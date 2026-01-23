@@ -1741,6 +1741,11 @@ class MFAWorker:
         self.driver = None
         self.user_data_dir = None
         self.stop_event = None
+        
+        # Popup polling
+        self._popup_polling_active = False
+        self._popup_polling_thread = None
+        self._popup_dismissed = False
 
         # Parse email info for TempMailAPI
         parts = self.email.split('@')
@@ -1753,6 +1758,7 @@ class MFAWorker:
         else:
             self.email_info = None
         self.mail_api = TempMailAPI()
+
         
     def log(self, message, color=Colors.INFO, emoji=""):
         safe_print(self.thread_id, message, color, emoji)
@@ -1835,11 +1841,63 @@ class MFAWorker:
             self.driver.refresh()
             time.sleep(3)
             
+            # Dismiss onboarding popup if appears
+            self.start_popup_polling()
+
+            
             return True
             
         except Exception as e:
             self.log(f"Error importing cookies: {e}", Colors.ERROR, "❌ ")
             return False
+    
+    def start_popup_polling(self):
+        """Start background thread to continuously check and dismiss onboarding popup"""
+        if self._popup_polling_active or self._popup_dismissed:
+            return
+        
+        self._popup_polling_active = True
+        self._popup_polling_thread = threading.Thread(target=self._popup_polling_loop, daemon=True)
+        self._popup_polling_thread.start()
+    
+    def stop_popup_polling(self):
+        """Stop the popup polling thread"""
+        self._popup_polling_active = False
+        if self._popup_polling_thread and self._popup_polling_thread.is_alive():
+            self._popup_polling_thread.join(timeout=2)
+        self._popup_polling_thread = None
+    
+    def _popup_polling_loop(self):
+        """Background loop to check for onboarding popup every 2 seconds"""
+        while self._popup_polling_active and not self._popup_dismissed:
+            try:
+                if not self.driver:
+                    break
+                
+                button_selectors = [
+                    "//button[.//div[contains(text(), \"Okay, let's go\")]]",
+                    "//button[contains(., \"Okay, let's go\")]",
+                    "//div[@role='dialog']//button[contains(., 'Okay')]",
+                ]
+                
+                for selector in button_selectors:
+                    try:
+                        buttons = self.driver.find_elements(By.XPATH, selector)
+                        for btn in buttons:
+                            if btn.is_displayed():
+                                self.driver.execute_script("arguments[0].click();", btn)
+                                self.log("Dismissed onboarding popup", Colors.SUCCESS, "✅ ")
+                                self._popup_dismissed = True
+                                self._popup_polling_active = False
+                                return
+                    except:
+                        continue
+            except:
+                pass
+            
+            # Poll every 2 seconds
+            time.sleep(2)
+
     
     def navigate_to_security_settings(self):
         """Navigate to Settings > Security"""
@@ -2254,12 +2312,16 @@ class MFAWorker:
     
     def cleanup(self):
         """Cleanup driver and temp files"""
+        # Stop popup polling thread first
+        self.stop_popup_polling()
+        
         if self.driver:
             try:
                 self.driver.quit()
             except:
                 pass
             self.driver = None
+
         
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             try:
@@ -2408,6 +2470,11 @@ class CheckoutCaptureWorker:
         self.stop_event = None
         self.net = NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"])
         
+        # Popup polling
+        self._popup_polling_active = False
+        self._popup_polling_thread = None
+        self._popup_dismissed = False
+        
     def log(self, message, color=Colors.INFO, emoji=""):
         safe_print(self.thread_id, message, color, emoji)
     
@@ -2449,12 +2516,16 @@ class CheckoutCaptureWorker:
     
     def cleanup_browser(self):
         """Close browser and clean up"""
+        # Stop popup polling thread first
+        self.stop_popup_polling()
+        
         if self.driver:
             try:
                 self.driver.quit()
             except:
                 pass
             self.driver = None
+
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             try:
                 shutil.rmtree(self.user_data_dir, ignore_errors=True)
@@ -2495,11 +2566,63 @@ class CheckoutCaptureWorker:
             time.sleep(self.net["extra_wait"])
             
             self.log("Cookies imported!", Colors.SUCCESS, "✅ ")
+            
+            # Start popup polling thread
+            self.start_popup_polling()
+            
             return True
             
         except Exception as e:
             self.log(f"Failed to import cookies: {e}", Colors.ERROR, "❌ ")
             return False
+    
+    def start_popup_polling(self):
+        """Start background thread to continuously check and dismiss onboarding popup"""
+        if self._popup_polling_active or self._popup_dismissed:
+            return
+        
+        self._popup_polling_active = True
+        self._popup_polling_thread = threading.Thread(target=self._popup_polling_loop, daemon=True)
+        self._popup_polling_thread.start()
+    
+    def stop_popup_polling(self):
+        """Stop the popup polling thread"""
+        self._popup_polling_active = False
+        if self._popup_polling_thread and self._popup_polling_thread.is_alive():
+            self._popup_polling_thread.join(timeout=2)
+        self._popup_polling_thread = None
+    
+    def _popup_polling_loop(self):
+        """Background loop to check for onboarding popup every 2 seconds"""
+        while self._popup_polling_active and not self._popup_dismissed:
+            try:
+                if not self.driver:
+                    break
+                
+                button_selectors = [
+                    "//button[.//div[contains(text(), \"Okay, let's go\")]]",
+                    "//button[contains(., \"Okay, let's go\")]",
+                    "//div[@role='dialog']//button[contains(., 'Okay')]",
+                ]
+                
+                for selector in button_selectors:
+                    try:
+                        buttons = self.driver.find_elements(By.XPATH, selector)
+                        for btn in buttons:
+                            if btn.is_displayed():
+                                self.driver.execute_script("arguments[0].click();", btn)
+                                self.log("Dismissed onboarding popup", Colors.SUCCESS, "✅ ")
+                                self._popup_dismissed = True
+                                self._popup_polling_active = False
+                                return
+                    except:
+                        continue
+            except:
+                pass
+            
+            # Poll every 2 seconds
+            time.sleep(2)
+
     
     def check_payment_error(self):
         """Check if payment error message is displayed using proper element"""
@@ -2586,6 +2709,50 @@ class CheckoutCaptureWorker:
                 
                 # Ensure Personal tab is active (not Business)
                 self.ensure_personal_tab_active()
+                time.sleep(1)
+                
+                # Check if Plus is a free offer (price = $0)
+                # Only check on first attempt to avoid redundant checks
+                if attempt == 1:
+                    try:
+                        # Look for the price element with text-5xl class but NOT line-through
+                        # line-through = original price (crossed out)
+                        # text-5xl without line-through = actual discounted price
+                        price_selectors = [
+                            "//div[@data-testid='plus-pricing-column-cost']//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]",
+                            "//div[contains(@class, 'plus-pricing')]//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]",
+                        ]
+                        
+                        actual_price = None
+                        for selector in price_selectors:
+                            price_elements = self.driver.find_elements(By.XPATH, selector)
+                            for price_elem in price_elements:
+                                if price_elem.is_displayed():
+                                    # Double-check class doesn't contain line-through
+                                    elem_class = price_elem.get_attribute("class") or ""
+                                    if "line-through" in elem_class:
+                                        continue  # Skip strikethrough prices
+                                    
+                                    price_text = price_elem.text.strip()
+                                    if price_text:
+                                        actual_price = price_text
+                                        break
+                            if actual_price:
+                                break
+                        
+                        # Check if actual price is NOT free ($0, 0, ₩0)
+                        if actual_price and actual_price not in ["$0", "0", "₩0"]:
+                            # Check if it contains any non-zero digits
+                            digits = ''.join(filter(str.isdigit, actual_price))
+                            if digits and int(digits) > 0:
+                                self.log(f"Plus price is {actual_price} - no free offer available", Colors.WARNING, "⚠️ ")
+                                return "NO_PLUS_OFFER"
+                        else:
+                            self.log(f"Plus offer detected: {actual_price}", Colors.SUCCESS, "✅ ")
+                            
+                    except Exception as e:
+                        self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
+
                 
                 # Find and click Get Plus button
                 button_xpath = (
@@ -2593,6 +2760,7 @@ class CheckoutCaptureWorker:
                     " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                     " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
                 )
+
                 
                 button = None
                 try:
@@ -2803,6 +2971,21 @@ class CheckoutCaptureWorker:
             self.log(f"Failed to save to Excel: {e}", Colors.ERROR, "❌ ")
             return False
     
+    def save_no_plus_offer(self):
+        """Save 'no Plus offer' to Excel column C when account has no free Plus offer"""
+        try:
+            with file_lock:
+                wb = load_workbook(self.excel_file)
+                ws = wb.active
+                ws.cell(row=self.row_index, column=3, value="no Plus offer")
+                wb.save(self.excel_file)
+                wb.close()
+                self.log("Saved 'no Plus offer' to Excel", Colors.SUCCESS, "💾 ")
+            return True
+        except Exception as e:
+            self.log(f"Failed to save no Plus offer: {e}", Colors.ERROR, "❌ ")
+            return False
+    
     def run(self):
         """Run the checkout capture flow"""
         try:
@@ -2817,12 +3000,21 @@ class CheckoutCaptureWorker:
             
             plus_url = None
             business_url = None
+            no_plus_offer = False
             
             if self.checkout_type in ["Plus", "Both"]:
-                plus_url = self.get_plus_checkout()
+                result = self.get_plus_checkout()
+                
+                # Handle NO_PLUS_OFFER case
+                if result == "NO_PLUS_OFFER":
+                    no_plus_offer = True
+                    self.log("Account has no Plus offer, saving to Excel...", Colors.WARNING, "⚠️ ")
+                    self.save_no_plus_offer()
+                else:
+                    plus_url = result
                 
                 # Close extra tabs for Business
-                if self.checkout_type == "Both" and plus_url:
+                if self.checkout_type == "Both" and (plus_url or no_plus_offer):
                     try:
                         while len(self.driver.window_handles) > 1:
                             self.driver.switch_to.window(self.driver.window_handles[-1])
@@ -2841,10 +3033,22 @@ class CheckoutCaptureWorker:
                 self.log(f"✅ Completed for {self.email}", Colors.SUCCESS, "🎉 ")
                 self.cleanup_browser()
                 return True
+            elif no_plus_offer and self.checkout_type == "Plus":
+                # Only Plus was requested and no offer available
+                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
+                self.cleanup_browser()
+                return True  # Still consider success since we saved the info
+            elif no_plus_offer and business_url:
+                # No Plus offer but got Business
+                self.save_to_excel(None, business_url)
+                self.log(f"✅ Business link captured for {self.email}", Colors.SUCCESS, "🎉 ")
+                self.cleanup_browser()
+                return True
             else:
                 self.log(f"No checkout URLs captured for {self.email}", Colors.WARNING, "⚠️ ")
                 self.cleanup_browser()
                 return False
+
                 
         except Exception as e:
             self.log(f"Error: {e}", Colors.ERROR, "❌ ")
@@ -4779,8 +4983,16 @@ class App(ctk.CTk):
                 self.checkout_account_widgets.append(email_label)
                 
                 # Plus status
-                plus_status = "✅" if account["plus_url"] else "❌"
-                plus_color = self.colors["accent_green"] if account["plus_url"] else self.colors["text_muted"]
+                if account["plus_url"] == "no Plus offer":
+                    plus_status = "⛔"
+                    plus_color = self.colors["error"]
+                elif account["plus_url"]:
+                    plus_status = "✅"
+                    plus_color = self.colors["accent_green"]
+                else:
+                    plus_status = "❌"
+                    plus_color = self.colors["text_muted"]
+
                 plus_label = ctk.CTkLabel(
                     row_frame, 
                     text=plus_status,
