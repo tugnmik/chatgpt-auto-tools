@@ -65,6 +65,26 @@ python chatgpt_auto_gui.pyw
 
 Hoặc double-click file `chatgpt_auto_gui.pyw` (Windows)
 
+### Chế độ OAuth2 Email (Tùy chọn)
+
+Nếu bạn muốn sử dụng tài khoản Outlook/Hotmail qua OAuth2 thay vì TinyHost:
+
+1. **Chuẩn bị file template**:
+   Chạy lệnh sau để tạo file `oauth2.xlsx`:
+   ```bash
+   python create_oauth2_template.py
+   ```
+
+2. **Điền thông tin tài khoản**:
+   Mở file `oauth2.xlsx` vừa tạo và điền thông tin vào các cột:
+   - Cột A: Định dạng `email|password|refresh_token|client_id`
+   - Cột B: `Status` (Để trống, tool sẽ tự điền "registered" khi thành công)
+
+3. **Sử dụng trong GUI**:
+   - Tại Tab Registration > Advanced Options
+   - Chọn **Email Mode**: `OAuth2`
+   - Nhấn nút 🔄 để load danh sách tài khoản
+
 ### Tab 1: Registration (Đăng ký)
 
 1. **Số lượng tài khoản**: Nhập số tài khoản muốn đăng ký

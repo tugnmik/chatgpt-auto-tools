@@ -41,7 +41,7 @@ print_lock = threading.Lock()
 driver_init_lock = threading.Lock()
 
 # Chrome major version installed locally (update when Chrome updates)
-CHROME_VERSION_MAIN = 142
+CHROME_VERSION_MAIN = 144
 
 # Global flag for getting checkout link (set by menu)
 GET_CHECKOUT_LINK = False
@@ -140,16 +140,226 @@ class TempMailAPI:
         }
 
 
+class DongVanOAuth2API:
+    """API client cho DongVan OAuth2 (thay thế tinyhost.shop)"""
+    
+    API_MESSAGES_URL = "https://tools.dongvanfb.net/api/get_messages_oauth2"
+    
+    def __init__(self, email, password, refresh_token, client_id):
+        self.email = email
+        self.password = password
+        self.refresh_token = refresh_token
+        self.client_id = client_id
+    
+    def fetch_messages(self):
+        """Lấy danh sách email từ OAuth2 API"""
+        payload = {
+            "email": self.email,
+            "refresh_token": self.refresh_token,
+            "client_id": self.client_id,
+        }
+        try:
+            response = requests.post(self.API_MESSAGES_URL, json=payload, timeout=20)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException:
+            return None
+        except json.JSONDecodeError:
+            return None
+    
+    def extract_code_from_messages(self, messages_payload):
+        """Trích xuất code 6 số từ thư mới nhất"""
+        if not messages_payload:
+            return None
+        
+        messages = messages_payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return None
+        
+        pattern = re.compile(r"\b(\d{6})\b")
+        
+        def parse_msg_datetime(raw):
+            if not raw:
+                return datetime.min
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+            for fmt in ("%H:%M - %d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
+                try:
+                    return datetime.strptime(raw, fmt)
+                except ValueError:
+                    continue
+            return datetime.min
+        
+        # Sắp xếp thư mới nhất lên đầu
+        sorted_messages = sorted(
+            messages,
+            key=lambda msg: parse_msg_datetime(msg.get("date")),
+            reverse=True,
+        )
+        
+        if not sorted_messages:
+            return None
+        
+        latest_msg = sorted_messages[0]
+        
+        # Ưu tiên 1: Trường 'code' nếu có
+        code_field = latest_msg.get("code", "")
+        if code_field and pattern.match(str(code_field)):
+            return code_field
+        
+        # Ưu tiên 2: Extract từ subject line
+        subject = latest_msg.get("subject") or ""
+        subject_codes = pattern.findall(subject)
+        if subject_codes:
+            return subject_codes[0]
+        
+        # Ưu tiên 3: Extract từ content/message
+        content = latest_msg.get("content") or latest_msg.get("message") or ""
+        content_codes = pattern.findall(content)
+        if content_codes:
+            return content_codes[0]
+        
+        return None
+    
+    def get_email_info(self):
+        """Trả về thông tin email theo format tương thích"""
+        return {
+            'email': self.email,
+            'username': self.email.split('@')[0],
+            'domain': self.email.split('@')[1] if '@' in self.email else ''
+        }
+
+
+# Global list để quản lý tài khoản OAuth2
+oauth2_accounts = []
+current_account_index = 0
+account_lock = threading.Lock()
+
+
+def load_oauth2_accounts_from_excel(file_path="oauth2.xlsx"):
+    """Load tài khoản OAuth2 từ file Excel oauth2.xlsx
+    Cột A: email|password|refresh_token|client_id
+    Cột B: Status (registered = đã đăng ký, trống = chưa đăng ký)
+    Row 1 là header, dữ liệu từ row 2
+    """
+    accounts = []
+    
+    if not os.path.exists(file_path):
+        return accounts
+    
+    try:
+        wb = load_workbook(file_path)
+        ws = wb.active
+        
+        skipped_count = 0
+        
+        for row_num in range(2, ws.max_row + 1):
+            cell_value = ws.cell(row=row_num, column=1).value
+            if not cell_value:
+                continue
+            
+            line = str(cell_value).strip()
+            if not line or line.startswith("#"):
+                continue
+            
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) != 4:
+                continue
+            
+            # Kiểm tra cột B (Status) - skip nếu đã registered
+            status_value = ws.cell(row=row_num, column=2).value
+            if status_value and str(status_value).strip().lower() == "registered":
+                skipped_count += 1
+                continue
+            
+            email, password, refresh_token, client_id = parts
+            accounts.append({
+                "email": email,
+                "password": password,
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "row_num": row_num,
+                "used": False
+            })
+        
+        wb.close()
+        
+        if skipped_count > 0:
+            print(f"⏭️ Skipped {skipped_count} registered accounts")
+        
+    except Exception as e:
+        print(f"Error loading OAuth2 accounts: {e}")
+        return []
+    
+    return accounts
+
+
+def get_next_oauth2_account():
+    """Lấy tài khoản OAuth2 tiếp theo chưa được sử dụng (thread-safe)"""
+    global oauth2_accounts
+    
+    with account_lock:
+        for i, account in enumerate(oauth2_accounts):
+            if not account.get("used", False):
+                oauth2_accounts[i]["used"] = True
+                return account
+    return None
+
+
+def reset_oauth2_accounts():
+    """Reset trạng thái used của tất cả oauth2 accounts"""
+    global oauth2_accounts
+    with account_lock:
+        for i in range(len(oauth2_accounts)):
+            oauth2_accounts[i]["used"] = False
+
+
+def mark_oauth2_registered(row_num, file_path="oauth2.xlsx"):
+    """Ghi 'registered' vào cột B của oauth2.xlsx sau khi đăng ký thành công
+    Thread-safe using file_lock
+    """
+    with file_lock:
+        try:
+            wb = load_workbook(file_path)
+            ws = wb.active
+            ws.cell(row=row_num, column=2, value="registered")
+            wb.save(file_path)
+            wb.close()
+            return True
+        except Exception as e:
+            print(f"Error marking OAuth2 account as registered: {e}")
+            return False
+
+
 class ChatGPTAutoRegisterWorker:
     """Worker thread for ChatGPT registration"""
     
-    def __init__(self, thread_id, num_threads=1):
+    def __init__(self, thread_id, num_threads=1, email_mode="TinyHost", oauth2_account=None):
         self.thread_id = thread_id
         self.num_threads = num_threads  # Total threads for position calculation
-        self.mail_api = TempMailAPI()
+        self.email_mode = email_mode  # "TinyHost" or "OAuth2"
+        self.oauth2_account = oauth2_account  # OAuth2 account data if mode is OAuth2
+        
+        # Initialize mail API based on mode
+        if email_mode == "OAuth2" and oauth2_account:
+            self.mail_api = DongVanOAuth2API(
+                email=oauth2_account["email"],
+                password=oauth2_account["password"],
+                refresh_token=oauth2_account["refresh_token"],
+                client_id=oauth2_account["client_id"]
+            )
+            self.email_info = self.mail_api.get_email_info()
+            self.password = DEFAULT_PASSWORD  # Use user-configured password, not oauth2 email password
+            self.oauth2_row_num = oauth2_account.get("row_num")
+        else:
+            self.mail_api = TempMailAPI()
+            self.email_info = None
+            self.password = DEFAULT_PASSWORD
+            self.oauth2_row_num = None
+        
         self.driver = None
-        self.email_info = None
-        self.password = DEFAULT_PASSWORD
         self.user_data_dir = None
         self.stop_event = None
         self.operation_timeout_detected = False
@@ -162,6 +372,7 @@ class ChatGPTAutoRegisterWorker:
     def log(self, message, color=Colors.INFO, emoji=""):
         """Log with thread ID"""
         safe_print(self.thread_id, message, color, emoji)
+
     
     def cleanup_browser(self):
         """Close browser and remove temporary profile"""
@@ -485,9 +696,12 @@ class ChatGPTAutoRegisterWorker:
     def enter_email_address(self):
         """Enter email with retry based on network mode"""
         try:
-            self.email_info = self.mail_api.generate_email()
+            # For OAuth2 mode, email_info is already set in __init__
+            # For TinyHost mode, we need to generate email
             if not self.email_info:
-                return False
+                self.email_info = self.mail_api.generate_email()
+                if not self.email_info:
+                    return False
             
             email = self.email_info['email']
             self.log(f"Email: {email}", Colors.INFO, "📧 ")
@@ -817,8 +1031,6 @@ class ChatGPTAutoRegisterWorker:
         """Wait and get OTP from email"""
         self.log("Waiting for OTP...", Colors.INFO, "📧 ")
         
-        username = self.email_info['username']
-        domain = self.email_info['domain']
         resend_count = 0
         
         for attempt in range(max_attempts):
@@ -828,30 +1040,44 @@ class ChatGPTAutoRegisterWorker:
                 self.operation_timeout_detected = True
                 return None
             
-            emails_data = self.mail_api.get_emails(domain, username, page=1, limit=5)
-            
-            if emails_data and emails_data.get('emails'):
-                for email_item in emails_data['emails']:
-                    sender = email_item.get('sender', '').lower()
-                    subject = email_item.get('subject', '').lower()
-                    
-                    if 'openai' in sender or 'verification' in subject or 'code' in subject:
-                        email_id = email_item['id']
+            # Different logic for OAuth2 vs TinyHost mode
+            if self.email_mode == "OAuth2":
+                # OAuth2 mode: use DongVanOAuth2API
+                messages_data = self.mail_api.fetch_messages()
+                if messages_data:
+                    otp = self.mail_api.extract_code_from_messages(messages_data)
+                    if otp:
+                        self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
+                        return otp
+            else:
+                # TinyHost mode: use TempMailAPI
+                username = self.email_info['username']
+                domain = self.email_info['domain']
+                
+                emails_data = self.mail_api.get_emails(domain, username, page=1, limit=5)
+                
+                if emails_data and emails_data.get('emails'):
+                    for email_item in emails_data['emails']:
+                        sender = email_item.get('sender', '').lower()
+                        subject = email_item.get('subject', '').lower()
                         
-                        email_detail = self.mail_api.get_email_detail(domain, username, email_id)
-                        
-                        if email_detail:
-                            body = email_detail.get('body', '')
-                            html_body = email_detail.get('html_body', '')
-                            full_content = f"{body} {html_body}"
-                            otp = self.extract_otp_from_email(full_content)
+                        if 'openai' in sender or 'verification' in subject or 'code' in subject:
+                            email_id = email_item['id']
                             
-                            if otp:
-                                self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
-                                return otp
+                            email_detail = self.mail_api.get_email_detail(domain, username, email_id)
+                            
+                            if email_detail:
+                                body = email_detail.get('body', '')
+                                html_body = email_detail.get('html_body', '')
+                                full_content = f"{body} {html_body}"
+                                otp = self.extract_otp_from_email(full_content)
+                                
+                                if otp:
+                                    self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
+                                    return otp
             
-            # Resend if needed
-            if attempt == max_attempts // 3 and resend_count < max_resend:
+            # Resend if needed (only for TinyHost mode)
+            if self.email_mode != "OAuth2" and attempt == max_attempts // 3 and resend_count < max_resend:
                 if self.resend_otp_email():
                     resend_count += 1
                     self.log(f"Resent email ({resend_count}/{max_resend})", Colors.INFO, "📧 ")
@@ -1706,7 +1932,7 @@ class ChatGPTAutoRegisterWorker:
 
 
 
-def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1):
+def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_mode="TinyHost", oauth2_account=None):
     """Worker function for registration with staggered start and retry logic"""
     # Apply delay based on position within current batch (reset for each batch)
     position_in_batch = (thread_id - 1) % num_threads if num_threads > 1 else 0
@@ -1719,9 +1945,15 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1):
                 return (False, None)
             time.sleep(0.5)
     
-    worker = ChatGPTAutoRegisterWorker(thread_id, num_threads=num_threads)
+    worker = ChatGPTAutoRegisterWorker(
+        thread_id, 
+        num_threads=num_threads,
+        email_mode=email_mode,
+        oauth2_account=oauth2_account
+    )
     worker.stop_event = stop_event
     return worker.run()
+
 
 
 # ============================================================================
@@ -3989,7 +4221,7 @@ class App(ctk.CTk):
         
         # Card Header
         card_header = ctk.CTkFrame(settings_card, fg_color="transparent")
-        card_header.pack(fill="x", padx=16, pady=(10, 8))
+        card_header.pack(fill="x", padx=16, pady=(6, 4))
         
         ctk.CTkLabel(
             card_header, 
@@ -4003,7 +4235,7 @@ class App(ctk.CTk):
         
         # Mode Selection
         self.reg_mode_frame = ctk.CTkFrame(settings_card, fg_color="transparent")
-        self.reg_mode_frame.pack(fill="x", padx=16, pady=10)
+        self.reg_mode_frame.pack(fill="x", padx=16, pady=6)
         
         mode_label = ctk.CTkLabel(
             self.reg_mode_frame, 
@@ -4034,7 +4266,7 @@ class App(ctk.CTk):
         
         # Count Input Row (will be modified for Multithread to include Threads)
         self.reg_count_frame = ctk.CTkFrame(settings_card, fg_color="transparent")
-        self.reg_count_frame.pack(fill="x", padx=16, pady=(0, 10))
+        self.reg_count_frame.pack(fill="x", padx=16, pady=(0, 6))
         
         # Left side: Total Accounts
         self.reg_count_left = ctk.CTkFrame(self.reg_count_frame, fg_color="transparent")
@@ -4142,7 +4374,7 @@ class App(ctk.CTk):
         
         # Advanced Header
         adv_header = ctk.CTkFrame(adv_card, fg_color="transparent")
-        adv_header.pack(fill="x", padx=16, pady=(10, 8))
+        adv_header.pack(fill="x", padx=16, pady=(6, 4))
         
         ctk.CTkLabel(
             adv_header, 
@@ -4155,7 +4387,7 @@ class App(ctk.CTk):
         
         # Network Mode selector
         self.reg_network_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_network_frame.pack(fill="x", padx=16, pady=(10, 6))
+        self.reg_network_frame.pack(fill="x", padx=16, pady=(6, 4))
         
         ctk.CTkLabel(
             self.reg_network_frame, 
@@ -4192,9 +4424,65 @@ class App(ctk.CTk):
         )
         self.reg_network_info.pack(side="right")
         
+        # Email Mode selector
+        self.reg_email_mode_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        self.reg_email_mode_frame.pack(fill="x", padx=16, pady=(4, 4))
+        
+        ctk.CTkLabel(
+            self.reg_email_mode_frame, 
+            text="📧  Email Mode:", 
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).pack(side="left", padx=(0, 16))
+        
+        self.reg_email_mode_var = ctk.StringVar(value="TinyHost")
+        self.reg_email_mode_menu = ctk.CTkOptionMenu(
+            self.reg_email_mode_frame, 
+            values=["TinyHost", "OAuth2"], 
+            variable=self.reg_email_mode_var,
+            command=self.on_email_mode_change,
+            font=self.font_label,
+            fg_color=self.colors["bg_elevated"],
+            button_color=self.colors["accent_tertiary"],
+            button_hover_color=self.colors["accent_primary"],
+            dropdown_fg_color=self.colors["bg_elevated"],
+            dropdown_hover_color=self.colors["bg_card_hover"],
+            dropdown_text_color=self.colors["text_primary"],
+            text_color=self.colors["text_primary"],
+            width=120,
+            height=32,
+            corner_radius=8
+        )
+        self.reg_email_mode_menu.pack(side="left")
+        
+        # OAuth2 status label (shows loaded accounts count)
+        self.reg_oauth2_status = ctk.CTkLabel(
+            self.reg_email_mode_frame,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color=self.colors["text_muted"]
+        )
+        self.reg_oauth2_status.pack(side="left", padx=(12, 0))
+        
+        # OAuth2 Refresh button
+        self.reg_oauth2_refresh = ctk.CTkButton(
+            self.reg_email_mode_frame,
+            text="🔄",
+            width=36,
+            height=32,
+            font=ctk.CTkFont(size=18),
+            fg_color=self.colors["bg_elevated"],
+            hover_color=self.colors["bg_card_hover"],
+            corner_radius=6,
+            command=self.refresh_oauth2_accounts
+        )
+        self.reg_oauth2_refresh.pack(side="left", padx=(8, 0))
+        self.reg_oauth2_refresh.pack_forget()  # Hidden by default
+        
         # Password Config
+
         self.reg_password_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_password_frame.pack(fill="x", padx=16, pady=(6, 8))
+        self.reg_password_frame.pack(fill="x", padx=16, pady=(4, 6))
         
         ctk.CTkLabel(
             self.reg_password_frame, 
@@ -5137,15 +5425,14 @@ class App(ctk.CTk):
             fail_count = 0
             count_lock = threading.Lock()
             
-            def run_checkout_worker(thread_id, account, account_idx, delay_per_account):
+            def run_checkout_worker(thread_id, account, account_idx, start_delay):
                 nonlocal success_count, fail_count
                 
-                # Staggered start delay based on account index and delay setting
-                delay = account_idx * delay_per_account
-                if delay > 0:
-                    safe_print(thread_id, f"Waiting {delay}s before starting...", Colors.INFO, "⏳ ")
+                # Use pre-calculated start delay
+                if start_delay > 0:
+                    safe_print(thread_id, f"Waiting {start_delay}s before starting...", Colors.INFO, "⏳ ")
                     # Sleep in 0.5s intervals to check stop_event
-                    for _ in range(int(delay * 2)):
+                    for _ in range(int(start_delay * 2)):
                         if self.stop_event.is_set():
                             return False, account["email"]
                         time.sleep(0.5)
@@ -5184,8 +5471,20 @@ class App(ctk.CTk):
                 for idx, account in enumerate(selected):
                     if self.stop_event.is_set():
                         break
+                    
+                    # Slot index is (idx % threads) for staggered delay in each wave
+                    slot_idx = idx % threads
+                    wave_idx = idx // threads
+                    
+                    if wave_idx == 0:
+                        # First wave: stagger by slot
+                        start_delay = slot_idx * thread_delay
+                    else:
+                        # Subsequent waves: Base delay (5s) + stagger
+                        start_delay = 5.0 + (slot_idx * thread_delay)
+                    
                     thread_id = (idx % threads) + 1
-                    future = executor.submit(run_checkout_worker, thread_id, account, idx, thread_delay)
+                    future = executor.submit(run_checkout_worker, thread_id, account, idx, start_delay)
                     futures.append(future)
                 
                 # Wait for all futures
@@ -5395,7 +5694,68 @@ class App(ctk.CTk):
         else:
             self.reg_checkout_type_frame.pack_forget()
     
+    def on_email_mode_change(self, mode):
+        """Handle email mode change between TinyHost and OAuth2"""
+        global oauth2_accounts
+        
+        if mode == "OAuth2":
+            # Show refresh button
+            self.reg_oauth2_refresh.pack(side="left", padx=(8, 0))
+            
+            # Load oauth2 accounts from oauth2.xlsx
+            excel_file = "oauth2.xlsx"
+            if os.path.exists(excel_file):
+                oauth2_accounts = load_oauth2_accounts_from_excel(excel_file)
+                count = len(oauth2_accounts)
+                if count > 0:
+                    self.reg_oauth2_status.configure(
+                        text=f"✅ Loaded {count} OAuth2 accounts",
+                        text_color=self.colors["accent_green"]
+                    )
+                else:
+                    self.reg_oauth2_status.configure(
+                        text="⚠️ No OAuth2 accounts found in oauth2.xlsx",
+                        text_color=self.colors["warning"]
+                    )
+            else:
+                self.reg_oauth2_status.configure(
+                    text="❌ oauth2.xlsx not found",
+                    text_color=self.colors["error"]
+                )
+                oauth2_accounts = []
+        else:
+            # TinyHost mode - clear status and hide refresh button
+            self.reg_oauth2_status.configure(text="")
+            self.reg_oauth2_refresh.pack_forget()
+            oauth2_accounts = []
+    
+    def refresh_oauth2_accounts(self):
+        """Refresh OAuth2 accounts from oauth2.xlsx"""
+        global oauth2_accounts
+        
+        excel_file = "oauth2.xlsx"
+        if os.path.exists(excel_file):
+            oauth2_accounts = load_oauth2_accounts_from_excel(excel_file)
+            count = len(oauth2_accounts)
+            if count > 0:
+                self.reg_oauth2_status.configure(
+                    text=f"✅ Loaded {count} OAuth2 accounts",
+                    text_color=self.colors["accent_green"]
+                )
+            else:
+                self.reg_oauth2_status.configure(
+                    text="⚠️ No OAuth2 accounts found",
+                    text_color=self.colors["warning"]
+                )
+        else:
+            self.reg_oauth2_status.configure(
+                text="❌ oauth2.xlsx not found",
+                text_color=self.colors["error"]
+            )
+            oauth2_accounts = []
+    
     def toggle_password_visibility(self):
+
         """Toggle password visibility"""
         self.password_visible = not self.password_visible
         if self.password_visible:
@@ -5665,15 +6025,39 @@ class App(ctk.CTk):
         self.update_stats(0, 0)
         
         # settings
-        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, NETWORK_MODE
+        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, NETWORK_MODE, oauth2_accounts
         GET_CHECKOUT_LINK = self.reg_checkout_var.get()
         GET_CHECKOUT_TYPE = self.reg_checkout_type_var.get()
         NETWORK_MODE = self.reg_network_var.get()
+        email_mode = self.reg_email_mode_var.get()  # "TinyHost" or "OAuth2"
         mode = self.reg_mode_var.get()
         try:
             count = int(self.reg_count_entry.get())
         except:
             count = 1
+        
+        # OAuth2 mode validation
+        if email_mode == "OAuth2":
+            # Reload oauth2 accounts to get fresh list
+            excel_file = "oauth2.xlsx"
+            if os.path.exists(excel_file):
+                oauth2_accounts = load_oauth2_accounts_from_excel(excel_file)
+            else:
+                oauth2_accounts = []
+            
+            available_count = len(oauth2_accounts)
+            if available_count == 0:
+                print(f"❌ No OAuth2 accounts available in oauth2.xlsx")
+                self.lock_ui(False)
+                return
+            
+            if count > available_count:
+                print(f"⚠️ Requested {count} accounts but only {available_count} OAuth2 accounts available. Using {available_count}.")
+                count = available_count
+            
+            # Reset used status
+            reset_oauth2_accounts()
+            print(f"📧 Using OAuth2 mode with {available_count} available accounts")
             
         # Get thread count (only for multithread mode)
         try:
@@ -5694,9 +6078,9 @@ class App(ctk.CTk):
             thread_delay = 2
             
         if mode == "Multithread":
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Registration | Mode: {mode} | Total: {count} | Threads: {threads} | Delay: {thread_delay}s")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Registration | Mode: {mode} | Email: {email_mode} | Total: {count} | Threads: {threads} | Delay: {thread_delay}s")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Registration | Mode: {mode} | Count: {count}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Registration | Mode: {mode} | Email: {email_mode} | Count: {count}")
         
         success_count = 0
         failed_count = 0
@@ -5710,18 +6094,34 @@ class App(ctk.CTk):
                 print(f"--- Account {i+1}/{count} ---")
                 
                 try:
-                    worker = ChatGPTAutoRegisterWorker(thread_id=1)
+                    # Get oauth2 account if in OAuth2 mode
+                    oauth2_account = None
+                    if email_mode == "OAuth2":
+                        oauth2_account = get_next_oauth2_account()
+                        if not oauth2_account:
+                            print(f"❌ No more OAuth2 accounts available")
+                            break
+                    
+                    worker = ChatGPTAutoRegisterWorker(
+                        thread_id=1, 
+                        email_mode=email_mode, 
+                        oauth2_account=oauth2_account
+                    )
                     worker.stop_event = self.stop_event
                     success, result = worker.run()
                     if success:
                         success_count += 1
                         print("✅ Success!")
+                        # Mark OAuth2 account as registered
+                        if email_mode == "OAuth2" and oauth2_account:
+                            mark_oauth2_registered(oauth2_account["row_num"])
                     else:
                         failed_count += 1
                         print("❌ Failed!")
                 except Exception as e:
                     failed_count += 1
                     print(f"❌ Error: {e}")
+
                 
                 self.update_stats(success_count, failed_count)
                 
@@ -5735,39 +6135,64 @@ class App(ctk.CTk):
             processed = 0
             
             # Create a wrapper function that calculates delay based on slot position
-            def run_worker_with_slot_delay(account_idx, slot_idx, stop_event, delay):
-                """Worker with delay based on slot position in thread pool"""
-                # Delay is based on slot index (0-based within thread pool)
-                actual_delay = slot_idx * delay
-                if actual_delay > 0:
-                    safe_print(account_idx, f"Waiting {actual_delay}s before starting...", Colors.INFO, "⏳ ")
-                    for _ in range(int(actual_delay * 2)):
+            def run_worker_with_slot_delay(account_idx, slot_idx, stop_event, start_delay, email_mode_inner, num_threads_inner):
+                """Worker with computed start delay"""
+                # Delay is pre-calculated
+                if start_delay > 0:
+                    safe_print(account_idx, f"Waiting {start_delay}s before starting...", Colors.INFO, "⏳ ")
+                    for _ in range(int(start_delay * 2)):
                         if stop_event and stop_event.is_set():
-                            return (False, None)
+                            return (False, None, None)
                         time.sleep(0.5)
                 
-                worker = ChatGPTAutoRegisterWorker(account_idx)
+                # Get oauth2 account if in OAuth2 mode
+                oauth2_account = None
+                oauth2_row_num = None
+                if email_mode_inner == "OAuth2":
+                    oauth2_account = get_next_oauth2_account()
+                    if not oauth2_account:
+                        safe_print(account_idx, "No more OAuth2 accounts available", Colors.ERROR, "❌ ")
+                        return (False, None, None)
+                    oauth2_row_num = oauth2_account.get("row_num")
+                
+                # Use slot_idx+1 as thread_id for proper window positioning
+                worker = ChatGPTAutoRegisterWorker(
+                    slot_idx + 1,  # Use slot index for window position (1-based)
+                    num_threads=num_threads_inner,
+                    email_mode=email_mode_inner,
+                    oauth2_account=oauth2_account
+                )
                 worker.stop_event = stop_event
-                return worker.run()
+                success, result = worker.run()
+                
+                # Mark OAuth2 account as registered if success
+                if success and email_mode_inner == "OAuth2" and oauth2_row_num:
+                    mark_oauth2_registered(oauth2_row_num)
+                
+                return (success, result, oauth2_row_num)
+
+
             
             with ThreadPoolExecutor(max_workers=threads) as executor:
-                # Submit first wave with staggered delays
+                # Submit tasks
                 futures = {}
                 for i in range(count):
                     if self.stop_event.is_set():
                         break
+                    
                     # Slot index is (i % threads) for staggered delay in each wave
                     slot_idx = i % threads
-                    # For first wave, apply staggered delay. For subsequent waves, apply fixed delay
                     wave_idx = i // threads
+                    
                     if wave_idx == 0:
                         # First wave: stagger by slot
-                        delay_for_task = slot_idx * thread_delay
+                        start_delay = slot_idx * thread_delay
                     else:
-                        # Subsequent waves: no stagger needed, ThreadPoolExecutor handles timing
-                        delay_for_task = 0
+                        # Subsequent waves: Base delay (5s) + stagger
+                        # This ensures threads wait 5s + stagger before starting next account
+                        start_delay = 5.0 + (slot_idx * thread_delay)
                     
-                    future = executor.submit(run_worker_with_slot_delay, i+1, slot_idx if wave_idx == 0 else 0, self.stop_event, thread_delay)
+                    future = executor.submit(run_worker_with_slot_delay, i+1, slot_idx, self.stop_event, start_delay, email_mode, threads)
                     futures[future] = i+1
                 
                 for future in as_completed(futures):
@@ -5775,7 +6200,12 @@ class App(ctk.CTk):
                         executor.shutdown(wait=False, cancel_futures=True)
                         break
                     try:
-                        success, result = future.result()
+                        result_tuple = future.result()
+                        # Handle both 2-tuple (TinyHost) and 3-tuple (OAuth2) returns
+                        if len(result_tuple) == 3:
+                            success, result, _ = result_tuple
+                        else:
+                            success, result = result_tuple
                         processed += 1
                         if success:
                             success_count += 1
