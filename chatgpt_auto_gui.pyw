@@ -238,11 +238,16 @@ current_account_index = 0
 account_lock = threading.Lock()
 
 
-def load_oauth2_accounts_from_excel(file_path="oauth2.xlsx"):
+def load_oauth2_accounts_from_excel(file_path="oauth2.xlsx", skip_registered=True):
     """Load tài khoản OAuth2 từ file Excel oauth2.xlsx
     Cột A: email|password|refresh_token|client_id
     Cột B: Status (registered = đã đăng ký, trống = chưa đăng ký)
     Row 1 là header, dữ liệu từ row 2
+    
+    Args:
+        file_path: Path to oauth2.xlsx
+        skip_registered: If True, skip accounts with status='registered' (for Registration)
+                        If False, load all accounts (for MFA/Checkout lookup)
     """
     accounts = []
     
@@ -268,11 +273,12 @@ def load_oauth2_accounts_from_excel(file_path="oauth2.xlsx"):
             if len(parts) != 4:
                 continue
             
-            # Kiểm tra cột B (Status) - skip nếu đã registered
-            status_value = ws.cell(row=row_num, column=2).value
-            if status_value and str(status_value).strip().lower() == "registered":
-                skipped_count += 1
-                continue
+            # Kiểm tra cột B (Status) - skip nếu đã registered (chỉ khi skip_registered=True)
+            if skip_registered:
+                status_value = ws.cell(row=row_num, column=2).value
+                if status_value and str(status_value).strip().lower() == "registered":
+                    skipped_count += 1
+                    continue
             
             email, password, refresh_token, client_id = parts
             accounts.append({
@@ -286,7 +292,7 @@ def load_oauth2_accounts_from_excel(file_path="oauth2.xlsx"):
         
         wb.close()
         
-        if skipped_count > 0:
+        if skipped_count > 0 and skip_registered:
             print(f"⏭️ Skipped {skipped_count} registered accounts")
         
     except Exception as e:
@@ -1963,13 +1969,14 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_
 class MFAWorker:
     """Worker for MFA enrollment"""
     
-    def __init__(self, thread_id, row_index, email, password, cookie_json, excel_file):
+    def __init__(self, thread_id, row_index, email, password, cookie_json, excel_file, oauth2_account=None):
         self.thread_id = thread_id
         self.row_index = row_index
         self.email = email
         self.password = password
         self.cookie_json = cookie_json
         self.excel_file = excel_file
+        self.oauth2_account = oauth2_account
         self.driver = None
         self.user_data_dir = None
         self.stop_event = None
@@ -1989,7 +1996,16 @@ class MFAWorker:
             }
         else:
             self.email_info = None
-        self.mail_api = TempMailAPI()
+            
+        if self.oauth2_account:
+            self.mail_api = DongVanOAuth2API(
+                email=self.oauth2_account.get("email", ""),
+                password=self.oauth2_account.get("password", ""),
+                refresh_token=self.oauth2_account.get("refresh_token", ""),
+                client_id=self.oauth2_account.get("client_id", "")
+            )
+        else:
+            self.mail_api = TempMailAPI()
 
         
     def log(self, message, color=Colors.INFO, emoji=""):
@@ -2194,34 +2210,77 @@ class MFAWorker:
         return None
 
     def wait_and_get_otp(self, max_attempts=30, wait_seconds=5):
-        if not self.email_info: return None
         self.log("Waiting for OTP from email...", Colors.INFO, "📧 ")
-        user, domain = self.email_info['username'], self.email_info['domain']
         
-        for _ in range(max_attempts):
-            if self.stop_event and self.stop_event.is_set():
-                self.log("Process stopped by user", Colors.WARNING, "🛑 ")
+        # Check if email is Outlook/Hotmail
+        is_outlook = self.email.lower().endswith(('@outlook.com', '@hotmail.com'))
+        
+        # HANDLE OAUTH2 MODE (Using DongVanOAuth2API)
+        if self.oauth2_account:
+            refresh_token = self.oauth2_account.get("refresh_token")
+            client_id = self.oauth2_account.get("client_id")
+            
+            if not refresh_token or not client_id:
+                self.log("Missing refresh_token or client_id for OAuth2", Colors.ERROR, "❌ ")
                 return None
                 
-            data = self.mail_api.get_emails(domain, user, limit=5)
-            if data and data.get('emails'):
-                for item in data['emails']:
-                    if 'openai' in item.get('sender', '').lower() or 'code' in item.get('subject', '').lower():
-                        detail = self.mail_api.get_email_detail(domain, user, item['id'])
-                        if detail:
-                            full = f"{detail.get('body','')} {detail.get('html_body','')}"
-                            otp = self.extract_otp_from_email(full)
-                            if otp:
-                                self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
-                                return otp
-            
-            # Sleep in intervals to check stop_event
-            for _ in range(wait_seconds * 2):
+            for _ in range(max_attempts):
                 if self.stop_event and self.stop_event.is_set():
+                    self.log("Process stopped by user", Colors.WARNING, "🛑 ")
                     return None
-                time.sleep(0.5)
                 
-        return None
+                try:
+                    # DongVanOAuth2API uses instance vars for auth, no params needed
+                    messages = self.mail_api.fetch_messages()
+                    if messages:
+                        code = self.mail_api.extract_code_from_messages(messages)
+                        if code:
+                            self.log(f"Got OTP (OAuth2): {code}", Colors.SUCCESS, "✅ ")
+                            return code
+                except Exception as e:
+                    pass  # Ignore errors during polling
+                
+                # Sleep in intervals
+                for _ in range(wait_seconds * 2):
+                    if self.stop_event and self.stop_event.is_set():
+                        return None
+                    time.sleep(0.5)
+            return None
+            
+        # HANDLE OUTLOOK/HOTMAIL WITHOUT OAUTH2 - SKIP
+        elif is_outlook:
+            self.log("Outlook/Hotmail email requires OAuth2 credentials in oauth2.xlsx", Colors.ERROR, "❌ ")
+            return None
+            
+        # HANDLE TINYHOST MODE (Using TempMailAPI)
+        else:
+            if not self.email_info: return None
+            user, domain = self.email_info['username'], self.email_info['domain']
+            
+            for _ in range(max_attempts):
+                if self.stop_event and self.stop_event.is_set():
+                    self.log("Process stopped by user", Colors.WARNING, "🛑 ")
+                    return None
+                    
+                data = self.mail_api.get_emails(domain, user, limit=5)
+                if data and data.get('emails'):
+                    for item in data['emails']:
+                        if 'openai' in item.get('sender', '').lower() or 'code' in item.get('subject', '').lower():
+                            detail = self.mail_api.get_email_detail(domain, user, item['id'])
+                            if detail:
+                                full = f"{detail.get('body','')} {detail.get('html_body','')}"
+                                otp = self.extract_otp_from_email(full)
+                                if otp:
+                                    self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
+                                    return otp
+                
+                # Sleep in intervals to check stop_event
+                for _ in range(wait_seconds * 2):
+                    if self.stop_event and self.stop_event.is_set():
+                        return None
+                    time.sleep(0.5)
+                    
+            return None
 
     def enter_otp_code(self, otp):
         try:
@@ -2636,7 +2695,7 @@ def load_mfa_accounts(excel_file):
     return accounts
 
 
-def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay=2, slot_index=0, is_first_batch=True):
+def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay=2, slot_index=0, is_first_batch=True, oauth2_account=None):
     """Run MFA worker thread with retries and staggered start
     
     Delay logic:
@@ -2666,7 +2725,8 @@ def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay
             email=account["email"],
             password=account["password"],
             cookie_json=account["cookie"],
-            excel_file=excel_file
+            excel_file=excel_file,
+            oauth2_account=oauth2_account
         )
         worker.stop_event = stop_event
         
@@ -5543,8 +5603,8 @@ class App(ctk.CTk):
             if self.stop_event.is_set():
                 self.update_status("STOPPED", self.colors["warning"], f"Stopped. Success: {final_success} | Failed: {final_fail}")
             else:
-                color = self.colors["accent_green"] if final_fail == 0 else self.colors["warning"]
-                self.update_status("COMPLETED", color, f"Success: {final_success} | Failed: {final_fail}")
+                # Use neutral color for COMPLETED (like IDLE)
+                self.update_status("COMPLETED", None, f"Success: {final_success} | Failed: {final_fail}")
             
             _toast(self, f"💳 Captured {final_success} checkout links!", toast_type="success" if final_success > 0 else "warning")
         
@@ -6233,8 +6293,12 @@ class App(ctk.CTk):
             _toast(self, f"⏹ Stopped. {success_count} completed", toast_type="warning")
         
         self.lock_ui(False)
-        # Restore status
-        self.status_indicator.configure(text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}", fg_color=color)
+        # Restore status with neutral color (like IDLE)
+        self.status_indicator.configure(
+            text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}",
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"]
+        )
 
     def start_mfa_thread(self):
         threading.Thread(target=self.run_mfa).start()
@@ -6276,6 +6340,20 @@ class App(ctk.CTk):
             return
             
         print(f"Found {len(accounts)} accounts.")
+        
+        # Load OAuth2 accounts for lookup (to enable code reading for OAuth2 emails)
+        oauth2_map = {}
+        if os.path.exists("oauth2.xlsx"):
+            try:
+                raw_oauth2 = load_oauth2_accounts_from_excel("oauth2.xlsx", skip_registered=False)
+                for acc in raw_oauth2:
+                    if acc.get('email'):
+                        oauth2_map[acc['email'].lower()] = acc
+                if len(oauth2_map) > 0:
+                    print(f"Loaded {len(oauth2_map)} OAuth2 accounts for reference.")
+            except Exception as e:
+                print(f"Error loading oauth2.xlsx: {e}")
+        
         success_count = 0
         fail_count = 0
         
@@ -6287,8 +6365,11 @@ class App(ctk.CTk):
                 self.update_status("RUNNING", self.colors["info"], f"🔐 {account['email'][:20]}... ({idx+1}/{len(accounts)})")
                 print(f"Processing {account['email']}...")
                 
+                # Get OAuth2 info if available
+                oauth2_acc = oauth2_map.get(account['email'].lower())
+                
                 try:
-                    result, email = run_mfa_worker(1, account, excel_file, self.stop_event)
+                    result, email = run_mfa_worker(1, account, excel_file, self.stop_event, oauth2_account=oauth2_acc)
                     if result:
                         success_count += 1
                         print(f"✅ MFA Enabled: {email}")
@@ -6310,12 +6391,16 @@ class App(ctk.CTk):
                 for idx, account in enumerate(accounts):
                     if self.stop_event.is_set():
                         break
+                    
+                    # Get OAuth2 info if available
+                    oauth2_acc = oauth2_map.get(account['email'].lower())
+                    
                     thread_id = (idx % threads) + 1
                     slot_index = idx % threads           # 0, 1, 2 for 3 threads
                     batch_number = idx // threads        # Which batch this account belongs to
                     is_first_batch = (batch_number == 0) # First batch has no base delay
                     # Pass slot-based delay parameters
-                    future = executor.submit(run_mfa_worker, thread_id, account, excel_file, self.stop_event, mfa_thread_delay, slot_index, is_first_batch)
+                    future = executor.submit(run_mfa_worker, thread_id, account, excel_file, self.stop_event, mfa_thread_delay, slot_index, is_first_batch, oauth2_acc)
                     futures[future] = account
                 
                 for future in as_completed(futures):
@@ -6345,7 +6430,12 @@ class App(ctk.CTk):
             _toast(self, f"⏹ MFA stopped. {success_count} completed", toast_type="warning")
         
         self.lock_ui(False)
-        self.status_indicator.configure(text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}", fg_color=color)
+        # Restore status with neutral color (like IDLE)
+        self.status_indicator.configure(
+            text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}",
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"]
+        )
 
 if __name__ == "__main__":
     app = App()
