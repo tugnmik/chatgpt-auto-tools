@@ -1452,6 +1452,10 @@ class ChatGPTAutoRegisterWorker:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
                         # Navigate back to pricing and ensure Personal tab
+                        self.log("Refreshing page to clear error state...", Colors.INFO, "🔄 ")
+                        self.driver.refresh()
+                        time.sleep(3)
+                        
                         self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
                         self.driver.get("https://chatgpt.com/#pricing")
                         time.sleep(2)

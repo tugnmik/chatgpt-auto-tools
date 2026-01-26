@@ -142,7 +142,7 @@ auto gpt/
 ### Thay đổi phiên bản Chrome
 Nếu Chrome của bạn khác phiên bản mặc định, sửa dòng:
 ```python
-CHROME_VERSION_MAIN = 142  # Đổi thành phiên bản Chrome của bạn
+CHROME_VERSION_MAIN = 144  # Đổi thành phiên bản Chrome của bạn
 ```
 
 ### Thay đổi mật khẩu mặc định
@@ -203,7 +203,7 @@ Dự án này chỉ dành cho mục đích học tập và nghiên cứu. Tác g
 
 ## 👤 Tác giả
 
-**tungd** - *Developer*
+**tungdk** - *Developer*
 
 ---
 
