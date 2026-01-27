@@ -1454,7 +1454,7 @@ class ChatGPTAutoRegisterWorker:
                         # Navigate back to pricing and ensure Personal tab
                         self.log("Refreshing page to clear error state...", Colors.INFO, "🔄 ")
                         self.driver.refresh()
-                        time.sleep(3)
+                        time.sleep(2)
                         
                         self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
                         self.driver.get("https://chatgpt.com/#pricing")
@@ -1973,7 +1973,7 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_
 class MFAWorker:
     """Worker for MFA enrollment"""
     
-    def __init__(self, thread_id, row_index, email, password, cookie_json, excel_file, oauth2_account=None):
+    def __init__(self, thread_id, row_index, email, password, cookie_json, excel_file, oauth2_account=None, recheck_mode=False):
         self.thread_id = thread_id
         self.row_index = row_index
         self.email = email
@@ -1981,6 +1981,7 @@ class MFAWorker:
         self.cookie_json = cookie_json
         self.excel_file = excel_file
         self.oauth2_account = oauth2_account
+        self.recheck_mode = recheck_mode
         self.driver = None
         self.user_data_dir = None
         self.stop_event = None
@@ -2130,6 +2131,8 @@ class MFAWorker:
                     "//button[.//div[contains(text(), \"Okay, let's go\")]]",
                     "//button[contains(., \"Okay, let's go\")]",
                     "//div[@role='dialog']//button[contains(., 'Okay')]",
+                    "//button[.//div[contains(text(), 'Not now')]]",
+                    "//button[contains(., 'Not now')]",
                 ]
                 
                 for selector in button_selectors:
@@ -2163,28 +2166,45 @@ class MFAWorker:
             return False
     
     def click_mfa_toggle(self):
-        """Click the MFA toggle button"""
+        """
+        Click the MFA toggle button with STRICT verification.
+        1. Must find text "Authenticator app" first.
+        2. Find toggle specifically associated with that text.
+        3. Check state (checked/unchecked).
+        """
         try:
-            self.log("Clicking MFA toggle...", Colors.INFO, "🔐 ")
-            time.sleep(2)
+            self.log("Searching for 'Authenticator app' toggle...", Colors.INFO, "🔍 ")
             
-            toggle_selectors = [
-                "//button[@data-state='unchecked' and contains(@class, 'radix')]",
-                "//button[@data-state='unchecked']",
-                "//div[contains(text(), 'Authenticator app')]/following::button[@data-state][1]",
-                "//span[contains(text(), 'Authenticator app')]/ancestor::div//button[@data-state]",
-                "//button[@role='switch']",
-                "//button[contains(@class, 'rounded-full') and contains(@class, 'bg-')]",
+            # 1. Wait/Retry for the specific label "Authenticator app"
+            label_found = False
+            for _ in range(5): # Retry for ~10 seconds
+                if "Authenticator app" in self.driver.page_source:
+                    label_found = True
+                    break
+                time.sleep(2)
+                
+            if not label_found:
+                self.log("'Authenticator app' section NOT found. Skipping to avoid false positives.", Colors.WARNING, "⚠️ ")
+                return False
+
+            time.sleep(1) # Small settle time
+            
+            # 2. Strict Selectors anchoring to the text
+            # We want the button that is a sibling or descendant of the row containing "Authenticator app"
+            strict_selectors = [
+                 # Case A: Label is in a div, button is following sibling in same container or row
+                "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                # Case B: Label is a span
+                "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                # Case C: Container approach (ancestor row) - safer
+                "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
             ]
             
             toggle = None
-            for selector in toggle_selectors:
+            for selector in strict_selectors:
                 try:
                     elements = self.driver.find_elements(By.XPATH, selector)
                     for elem in elements:
-                        state = elem.get_attribute("data-state")
-                        if state == "checked":
-                            continue
                         if elem.is_displayed():
                             toggle = elem
                             break
@@ -2194,12 +2214,22 @@ class MFAWorker:
                     continue
             
             if toggle:
+                state = toggle.get_attribute("data-state")
+                
+                # Double check to ensure we didn't pick up a stray button
+                # (Logic: if we used strict XPath, it should be correct, but let's be sure)
+                
+                if state == "checked":
+                    self.log("MFA is already enabled (checked)", Colors.SUCCESS, "✅ ")
+                    return "ALREADY_ENABLED"
+                
+                self.log("MFA is disabled (unchecked). Clicking to enable...", Colors.INFO, "👆 ")
                 self.driver.execute_script("arguments[0].click();", toggle)
                 self.log("Clicked MFA toggle", Colors.SUCCESS, "✅ ")
                 time.sleep(3)
                 return True
             else:
-                self.log("Could not find MFA toggle", Colors.ERROR, "❌ ")
+                self.log("Found label but could not locate strict Toggle button!", Colors.ERROR, "❌ ")
                 return False
                 
         except Exception as e:
@@ -2548,13 +2578,8 @@ class MFAWorker:
                 self.log("MFA activated successfully!", Colors.SUCCESS, "🎉 ")
                 return True
             else:
-                page_text = self.driver.page_source.lower()
-                if "enabled" in page_text or "success" in page_text:
-                    self.log("MFA likely activated", Colors.SUCCESS, "✅ ")
-                    return True
-                else:
-                    self.log("Could not confirm MFA activation", Colors.WARNING, "⚠️ ")
-                    return False
+                self.log("Could not confirm MFA activation - Success message not found", Colors.WARNING, "⚠️ ")
+                return False
                 
         except Exception as e:
             self.log(f"Error verifying OTP: {e}", Colors.ERROR, "❌ ")
@@ -2565,14 +2590,22 @@ class MFAWorker:
         try:
             if not self.navigate_to_security_settings():
                 return None
-            if not self.click_mfa_toggle():
+            
+            toggle_result = self.click_mfa_toggle()
+            if toggle_result == "ALREADY_ENABLED":
+                return {"status": "already_enabled"}
+            elif not toggle_result:
                 return None
+            
             if not self.handle_password_verification():
                 return None
             secret = self.extract_totp_secret()
             if not secret:
                 return None
             return {"secret": secret}
+        except Exception as e:
+            self.log(f"Error in MFA enrollment: {e}", Colors.ERROR, "❌ ")
+            return None
         except Exception as e:
             self.log(f"Error in MFA enrollment: {e}", Colors.ERROR, "❌ ")
             return None
@@ -2639,6 +2672,10 @@ class MFAWorker:
             if not enroll_data:
                 return False
             
+            if enroll_data.get("status") == "already_enabled":
+                self.log(f"MFA already enabled for {self.email} (Recheck passed)", Colors.SUCCESS, "🎉 ")
+                return True
+
             totp_secret = self.activate_mfa(enroll_data)
             if not totp_secret:
                 return False
@@ -2699,7 +2736,50 @@ def load_mfa_accounts(excel_file):
     return accounts
 
 
-def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay=2, slot_index=0, is_first_batch=True, oauth2_account=None):
+def load_mfa_accounts_recheck(excel_file, reverse_order=False):
+    """Load accounts that already have MFA for rechecking"""
+    wb = load_workbook(excel_file)
+    ws = wb.active
+    
+    accounts = []
+    
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if len(row) < 2:
+            continue
+        
+        account = row[0] if row[0] else ""
+        cookie = row[1] if len(row) > 1 and row[1] else ""
+        two_fa = row[4] if len(row) > 4 and row[4] else ""  # Column E = 2FA Secret
+        
+        if not account or not cookie:
+            continue
+        
+        # For recheck, we ONLY want accounts that HAVE 2FA secret
+        if not two_fa:
+            continue
+        
+        if ":" in str(account):
+            parts = str(account).split(":", 1)
+            email = parts[0]
+            password = parts[1] if len(parts) > 1 else ""
+        else:
+            email = str(account)
+            password = ""
+        
+        accounts.append({
+            "row_index": row_idx,
+            "email": email,
+            "password": password,
+            "cookie": cookie
+        })
+    
+    if reverse_order:
+        accounts.reverse()
+        
+    return accounts
+
+
+def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay=2, slot_index=0, is_first_batch=True, oauth2_account=None, recheck_mode=False):
     """Run MFA worker thread with retries and staggered start
     
     Delay logic:
@@ -2730,7 +2810,8 @@ def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay
             password=account["password"],
             cookie_json=account["cookie"],
             excel_file=excel_file,
-            oauth2_account=oauth2_account
+            oauth2_account=oauth2_account,
+            recheck_mode=recheck_mode
         )
         worker.stop_event = stop_event
         
@@ -2899,6 +2980,8 @@ class CheckoutCaptureWorker:
                     "//button[.//div[contains(text(), \"Okay, let's go\")]]",
                     "//button[contains(., \"Okay, let's go\")]",
                     "//div[@role='dialog']//button[contains(., 'Okay')]",
+                    "//button[.//div[contains(text(), 'Not now')]]",
+                    "//button[contains(., 'Not now')]",
                 ]
                 
                 for selector in button_selectors:
@@ -3421,6 +3504,11 @@ class GlowButton(ctk.CTkButton):
         self.bind("<Enter>", self._on_hover_enter)
         self.bind("<Leave>", self._on_hover_leave)
         
+    def configure(self, require_redraw=False, **kwargs):
+        if "glow_color" in kwargs:
+            self.glow_color = kwargs.pop("glow_color")
+        super().configure(require_redraw=require_redraw, **kwargs)
+
     def _on_hover_enter(self, e=None):
         try:
             self.configure(border_width=2, border_color=self.glow_color)
@@ -3802,6 +3890,9 @@ class App(ctk.CTk):
 
         # UI Motion Engine
         self.motion = Motion(self, MotionTokens)
+        
+        # State tracking
+        self.process_running = False
 
         # Window setup
         self.title("⚡ ChatGPT Auto Tools")
@@ -3826,6 +3917,8 @@ class App(ctk.CTk):
             "accent_primary": "#00f0ff",    # Electric Cyan
             "accent_secondary": "#ff00aa",  # Hot Pink/Magenta
             "accent_tertiary": "#7c3aed",   # Purple
+            "accent_purple": "#a855f7",     # Vivid Purple (NEW)
+            "accent_cyan": "#06b6d4",       # Cyan (NEW)
             "accent_green": "#00ff9f",      # Neon Mint
             "accent_orange": "#ff6b35",     # Coral Orange
             "accent_yellow": "#ffd600",     # Electric Yellow
@@ -4749,16 +4842,44 @@ class App(ctk.CTk):
         # Divider
         ctk.CTkFrame(mfa_settings_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
         
-        # Mode Selection
+        # Mode Selection (Grid Layout for better organization)
         self.mfa_mode_frame = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
         self.mfa_mode_frame.pack(fill="x", padx=16, pady=10)
         
+        # Operation Mode (Enroll vs Recheck)
+        ctk.CTkLabel(
+            self.mfa_mode_frame, 
+            text="Operation Mode", 
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).grid(row=0, column=0, padx=(0, 16), pady=4, sticky="w")
+        
+        self.mfa_op_mode_var = ctk.StringVar(value="Enroll New")
+        self.mfa_op_mode_menu = ctk.CTkOptionMenu(
+            self.mfa_mode_frame, 
+            values=["Enroll New", "Recheck Status"], 
+            variable=self.mfa_op_mode_var, 
+            command=self.update_mfa_ui_state,
+            width=180,
+            height=36,
+            font=self.font_label,
+            dropdown_font=self.font_label,
+            fg_color=self.colors["bg_elevated"],
+            button_color=self.colors["accent_tertiary"],
+            button_hover_color=self.colors["accent_secondary"],
+            dropdown_fg_color=self.colors["bg_card"],
+            dropdown_hover_color=self.colors["bg_card_hover"],
+            corner_radius=10
+        )
+        self.mfa_op_mode_menu.grid(row=0, column=1, pady=4, sticky="e")
+        
+        # Execution Mode (Sequential vs Multithread)
         ctk.CTkLabel(
             self.mfa_mode_frame, 
             text="Execution Mode", 
             font=self.font_label,
             text_color=self.colors["text_secondary"]
-        ).pack(side="left", padx=(0, 16))
+        ).grid(row=1, column=0, padx=(0, 16), pady=4, sticky="w")
         
         self.mfa_mode_var = ctk.StringVar(value="Sequential")
         self.mfa_mode_menu = ctk.CTkOptionMenu(
@@ -4777,7 +4898,9 @@ class App(ctk.CTk):
             dropdown_hover_color=self.colors["bg_card_hover"],
             corner_radius=10
         )
-        self.mfa_mode_menu.pack(side="right")
+        self.mfa_mode_menu.grid(row=1, column=1, pady=4, sticky="e")
+        
+        self.mfa_mode_frame.grid_columnconfigure(0, weight=1)
         
         # Threads Input
         self.mfa_threads_frame = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
@@ -4845,8 +4968,22 @@ class App(ctk.CTk):
             border_color=self.colors["border_subtle"],
             corner_radius=10
         )
-        self.mfa_delay_entry.insert(0, "2")
+        self.mfa_delay_entry.insert(0, "3")
         self.mfa_delay_entry.pack(side="right")
+        
+        # Reverse Order Checkbox (Integrated)
+        self.mfa_recheck_reverse_var = ctk.BooleanVar(value=False)
+        self.mfa_recheck_reverse_cb = ctk.CTkCheckBox(
+            mfa_settings_card,
+            text="Process Bottom-up (Newest First)",
+            variable=self.mfa_recheck_reverse_var,
+            font=self.font_label,
+            fg_color=self.colors["accent_tertiary"],
+            hover_color=self.colors["accent_primary"],
+            text_color=self.colors["text_secondary"]
+        )
+        self.mfa_recheck_reverse_cb.pack(fill="x", padx=16, pady=(0, 16))
+        
         
         # Info tooltip for delay
         self.mfa_delay_info = ctk.CTkLabel(
@@ -4890,10 +5027,11 @@ class App(ctk.CTk):
         self.mfa_btn_frame.pack(fill="x", padx=8, pady=(8, 4))
         
         # Start Button
+        # Start Button
         self.mfa_start_btn = GlowButton(
             self.mfa_btn_frame, 
             text="🔐  START MFA AUTOMATION", 
-            command=self.start_mfa_thread, 
+            command=self.start_mfa_wrapper, 
             fg_color=self.colors["accent_primary"], 
             hover_color="#33ddff",
             text_color="#0a0a0a",
@@ -4931,7 +5069,39 @@ class App(ctk.CTk):
         )
         
         # Initial State
+        # Initial State
         self.toggle_mfa_inputs("Sequential")
+        self.update_mfa_ui_state("Enroll New")
+
+    def update_mfa_ui_state(self, choice):
+        """Update UI based on MFA Operation Mode"""
+        mode = self.mfa_op_mode_var.get()
+        if mode == "Recheck Status":
+            self.mfa_start_btn.configure(
+                text="🔄  START RECHECK_PROCESS",
+                fg_color=self.colors["accent_purple"],
+                glow_color=self.colors["accent_purple"],
+                hover_color="#9933ff"
+            )
+            # Show reverse checkbox (append to bottom of card)
+            self.mfa_recheck_reverse_cb.pack(fill="x", padx=16, pady=(0, 16))
+        else:
+            self.mfa_start_btn.configure(
+                text="🔐  START MFA AUTOMATION",
+                fg_color=self.colors["accent_primary"],
+                glow_color=self.colors["accent_primary"],
+                hover_color="#33ddff"
+            )
+            # Hide reverse checkbox
+            self.mfa_recheck_reverse_cb.pack_forget()
+            
+    def start_mfa_wrapper(self):
+        """Wrapper to route start button to correct function"""
+        mode = self.mfa_op_mode_var.get()
+        if mode == "Recheck Status":
+            self.start_mfa_recheck_thread()
+        else:
+            self.start_mfa_thread()
 
     def setup_checkout_tab(self):
         """Setup the Checkout Capture tab with account selection table"""
@@ -5443,6 +5613,122 @@ class App(ctk.CTk):
             item["var"].set(False)
         self.update_checkout_selection_count()
     
+    def start_mfa_recheck_thread(self):
+        """Start MFA recheck in thread"""
+        threading.Thread(target=self.run_mfa_recheck).start()
+        
+    def run_mfa_recheck(self):
+        """Run MFA recheck process"""
+        if self.process_running:
+            _toast(self, "⚠️ Another process is already running!", toast_type="warning")
+            return
+            
+        excel_file = "chatgpt.xlsx"
+        if not os.path.exists(excel_file):
+            _toast(self, "⚠️ chatgpt.xlsx not found!", toast_type="error")
+            return
+            
+        reverse_order = self.mfa_recheck_reverse_var.get()
+        accounts = load_mfa_accounts_recheck(excel_file, reverse_order=reverse_order)
+        
+        if not accounts:
+            _toast(self, "⚠️ No accounts with MFA found to recheck!", toast_type="warning")
+            return
+            
+        self.lock_ui(True)
+        self.stop_event.clear()
+        
+        # Reuse existing MFA settings for threading
+        try:
+            threads = int(self.mfa_threads_entry.get())
+            threads = max(1, min(threads, 5))
+        except:
+            threads = 1
+            
+        try:
+            thread_delay = int(self.mfa_delay_entry.get())
+        except:
+            thread_delay = 2
+        
+        mode_text = "Bottom-up" if reverse_order else "Top-down"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting MFA Recheck | Mode: {mode_text} | Accounts: {len(accounts)} | Threads: {threads}")
+        self.update_status("RUNNING", self.colors["accent_purple"], f"Rechecking {len(accounts)} accounts ({mode_text})...")
+        
+        self.update_stats(0, 0)
+        success_count = 0
+        fail_count = 0
+        count_lock = threading.Lock()
+        
+        # Setup OAuth2 if needed
+        oauth2_system_acc = None
+        if self.reg_email_mode_var.get() == "OAuth2":
+            oauth2_system_acc = self.oauth2_accounts[0] if self.oauth2_accounts else None
+        
+        def run_worker_wrapper(thread_id, account, idx, start_delay):
+            nonlocal success_count, fail_count
+            
+            if start_delay > 0:
+                # Sleep in intervals
+                for _ in range(int(start_delay * 2)):
+                    if self.stop_event.is_set():
+                        return False, account["email"]
+                    time.sleep(0.5)
+            
+            # Pass recheck_mode=True
+            result, email = run_mfa_worker(
+                thread_id, 
+                account, 
+                excel_file, 
+                self.stop_event, 
+                0, 
+                0, 
+                True, 
+                oauth2_system_acc,
+                recheck_mode=True
+            )
+            
+            with count_lock:
+                if result:
+                    nonlocal success_count
+                    success_count += 1
+                else:
+                    nonlocal fail_count
+                    fail_count += 1
+                self.update_stats(success_count, fail_count)
+            
+            return result, email
+            
+        # Run logic (similar to regular MFA but calling wrapper)
+        if len(accounts) >= 2 and threads > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = []
+                for idx, account in enumerate(accounts):
+                    if self.stop_event.is_set():
+                        break
+                    
+                    slot_idx = idx % threads
+                    start_delay = slot_idx * thread_delay if idx < threads else 0 # Simple delay for start
+                    
+                    thread_id = slot_idx + 1
+                    future = executor.submit(run_worker_wrapper, thread_id, account, idx, start_delay)
+                    futures.append(future)
+                
+                for future in concurrent.futures.as_completed(futures):
+                    if self.stop_event.is_set(): break
+                    try: future.result()
+                    except: pass
+        else:
+            # Sequential
+            for idx, account in enumerate(accounts):
+                if self.stop_event.is_set(): break
+                self.update_status("RUNNING", self.colors["accent_purple"], f"Rechecking {idx+1}/{len(accounts)}: {account['email']}")
+                run_worker_wrapper(1, account, idx, 0)
+
+        # Finish
+        self.lock_ui(False)
+        self.update_status("COMPLETED", None, f"Recheck: {success_count} Success | {fail_count} Failed")
+        _toast(self, f"Recheck Complete: {success_count} passed", toast_type="success")
+
     def start_checkout_capture_thread(self):
         """Start checkout capture in thread"""
         threading.Thread(target=self.run_checkout_capture).start()
