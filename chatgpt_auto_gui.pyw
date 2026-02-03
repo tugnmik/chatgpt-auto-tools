@@ -1330,7 +1330,13 @@ class ChatGPTAutoRegisterWorker:
             self.ensure_personal_tab_active()
             
             button_xpath = (
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
+                # Priority 1: data-testid selector (most reliable from screenshot)
+                "//button[@data-testid='select-plan-button-plus-upgrade']"
+                # Priority 2: "Try for" text (covers "Try for ₩0", "Try for $0", "Try for free", etc.)
+                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
+                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
+                # Fallback: legacy selectors
+                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                 " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
@@ -2947,11 +2953,52 @@ class CheckoutCaptureWorker:
             # Start popup polling thread
             self.start_popup_polling()
             
+            # Wait for page to stabilize (Free offer button appears twice due to auto-reload)
+            if not self.wait_for_page_stable_after_cookie_import():
+                self.log("Warning: Page may not be fully stable", Colors.WARNING, "⚠️ ")
+            
             return True
             
         except Exception as e:
             self.log(f"Failed to import cookies: {e}", Colors.ERROR, "❌ ")
             return False
+    
+    def wait_for_page_stable_after_cookie_import(self, max_wait_seconds=30):
+        """
+        Wait for the page to stabilize after cookie import.
+        Simply wait for 'Free offer' button to appear once, then proceed to #pricing.
+        
+        Returns True if button found, False if timeout
+        """
+        self.log("Waiting for Free offer button...", Colors.INFO, "⏳ ")
+        
+        # XPath for 'Free offer' button based on the provided HTML
+        free_offer_xpath = (
+            "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Free offer')]"
+            " | //button[contains(text(), 'Free offer')]"
+            " | //button[.//text()[contains(., 'Free offer')]]"
+        )
+        
+        start_time = time.time()
+        poll_interval = 0.3
+        
+        while time.time() - start_time < max_wait_seconds:
+            try:
+                buttons = self.driver.find_elements(By.XPATH, free_offer_xpath)
+                button_visible = any(btn.is_displayed() for btn in buttons if btn)
+                
+                if button_visible:
+                    self.log("Free offer button found, page ready!", Colors.SUCCESS, "✅ ")
+                    time.sleep(0.5)
+                    return True
+                    
+            except Exception:
+                pass
+            
+            time.sleep(poll_interval)
+        
+        self.log("Timeout waiting for Free offer button", Colors.WARNING, "⚠️ ")
+        return False
     
     def start_popup_polling(self):
         """Start background thread to continuously check and dismiss onboarding popup"""
@@ -3090,54 +3137,62 @@ class CheckoutCaptureWorker:
                 self.ensure_personal_tab_active()
                 time.sleep(1)
                 
-                # Check if Plus is a free offer (price = $0)
-                # Only check on first attempt to avoid redundant checks
+                # Check if Plus has free offer by detecting BOTH:
+                # 1. text-5xl line-through (original price, e.g. 29000)
+                # 2. text-5xl without line-through (discounted price, e.g. 0)
+                # If BOTH exist -> has free offer, if only non-line-through with value > 0 -> no offer
                 if attempt == 1:
                     try:
-                        # Look for the price element with text-5xl class but NOT line-through
-                        # line-through = original price (crossed out)
-                        # text-5xl without line-through = actual discounted price
-                        price_selectors = [
-                            "//div[@data-testid='plus-pricing-column-cost']//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]",
-                            "//div[contains(@class, 'plus-pricing')]//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]",
-                        ]
+                        # XPath for Plus pricing column
+                        plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
+                        
+                        # Find line-through price (original price)
+                        line_through_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and contains(@class, 'line-through')]"
+                        # Find non-line-through price (actual/discounted price)
+                        actual_price_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]"
+                        
+                        line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
+                        actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
+                        
+                        has_line_through = any(el.is_displayed() for el in line_through_elements if el)
                         
                         actual_price = None
-                        for selector in price_selectors:
-                            price_elements = self.driver.find_elements(By.XPATH, selector)
-                            for price_elem in price_elements:
-                                if price_elem.is_displayed():
-                                    # Double-check class doesn't contain line-through
-                                    elem_class = price_elem.get_attribute("class") or ""
-                                    if "line-through" in elem_class:
-                                        continue  # Skip strikethrough prices
-                                    
-                                    price_text = price_elem.text.strip()
-                                    if price_text:
-                                        actual_price = price_text
-                                        break
-                            if actual_price:
+                        for price_elem in actual_price_elements:
+                            if price_elem.is_displayed():
+                                actual_price = price_elem.text.strip()
                                 break
                         
-                        # Check if actual price is NOT free ($0, 0, ₩0)
-                        if actual_price and actual_price not in ["$0", "0", "₩0"]:
-                            # Check if it contains any non-zero digits
+                        self.log(f"Price check: line-through={has_line_through}, actual={actual_price}", Colors.INFO, "🔍 ")
+                        
+                        # Has free offer if: has line-through AND actual price is 0
+                        if has_line_through and actual_price:
+                            # Extract digits from actual price
+                            digits = ''.join(filter(str.isdigit, actual_price))
+                            if not digits or int(digits) == 0:
+                                self.log(f"Plus FREE offer detected! (original crossed out, current: {actual_price})", Colors.SUCCESS, "✅ ")
+                            else:
+                                # Has line-through but price is not 0 - unusual case
+                                self.log(f"Plus discounted price: {actual_price}", Colors.INFO, "💰 ")
+                        elif actual_price:
+                            # No line-through, just regular price
                             digits = ''.join(filter(str.isdigit, actual_price))
                             if digits and int(digits) > 0:
                                 self.log(f"Plus price is {actual_price} - no free offer available", Colors.WARNING, "⚠️ ")
                                 return "NO_PLUS_OFFER"
-                        else:
-                            self.log(f"Plus offer detected: {actual_price}", Colors.SUCCESS, "✅ ")
-                            
+                            else:
+                                self.log(f"Plus offer detected: {actual_price}", Colors.SUCCESS, "✅ ")
+                                
                     except Exception as e:
                         self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
 
                 
-                # Find and click Get Plus button
+                # Find and click Plus button - includes "Try for free", "Try for ₩0", "Get Plus", etc.
                 button_xpath = (
-                    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
+                    "//button[@data-testid='select-plan-button-plus-upgrade']"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
                     " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                    " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
                 )
 
                 
@@ -3145,14 +3200,14 @@ class CheckoutCaptureWorker:
                 try:
                     button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
                 except:
-                    self.log("Get Plus button not found, ensuring Personal tab...", Colors.WARNING, "⚠️ ")
+                    self.log("Plus upgrade button not found, ensuring Personal tab...", Colors.WARNING, "⚠️ ")
                     # Try to switch to Personal tab and retry finding button
                     self.ensure_personal_tab_active()
                     time.sleep(1)
                     try:
                         button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
                     except:
-                        self.log("Get Plus button still not found", Colors.WARNING, "⚠️ ")
+                        self.log("Plus upgrade button still not found", Colors.WARNING, "⚠️ ")
                 
                 if not button:
                     if attempt < max_attempts:
@@ -3160,8 +3215,9 @@ class CheckoutCaptureWorker:
                     return None
                 
                 handles_before = list(self.driver.window_handles)
+                button_text = button.text.strip() if button.text else "Plus"
                 button.click()
-                self.log("Clicked Get Plus", Colors.SUCCESS, "✅ ")
+                self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
                 time.sleep(1)
                 
                 # Check for new tab
