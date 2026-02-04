@@ -3283,34 +3283,40 @@ class CheckoutCaptureWorker:
     
     def get_business_checkout(self):
         """Get Business checkout link with retry logic"""
-        business_url = "https://chatgpt.com/?numSeats=5&selectedPlan=month&referrer=#team-pricing-seat-selection"
+        pricing_url = "https://chatgpt.com/#pricing"
         max_attempts = 3
         
         for attempt in range(1, max_attempts + 1):
             try:
                 self.log(f"Getting Business checkout link (attempt {attempt}/{max_attempts})...", Colors.INFO, "💼 ")
                 
-                # Navigate to business pricing
-                self.driver.get(business_url)
-                time.sleep(3)
+                # Navigate to pricing page (Business tab is default)
+                self.driver.get(pricing_url)
+                time.sleep(2)
                 
                 wait = WebDriverWait(self.driver, self.net["element_timeout"])
                 
-                # Find Continue to billing button
+                # Find and click Business button - includes "Claim free offer", "Try for free", etc.
+                # Using data-testid from the HTML: select-plan-button-teams-create
                 button_xpath = (
-                    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue to billing')]"
-                    " | //button[contains(@class, 'btn-green')]"
+                    "//button[@data-testid='select-plan-button-teams-create']"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get team')]"
                 )
                 
+                button = None
                 try:
                     button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
                 except:
-                    self.log("Continue to billing button not found", Colors.WARNING, "⚠️ ")
+                    self.log("Business button not found, retrying...", Colors.WARNING, "⚠️ ")
                     if attempt < max_attempts:
                         continue
                     return None
                 
                 handles_before = list(self.driver.window_handles)
+                button_text = button.text.strip() if button.text else "Business"
                 
                 # Try multiple click methods
                 try:
@@ -3322,7 +3328,7 @@ class CheckoutCaptureWorker:
                         from selenium.webdriver.common.action_chains import ActionChains
                         ActionChains(self.driver).move_to_element(button).click().perform()
                 
-                self.log("Clicked Continue to billing", Colors.SUCCESS, "✅ ")
+                self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
                 time.sleep(1)
                 
                 # Check for new tab
@@ -3345,10 +3351,10 @@ class CheckoutCaptureWorker:
                         if len(self.driver.window_handles) > 1:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to business pricing page
-                        self.log("Refreshing and navigating back to business pricing...", Colors.INFO, "🔄 ")
-                        self.driver.get(business_url)
-                        time.sleep(3)
+                        # Navigate back to pricing page
+                        self.log("Refreshing and navigating back to pricing...", Colors.INFO, "🔄 ")
+                        self.driver.get(pricing_url)
+                        time.sleep(2)
                         continue
                     else:
                         self.log(f"{error_type.capitalize()} persists, cannot capture Business link", Colors.ERROR, "❌ ")
@@ -3363,9 +3369,9 @@ class CheckoutCaptureWorker:
                         if len(self.driver.window_handles) > 1:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to business pricing page
-                        self.driver.get(business_url)
-                        time.sleep(3)
+                        # Navigate back to pricing page
+                        self.driver.get(pricing_url)
+                        time.sleep(2)
                         continue
                     return None
                     
