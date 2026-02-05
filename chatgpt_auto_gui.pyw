@@ -3329,7 +3329,7 @@ class CheckoutCaptureWorker:
                         ActionChains(self.driver).move_to_element(button).click().perform()
                 
                 self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
-                time.sleep(1)
+                time.sleep(2)
                 
                 # Check for new tab
                 handles_after = self.driver.window_handles
@@ -3337,6 +3337,41 @@ class CheckoutCaptureWorker:
                 if new_handles:
                     self.driver.switch_to.window(new_handles[-1])
                     self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
+                
+                # Check for "Continue to billing" button (seat selection page)
+                # This appears when user needs to select number of seats before checkout
+                continue_billing_xpath = (
+                    "//button[contains(@class, 'btn-green') and .//div[contains(text(), 'Continue to billing')]]"
+                    " | //button[contains(@class, 'btn-green') and contains(., 'Continue to billing')]"
+                    " | //button[.//div[contains(text(), 'Continue to billing')]]"
+                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue to billing')]"
+                )
+                
+                try:
+                    continue_btn = WebDriverWait(self.driver, 3).until(
+                        EC.element_to_be_clickable((By.XPATH, continue_billing_xpath))
+                    )
+                    if continue_btn:
+                        self.log("Found 'Continue to billing' button, clicking...", Colors.INFO, "💳 ")
+                        try:
+                            continue_btn.click()
+                        except Exception:
+                            self.driver.execute_script("arguments[0].click();", continue_btn)
+                        self.log("Clicked 'Continue to billing'", Colors.SUCCESS, "✅ ")
+                        time.sleep(1)
+                        
+                        # Check for new tab again after clicking Continue to billing
+                        handles_after_billing = self.driver.window_handles
+                        new_handles_billing = [h for h in handles_after_billing if h not in handles_before]
+                        if new_handles_billing and self.driver.current_window_handle not in new_handles_billing:
+                            self.driver.switch_to.window(new_handles_billing[-1])
+                            self.log("Switched to checkout tab after billing", Colors.INFO, "🪟 ")
+                except TimeoutException:
+                    # No "Continue to billing" button, proceed directly to poll checkout
+                    pass
+                except Exception:
+                    # Ignore errors, continue to poll checkout
+                    pass
                 
                 # Use polling to check for checkout URL or error
                 self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
