@@ -5730,11 +5730,12 @@ class App(ctk.CTk):
                 email_label.grid(row=0, column=1, padx=4, pady=2, sticky="w")
                 self.checkout_account_widgets.append(email_label)
                 
-                # Plus status
-                if account["plus_url"] == "no Plus offer":
+                # Plus status - check for "No offer" or "no Plus offer"
+                plus_url = account["plus_url"]
+                if plus_url and ("no offer" in str(plus_url).lower() or "no plus offer" in str(plus_url).lower()):
                     plus_status = "⛔"
                     plus_color = self.colors["error"]
-                elif account["plus_url"]:
+                elif plus_url:
                     plus_status = "✅"
                     plus_color = self.colors["accent_green"]
                 else:
@@ -5750,9 +5751,17 @@ class App(ctk.CTk):
                 plus_label.grid(row=0, column=2, padx=4, pady=2, sticky="w")
                 self.checkout_account_widgets.append(plus_label)
                 
-                # Business status
-                business_status = "✅" if account["business_url"] else "❌"
-                business_color = self.colors["accent_green"] if account["business_url"] else self.colors["text_muted"]
+                # Business status - check for "No offer" or "no Plus offer"
+                business_url = account["business_url"]
+                if business_url and ("no offer" in str(business_url).lower() or "no plus offer" in str(business_url).lower()):
+                    business_status = "⛔"
+                    business_color = self.colors["error"]
+                elif business_url:
+                    business_status = "✅"
+                    business_color = self.colors["accent_green"]
+                else:
+                    business_status = "❌"
+                    business_color = self.colors["text_muted"]
                 business_label = ctk.CTkLabel(
                     row_frame, 
                     text=business_status,
