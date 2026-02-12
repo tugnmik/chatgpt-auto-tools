@@ -26,6 +26,9 @@ import warnings
 import traceback
 import tempfile
 import shutil
+import base64
+import socket
+import select
 import pyotp
 from openpyxl import Workbook, load_workbook
 import customtkinter as ctk
@@ -69,6 +72,307 @@ NETWORK_SETTINGS = {
 # Default password for registration (editable via GUI)
 DEFAULT_PASSWORD = "Matkhau123!@#"
 
+# Proxy settings
+PROXY_CONFIG_FILE = "proxy_config.json"
+PROXY_ENABLED = False
+PROXY_STRING = ""
+PROXY_FORMAT = "username:password@hostname:port"  # Default format
+
+def detect_proxy_format(proxy_string):
+    """Auto-detect proxy format from string.
+    Supports:
+      - username:password@hostname:port  (has @)
+      - hostname:port:username:password   (port is 2nd, numeric)
+      - username:password:hostname:port   (port is last, numeric)
+    Returns format name or None."""
+    proxy_string = proxy_string.strip()
+    if not proxy_string:
+        return None
+    if '@' in proxy_string:
+        return "username:password@hostname:port"
+    parts = proxy_string.split(':')
+    if len(parts) == 4:
+        # Check if 2nd part is numeric → hostname:port:user:pass
+        if parts[1].strip().isdigit():
+            return "hostname:port:username:password"
+        # Check if last part is numeric → user:pass:hostname:port
+        if parts[3].strip().isdigit():
+            return "username:password:hostname:port"
+    return None
+
+def parse_proxy(proxy_string, format_type=None):
+    """Parse proxy string into components. Auto-detects format if not specified.
+    Returns dict {host, port, username, password} and urls dict."""
+    proxy_string = proxy_string.strip()
+    if not proxy_string:
+        return None, None
+    
+    if not format_type:
+        format_type = detect_proxy_format(proxy_string)
+    if not format_type:
+        return None, None
+    
+    try:
+        if format_type == "hostname:port:username:password":
+            parts = proxy_string.split(':')
+            if len(parts) != 4:
+                return None, None
+            host, port, username, password = parts
+        elif format_type == "username:password:hostname:port":
+            parts = proxy_string.split(':')
+            if len(parts) != 4:
+                return None, None
+            username, password, host, port = parts
+        elif format_type == "username:password@hostname:port":
+            if '@' not in proxy_string:
+                return None, None
+            creds, server = proxy_string.split('@', 1)
+            cred_parts = creds.split(':', 1)
+            server_parts = server.split(':', 1)
+            if len(cred_parts) != 2 or len(server_parts) != 2:
+                return None, None
+            username, password = cred_parts
+            host, port = server_parts
+        else:
+            return None, None
+        
+        port = port.strip()
+        proxy_info = {
+            "host": host.strip(),
+            "port": port,
+            "username": username.strip(),
+            "password": password.strip()
+        }
+        chrome_url = f"http://{host.strip()}:{port}"
+        requests_url = f"http://{username.strip()}:{password.strip()}@{host.strip()}:{port}"
+        return proxy_info, {"chrome": chrome_url, "requests": requests_url}
+    except Exception:
+        return None, None
+
+class LocalProxyAuthBridge:
+    """Local HTTP proxy bridge (no auth) -> upstream HTTP proxy (with Basic auth).
+
+    Why: Chrome + undetected_chromedriver is unreliable with proxy auth popups / extensions / CDP.
+    This bridge makes Chrome talk to 127.0.0.1 without authentication, while the bridge
+    injects Proxy-Authorization for the upstream proxy.
+    """
+
+    def __init__(self, upstream_host, upstream_port, username, password, log_func=None):
+        self.upstream_host = (upstream_host or "").strip()
+        self.upstream_port = int(upstream_port)
+        self.username = username or ""
+        self.password = password or ""
+        self._log = log_func
+        self._stop_event = threading.Event()
+        self._server = None
+        self._thread = None
+        self.bound_host = "127.0.0.1"
+        self.bound_port = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.bound_host, 0))
+        server.listen(50)
+        self._server = server
+        self.bound_port = int(server.getsockname()[1])
+
+        self._thread = threading.Thread(target=self._serve, name="LocalProxyAuthBridge", daemon=True)
+        self._thread.start()
+
+        self._safe_log(f"[ProxyBridge] {self.bound_host}:{self.bound_port} -> {self.upstream_host}:{self.upstream_port}")
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            if self._server:
+                self._server.close()
+        except Exception:
+            pass
+        self._server = None
+
+    def _safe_log(self, msg):
+        if not self._log:
+            return
+        try:
+            self._log(msg)
+        except Exception:
+            pass
+
+    def _serve(self):
+        while not self._stop_event.is_set() and self._server:
+            try:
+                client, _addr = self._server.accept()
+                threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+            except OSError:
+                break
+            except Exception:
+                continue
+
+    def _recv_until(self, sock_obj, marker=b"\r\n\r\n", max_bytes=256 * 1024):
+        data = b""
+        while marker not in data and len(data) < max_bytes:
+            chunk = sock_obj.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def _inject_proxy_auth_header(self, header_bytes):
+        auth_b64 = base64.b64encode(f"{self.username}:{self.password}".encode("utf-8")).decode("ascii")
+        auth_line = f"Proxy-Authorization: Basic {auth_b64}".encode("latin1")
+
+        low = header_bytes.lower()
+        if b"\r\nproxy-authorization:" in low:
+            return header_bytes
+
+        # Insert after request line
+        parts = header_bytes.split(b"\r\n", 1)
+        if len(parts) != 2:
+            return header_bytes
+        return parts[0] + b"\r\n" + auth_line + b"\r\n" + parts[1]
+
+    def _tunnel(self, sock_a, sock_b):
+        sock_a.setblocking(False)
+        sock_b.setblocking(False)
+        sockets = [sock_a, sock_b]
+        while True:
+            try:
+                readable, _w, _x = select.select(sockets, [], [], 30)
+            except Exception:
+                return
+            if not readable:
+                continue
+            for s in readable:
+                other = sock_b if s is sock_a else sock_a
+                try:
+                    data = s.recv(65536)
+                except Exception:
+                    return
+                if not data:
+                    return
+                try:
+                    other.sendall(data)
+                except Exception:
+                    return
+
+    def _handle_client(self, client):
+        upstream = None
+        try:
+            client.settimeout(15)
+            header = self._recv_until(client)
+            if not header:
+                return
+
+            upstream = socket.create_connection((self.upstream_host, self.upstream_port), timeout=20)
+            upstream.settimeout(20)
+
+            header = self._inject_proxy_auth_header(header)
+            upstream.sendall(header)
+
+            # For CONNECT, we need to forward the upstream response header first, then tunnel.
+            first_line = header.split(b"\r\n", 1)[0].decode("latin1", errors="ignore")
+            if first_line.upper().startswith("CONNECT "):
+                resp = self._recv_until(upstream, max_bytes=64 * 1024)
+                if not resp:
+                    return
+                client.sendall(resp)
+                # Only tunnel on 200
+                status_line = resp.split(b"\r\n", 1)[0]
+                if b" 200 " not in status_line:
+                    return
+
+            # Tunnel both directions (also works for non-CONNECT)
+            self._tunnel(client, upstream)
+        except Exception:
+            return
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+            try:
+                if upstream:
+                    upstream.close()
+            except Exception:
+                pass
+
+def get_proxy_for_requests():
+    """Get proxy dict for requests library. Returns None if proxy disabled."""
+    if not PROXY_ENABLED or not PROXY_STRING:
+        return None
+    proxy_info, urls = parse_proxy(PROXY_STRING)
+    if not proxy_info or not urls:
+        return None
+    req_url = urls["requests"]
+    return {"http": req_url, "https": req_url}
+
+def apply_proxy_to_chrome_options(options):
+    """Apply proxy settings to Chrome options.
+
+    Returns (bridge, label) where bridge is a LocalProxyAuthBridge or None.
+    """
+    if not PROXY_ENABLED or not PROXY_STRING:
+        return None, None
+    proxy_info, urls = parse_proxy(PROXY_STRING)
+    if not proxy_info or not urls:
+        return None, None
+    
+    host = (proxy_info.get("host") or "").strip()
+    port = str(proxy_info.get("port") or "").strip()
+    username = (proxy_info.get("username") or "").strip()
+    password = (proxy_info.get("password") or "").strip()
+
+    # Always ensure Chrome gets only host:port (never embed creds)
+    if not host or not port.isdigit():
+        return None, None
+
+    # Auth proxy: run a local bridge so Chrome never shows auth popup
+    if username and password:
+        bridge = LocalProxyAuthBridge(host, int(port), username, password)
+        bridge.start()
+        options.add_argument(f'--proxy-server=http://127.0.0.1:{bridge.bound_port}')
+        return bridge, f"127.0.0.1:{bridge.bound_port}"
+
+    # No-auth proxy
+    options.add_argument(f'--proxy-server=http://{host}:{port}')
+    return None, f"{host}:{port}"
+
+def load_proxy_config():
+    """Load proxy configuration from JSON file."""
+    global PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+    try:
+        if os.path.exists(PROXY_CONFIG_FILE):
+            with open(PROXY_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            PROXY_ENABLED = config.get("enabled", False)
+            PROXY_STRING = config.get("proxy_string", "")
+            PROXY_FORMAT = config.get("format", "username:password@hostname:port")
+            return PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+    except Exception:
+        pass
+    return False, "", "username:password@hostname:port"
+
+def save_proxy_config(enabled, proxy_string, fmt):
+    """Save proxy configuration to JSON file."""
+    try:
+        config = {
+            "enabled": enabled,
+            "proxy_string": proxy_string,
+            "format": fmt
+        }
+        with open(PROXY_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+# Load proxy config on startup
+load_proxy_config()
+
 # Define colors
 class Colors:
     SUCCESS = Fore.GREEN
@@ -90,13 +394,14 @@ class TempMailAPI:
     
     def __init__(self):
         self.base_url = "https://tinyhost.shop"
+        self.proxies = get_proxy_for_requests()
     
     def get_random_domains(self, limit=10):
         """Lấy danh sách domain ngẫu nhiên"""
         try:
             url = f"{self.base_url}/api/random-domains/"
             params = {"limit": limit}
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=10, proxies=self.proxies)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -107,7 +412,7 @@ class TempMailAPI:
         try:
             url = f"{self.base_url}/api/email/{domain}/{user}/"
             params = {"page": page, "limit": limit}
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=10, proxies=self.proxies)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -117,7 +422,7 @@ class TempMailAPI:
         """Lấy chi tiết một email"""
         try:
             url = f"{self.base_url}/api/email/{domain}/{user}/{email_id}"
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10, proxies=self.proxies)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -159,7 +464,8 @@ class DongVanOAuth2API:
             "client_id": self.client_id,
         }
         try:
-            response = requests.post(self.API_MESSAGES_URL, json=payload, timeout=20)
+            proxies = get_proxy_for_requests()
+            response = requests.post(self.API_MESSAGES_URL, json=payload, timeout=20, proxies=proxies)
             response.raise_for_status()
             return response.json()
         except requests.RequestException:
@@ -367,13 +673,20 @@ class ChatGPTAutoRegisterWorker:
         
         self.driver = None
         self.user_data_dir = None
+        self.proxy_bridge = None
         self.stop_event = None
         self.operation_timeout_detected = False
         self.max_timeout_retries = 2
         self.current_retry = 0
         
         # Network settings based on mode
-        self.net = NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"])
+        self.net = dict(NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"]))
+        # Multi-thread + multiple visible windows can trigger Chrome occlusion/background throttling.
+        # Add a bit more patience to element waits/retries to avoid focus-dependent failures.
+        if self.num_threads and self.num_threads > 1:
+            self.net["max_retries"] = max(int(self.net.get("max_retries", 1)), 2)
+            self.net["element_timeout"] = max(float(self.net.get("element_timeout", 5)), 7)
+            self.net["page_load_timeout"] = max(float(self.net.get("page_load_timeout", 15)), 20)
         
     def log(self, message, color=Colors.INFO, emoji=""):
         """Log with thread ID"""
@@ -388,6 +701,13 @@ class ChatGPTAutoRegisterWorker:
             except Exception:
                 pass
             self.driver = None
+
+        if self.proxy_bridge:
+            try:
+                self.proxy_bridge.stop()
+            except Exception:
+                pass
+            self.proxy_bridge = None
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             try:
                 shutil.rmtree(self.user_data_dir, ignore_errors=True)
@@ -482,6 +802,12 @@ class ChatGPTAutoRegisterWorker:
                 options.add_argument('--window-size=900,700')
                 options.add_argument('--disable-blink-features=AutomationControlled')
                 options.add_argument('--lang=en-US')  # Set browser language to English (MM/DD/YYYY format)
+
+                # Improve stability when Chrome windows are background/occluded (multi-thread)
+                options.add_argument('--disable-background-timer-throttling')
+                options.add_argument('--disable-backgrounding-occluded-windows')
+                options.add_argument('--disable-renderer-backgrounding')
+                options.add_argument('--disable-features=CalculateNativeWinOcclusion')
             
                 
                 # Disable notifications
@@ -491,6 +817,11 @@ class ChatGPTAutoRegisterWorker:
                     "profile.default_content_setting_values.notifications": 2
                 }
                 options.add_experimental_option("prefs", prefs)
+                
+                # Apply proxy if enabled
+                self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
+                if proxy_label:
+                    self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
                 
                 if attempt > 0:
                     delay = attempt * 2
@@ -558,6 +889,10 @@ class ChatGPTAutoRegisterWorker:
     
     def move_mouse_randomly(self):
         """Move mouse randomly (fast)"""
+        # In multi-thread mode, simulated mouse movement can become focus-dependent.
+        # Skip it to keep interactions background-safe.
+        if getattr(self, 'num_threads', 1) > 1:
+            return
         try:
             action = ActionChains(self.driver)
             for _ in range(random.randint(1, 2)):
@@ -666,31 +1001,63 @@ class ChatGPTAutoRegisterWorker:
             
             # Try multiple click methods
             click_success = False
+            # Prefer DOM click methods first (more reliable in background windows)
             try:
-                self.move_mouse_randomly()
-                ActionChains(self.driver).move_to_element(login_button).pause(0.3).click().perform()
+                login_button.click()
                 click_success = True
             except Exception:
                 pass
-            
-            if not click_success:
-                try:
-                    login_button.click()
-                    click_success = True
-                except Exception:
-                    pass
-            
+
             if not click_success:
                 try:
                     self.driver.execute_script("arguments[0].click();", login_button)
                     click_success = True
                 except Exception:
                     pass
+
+            # Optional: only use ActionChains/mouse simulation when single-thread
+            if not click_success and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(login_button).pause(0.3).click().perform()
+                    click_success = True
+                except Exception:
+                    pass
             
             if click_success:
                 self.log("Clicked Log in", Colors.SUCCESS, "✅ ")
+
+                def _login_ready(d):
+                    try:
+                        url = (d.current_url or "").lower()
+                    except Exception:
+                        url = ""
+                    if "auth.openai.com" in url or "/auth" in url:
+                        return True
+                    # Some variants render login inline; detect email field.
+                    try:
+                        if d.find_elements(By.CSS_SELECTOR, "input[type='email']"):
+                            return True
+                        if d.find_elements(By.CSS_SELECTOR, "input[name='email']"):
+                            return True
+                        if d.find_elements(By.ID, "email"):
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                ready = False
+                try:
+                    WebDriverWait(self.driver, self.net["element_timeout"]).until(_login_ready)
+                    ready = True
+                except Exception:
+                    ready = False
+
+                if not ready:
+                    self.log("Login flow not ready (no email input detected)", Colors.ERROR, "❌ ")
+
                 time.sleep(self.net["extra_wait"])
-                return True
+                return bool(ready)
             else:
                 self.log("Failed to click Log in button", Colors.ERROR, "❌ ")
                 return False
@@ -766,10 +1133,17 @@ class ChatGPTAutoRegisterWorker:
                 if attempt < max_retries - 1:
                     self.log("Email input not found, refreshing page...", Colors.WARNING, "🔄 ")
                     try:
-                        self.driver.get("https://auth.openai.com/authorize")
+                        # Do NOT force-navigate to auth.openai.com/authorize.
+                        # Instead, refresh chatgpt.com and click Log in again.
+                        self.driver.get("https://chatgpt.com/")
                         time.sleep(self.net["retry_delay"])
+                        self.click_login_button()
+                        time.sleep(self.net["extra_wait"])
                     except Exception:
-                        self.driver.get("https://chatgpt.com")
+                        try:
+                            self.driver.refresh()
+                        except Exception:
+                            pass
                         time.sleep(self.net["retry_delay"])
                         self.click_login_button()
                         time.sleep(self.net["extra_wait"])
@@ -786,19 +1160,30 @@ class ChatGPTAutoRegisterWorker:
             
             # Scroll and interact
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", email_input)
-            self.human_like_delay(0.2, 0.3)
+            self.human_like_delay(0.1, 0.2)
             
             # Try multiple click methods
+            clicked = False
             try:
-                self.move_mouse_randomly()
-                ActionChains(self.driver).move_to_element(email_input).click().perform()
+                email_input.click()
+                clicked = True
             except Exception:
+                pass
+
+            if not clicked:
                 try:
-                    email_input.click()
-                except Exception:
                     self.driver.execute_script("arguments[0].click();", email_input)
-            
-            self.human_like_delay(0.1, 0.2)
+                    clicked = True
+                except Exception:
+                    pass
+
+            if not clicked and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(email_input).click().perform()
+                    clicked = True
+                except Exception:
+                    pass
             
             # Clear and type
             try:
@@ -865,22 +1250,22 @@ class ChatGPTAutoRegisterWorker:
             # Try multiple click methods
             click_success = False
             try:
-                self.move_mouse_randomly()
-                ActionChains(self.driver).move_to_element(continue_button).pause(0.2).click().perform()
+                continue_button.click()
                 click_success = True
             except Exception:
                 pass
-            
-            if not click_success:
-                try:
-                    continue_button.click()
-                    click_success = True
-                except Exception:
-                    pass
-            
+
             if not click_success:
                 try:
                     self.driver.execute_script("arguments[0].click();", continue_button)
+                    click_success = True
+                except Exception:
+                    pass
+
+            if not click_success and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(continue_button).pause(0.2).click().perform()
                     click_success = True
                 except Exception:
                     pass
@@ -898,17 +1283,30 @@ class ChatGPTAutoRegisterWorker:
             return False
     
     def enter_password(self):
-        """Enter password with retry based on network mode"""
+        """Enter password with retry based on network mode - handles both log-in and create-account flows"""
         try:
             max_retries = self.net["max_retries"]
             
+            # Check if we're on create-account page (new password) or log-in page (existing password)
+            current_url = self.driver.current_url or ""
+            is_create_account = "create-account" in current_url.lower()
+            if is_create_account:
+                self.log("Detected create-account flow (new password)", Colors.INFO, "ℹ️ ")
+            
+            # Selectors for both flows: log-in (existing) and create-account (new password)
             selectors = [
+                # CREATE ACCOUNT flow (new password) - check FIRST
+                (By.XPATH, "//input[@name='new-password']"),
+                (By.XPATH, "//input[@autocomplete='new-password']"),
+                (By.XPATH, "//input[contains(@id, 'new-password')]"),
+                # LOG IN flow (existing password)
                 (By.ID, "password"),
                 (By.XPATH, "//input[@id='password']"),
-                (By.XPATH, "//input[@type='password']"),
                 (By.XPATH, "//input[@name='password']"),
                 (By.XPATH, "//input[@aria-label='Password']"),
                 (By.XPATH, "//input[@aria-label='Mật khẩu']"),
+                # Generic fallback
+                (By.XPATH, "//input[@type='password']"),
                 (By.XPATH, "//input[contains(@class, 'password')]"),
             ]
             
@@ -953,22 +1351,38 @@ class ChatGPTAutoRegisterWorker:
                 try:
                     current_url = self.driver.current_url
                     self.log(f"Current URL: {current_url}", Colors.INFO, "ℹ️ ")
+                    # Log page title for debugging
+                    page_title = self.driver.title
+                    self.log(f"Page title: {page_title}", Colors.INFO, "ℹ️ ")
                 except Exception:
                     pass
                 return False
             
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", password_input)
-            self.human_like_delay(0.2, 0.3)
+        
             
             # Try multiple click methods
+            clicked = False
             try:
-                self.move_mouse_randomly()
-                ActionChains(self.driver).move_to_element(password_input).click().perform()
+                password_input.click()
+                clicked = True
             except Exception:
+                pass
+
+            if not clicked:
                 try:
-                    password_input.click()
-                except Exception:
                     self.driver.execute_script("arguments[0].click();", password_input)
+                    clicked = True
+                except Exception:
+                    pass
+
+            if not clicked and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(password_input).click().perform()
+                    clicked = True
+                except Exception:
+                    pass
             
             self.human_like_delay(0.1, 0.2)
             
@@ -981,7 +1395,6 @@ class ChatGPTAutoRegisterWorker:
             self.human_like_typing(password_input, self.password)
             self.log("Entered password", Colors.SUCCESS, "✅ ")
             
-            self.human_like_delay(0.1, 0.2)
             return True
             
         except Exception as e:
@@ -1033,11 +1446,13 @@ class ChatGPTAutoRegisterWorker:
         except Exception as e:
             return False
     
-    def wait_and_get_otp(self, max_attempts=30, wait_seconds=5, max_resend=2):
+    def wait_and_get_otp(self, max_attempts=15, wait_seconds=5, max_resend=2):
         """Wait and get OTP from email"""
         self.log("Waiting for OTP...", Colors.INFO, "📧 ")
         
         resend_count = 0
+        checked_email_ids = set()
+        tinyhost_empty_streak = 0
         
         for attempt in range(max_attempts):
             # Check for timeout error during OTP wait
@@ -1061,6 +1476,18 @@ class ChatGPTAutoRegisterWorker:
                 domain = self.email_info['domain']
                 
                 emails_data = self.mail_api.get_emails(domain, username, page=1, limit=5)
+
+                if not emails_data:
+                    tinyhost_empty_streak += 1
+                    # Log occasionally to avoid spamming
+                    if tinyhost_empty_streak in (1, 5, 10, 15):
+                        self.log(
+                            f"TinyHost inbox fetch returned empty/None (streak={tinyhost_empty_streak})",
+                            Colors.WARNING,
+                            "⚠️ "
+                        )
+                else:
+                    tinyhost_empty_streak = 0
                 
                 if emails_data and emails_data.get('emails'):
                     for email_item in emails_data['emails']:
@@ -1068,19 +1495,32 @@ class ChatGPTAutoRegisterWorker:
                         subject = email_item.get('subject', '').lower()
                         
                         if 'openai' in sender or 'verification' in subject or 'code' in subject:
-                            email_id = email_item['id']
-                            
+                            # Fast path: OTP often appears in subject (e.g., "Your ChatGPT code is 123456")
+                            otp_from_subject = self.extract_otp_from_email(subject)
+                            if otp_from_subject:
+                                self.log(f"Got OTP: {otp_from_subject}", Colors.SUCCESS, "✅ ")
+                                return otp_from_subject
+
+                            email_id = email_item.get('id')
+                            if not email_id:
+                                continue
+                            if email_id in checked_email_ids:
+                                continue
+                            checked_email_ids.add(email_id)
+
+                            # Slow path: fetch detail only for the newest matching message.
                             email_detail = self.mail_api.get_email_detail(domain, username, email_id)
-                            
                             if email_detail:
                                 body = email_detail.get('body', '')
                                 html_body = email_detail.get('html_body', '')
                                 full_content = f"{body} {html_body}"
                                 otp = self.extract_otp_from_email(full_content)
-                                
                                 if otp:
                                     self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
                                     return otp
+
+                            # Don't spam detail calls in one polling cycle
+                            break
             
             # Resend if needed (only for TinyHost mode)
             if self.email_mode != "OAuth2" and attempt == max_attempts // 3 and resend_count < max_resend:
@@ -1104,40 +1544,90 @@ class ChatGPTAutoRegisterWorker:
         return None
     
     def enter_otp_code(self, otp):
-        """Enter OTP"""
+        """Enter OTP - handles both new (6 separate digit inputs) and old (single field) formats"""
         try:
-            wait = WebDriverWait(self.driver, 1)
+            wait = WebDriverWait(self.driver, 2)
             time.sleep(0.5)
             
+            # NEW FORMAT: Try 6 separate digit inputs first (aria-label="Digit 1" through "Digit 6")
+            try:
+                digit_inputs = []
+                for i in range(1, 7):
+                    inp = self.driver.find_element(By.XPATH, f"//input[@aria-label='Digit {i}']")
+                    if inp and inp.is_displayed():
+                        digit_inputs.append(inp)
+                
+                if len(digit_inputs) == 6 and len(otp) == 6:
+                    self.log("Detected new 6-digit separate input format", Colors.INFO, "ℹ️ ")
+                    for i, digit in enumerate(otp):
+                        try:
+                            digit_inputs[i].click()
+                            time.sleep(0.05)
+                            digit_inputs[i].send_keys(digit)
+                            time.sleep(0.05)
+                        except Exception:
+                            # Fallback: direct send_keys
+                            digit_inputs[i].send_keys(digit)
+                    self.log("Entered OTP (6-digit format)", Colors.SUCCESS, "✅ ")
+                    self.human_like_delay(0.2, 0.4)
+                    return True
+            except Exception:
+                pass
+            
+            # OLD FORMAT: Single input field
             selectors = [
                 (By.ID, "code"),
                 (By.XPATH, "//input[@id='code']"),
                 (By.XPATH, "//input[@name='code']"),
                 (By.XPATH, "//input[@inputmode='numeric']"),
+                (By.XPATH, "//input[@placeholder='Code']"),
             ]
             
             code_input = None
             for by, selector in selectors:
                 try:
                     code_input = wait.until(EC.presence_of_element_located((by, selector)))
-                    break
+                    if code_input.is_displayed():
+                        break
+                    else:
+                        code_input = None
                 except:
                     continue
             
             if not code_input:
-                self.log("Could not find code input", Colors.ERROR, "❌ ")
+                self.log("Could not find code input (old or new format)", Colors.ERROR, "❌ ")
                 return False
             
+            self.log("Detected old single-field OTP format", Colors.INFO, "ℹ️ ")
             self.driver.execute_script("arguments[0].scrollIntoView(true);", code_input)
             self.human_like_delay(0.2, 0.4)
-            
-            self.move_mouse_randomly()
-            ActionChains(self.driver).move_to_element(code_input).click().perform()
+
+            clicked = False
+            try:
+                code_input.click()
+                clicked = True
+            except Exception:
+                pass
+
+            if not clicked:
+                try:
+                    self.driver.execute_script("arguments[0].click();", code_input)
+                    clicked = True
+                except Exception:
+                    pass
+
+            if not clicked and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(code_input).click().perform()
+                    clicked = True
+                except Exception:
+                    pass
             self.human_like_delay(0.2, 0.4)
             
             code_input.clear()
             self.human_like_typing(code_input, otp)
-            self.log("Entered OTP", Colors.SUCCESS, "✅ ")
+            self.log("Entered OTP (single-field format)", Colors.SUCCESS, "✅ ")
             
             self.human_like_delay(0.2, 0.4)
             return True
@@ -1149,7 +1639,7 @@ class ChatGPTAutoRegisterWorker:
     def enter_name_and_dob(self):
         """Enter name and DOB"""
         try:
-            wait = WebDriverWait(self.driver, 1)
+            wait = WebDriverWait(self.driver, self.net.get("element_timeout", 5))
             
             name_selectors = [
                 (By.ID, "name"),
@@ -1171,11 +1661,28 @@ class ChatGPTAutoRegisterWorker:
                 return False
             
             self.driver.execute_script("arguments[0].scrollIntoView(true);", name_input)
-            self.human_like_delay(0.2, 0.4)
-            
-            self.move_mouse_randomly()
-            ActionChains(self.driver).move_to_element(name_input).click().perform()
-            self.human_like_delay(0.2, 0.4)
+
+            clicked = False
+            try:
+                name_input.click()
+                clicked = True
+            except Exception:
+                pass
+
+            if not clicked:
+                try:
+                    self.driver.execute_script("arguments[0].click();", name_input)
+                    clicked = True
+                except Exception:
+                    pass
+
+            if not clicked and getattr(self, 'num_threads', 1) <= 1:
+                try:
+                    self.move_mouse_randomly()
+                    ActionChains(self.driver).move_to_element(name_input).click().perform()
+                    clicked = True
+                except Exception:
+                    pass
             
             name_input.clear()
             self.human_like_typing(name_input, "GPT")
@@ -1183,23 +1690,43 @@ class ChatGPTAutoRegisterWorker:
             
             self.human_like_delay(0.2, 0.4)
             
-            # Press Tab to move to DOB
+            # Press Tab to move to DOB field
             name_input.send_keys(Keys.TAB)
-            self.human_like_delay(0.3, 0.6)
+
             
-            # Random DOB
-            year = random.randint(1997, 2006)
+            # Random DOB (MM/DD/YYYY format)
+            year = random.randint(1999, 2006)
             month = random.randint(1, 12)
-            day = random.randint(1, 28)
-            # Format MM/DD/YYYY (cả tháng và ngày đều có số 0 đầu)
+            day = random.randint(1, 12)
             dob = f"{month:02d}/{day:02d}/{year}"
             
-            # Type DOB
-            actions = ActionChains(self.driver)
-            for char in dob:
-                actions.send_keys(char)
-                actions.pause(random.uniform(0.1, 0.3))
-            actions.perform()
+            # Type DOB character by character.
+            # Avoid ActionChains in multithread/background mode (can be focus-dependent).
+            typed = False
+            if getattr(self, 'num_threads', 1) > 1:
+                try:
+                    active_el = self.driver.switch_to.active_element
+                    for char in dob:
+                        active_el.send_keys(char)
+                        time.sleep(random.uniform(0.03, 0.08))
+                    typed = True
+                except Exception:
+                    typed = False
+
+            if not typed:
+                try:
+                    actions = ActionChains(self.driver)
+                    for char in dob:
+                        actions.send_keys(char)
+                        actions.pause(random.uniform(0.1, 0.3))
+                    actions.perform()
+                    typed = True
+                except Exception:
+                    typed = False
+
+            if not typed:
+                self.log("Could not type DOB", Colors.ERROR, "❌ ")
+                return False
             
             self.log(f"Entered DOB: {dob}", Colors.SUCCESS, "✅ ")
             
@@ -1237,12 +1764,12 @@ class ChatGPTAutoRegisterWorker:
             return False
     
 
-    
+    time.sleep(2)
     def get_cookies_json(self):
         """Get cookies in JSON format"""
         try:
             self.log("Getting cookies...", Colors.INFO, "🍪 ")
-            time.sleep(4)
+            time.sleep(6)
             
             all_cookies = self.driver.get_cookies()
             cookies_for_export = []
@@ -1313,92 +1840,57 @@ class ChatGPTAutoRegisterWorker:
             return False
     
     def get_checkout_link(self):
-        """Navigate to pricing section and capture checkout URL
-        Returns:
-            - checkout_url string if successful
-            - "NO_OFFER" if no free offer available (Get Plus button in header instead of Free offer)
-            - None if error
-        """
+        """Navigate to pricing section and capture checkout URL"""
         try:
             if not self.driver:
                 return None
-            self.log("Checking for free offer availability...", Colors.INFO, "💳 ")
-            time.sleep(1)
-            
-            # STEP 1: Find header button (button-glimmer-cta class) and check its text
-            # "Free offer" = has offer, "Get Plus" = no offer
-            header_button_xpath = (
-                "//button[contains(@class, 'button-glimmer-cta')]"
-            )
-            
-            try:
-                header_btn = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, header_button_xpath))
-                )
-                if header_btn and header_btn.is_displayed():
-                    btn_text = header_btn.text.strip().lower()
-                    self.log(f"Found header button: '{header_btn.text}'", Colors.INFO, "🔍 ")
-                    
-                    if 'get plus' in btn_text or 'upgrade' in btn_text:
-                        # "Get Plus" button = NO FREE OFFER
-                        self.log(f"Found 'Get Plus' button - NO OFFER available", Colors.WARNING, "💰 ")
-                        return "NO_OFFER"
-                    elif 'free offer' in btn_text or 'free' in btn_text:
-                        # "Free offer" button = HAS OFFER - continue to #pricing
-                        self.log(f"Found 'Free offer' button - offer available!", Colors.SUCCESS, "🎁 ")
-                    else:
-                        # Unknown button text - log and continue
-                        self.log(f"Unknown header button text: '{header_btn.text}', continuing...", Colors.WARNING, "⚠️ ")
-            except TimeoutException:
-                self.log("Header button not found, continuing to pricing...", Colors.WARNING, "⚠️ ")
-            
-            # STEP 2: Navigate to #pricing section to find and click free offer button
-            self.log("Navigating to pricing section...", Colors.INFO, "💳 ")
+            self.log("Navigating to pricing to capture checkout link...", Colors.INFO, "💳 ")
+            time.sleep(1.5)  # Wait after getting session cookie
             try:
                 self.driver.execute_script("location.hash = '#pricing';")
             except Exception:
                 pass
             time.sleep(1.5)
-            wait = WebDriverWait(self.driver, 3)
+            wait = WebDriverWait(self.driver, 2)
             
             # Ensure Personal tab is active (not Business)
             self.ensure_personal_tab_active()
             
-            # Priority 1: Free offer buttons (has special offer)
-            free_offer_xpath = (
-                # data-testid for upgrade button
+            button_xpath = (
+                # Priority 1: data-testid selector (most reliable from screenshot)
                 "//button[@data-testid='select-plan-button-plus-upgrade']"
-                # "Try for" text (covers "Try for ₩0", "Try for $0", "Try for free", etc.)
+                # Priority 2: "Try for" text (covers "Try for ₩0", "Try for $0", "Try for free", etc.)
                 " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                # "Claim free offer" text
+                # Fallback: legacy selectors
                 " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
+                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
+                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
+                " | //button[contains(normalize-space(.), 'Dùng bản Plus')]"
+                " | //a[contains(normalize-space(.), 'Dùng bản Plus')]"
             )
-            
-            def locate_free_offer_button(reload_if_needed):
-                """Locate free offer button in pricing section"""
+
+            def locate_plus_button(reload_if_needed):
                 attempts = 2 if reload_if_needed else 1
                 for attempt in range(attempts):
                     try:
-                        button = wait.until(EC.element_to_be_clickable((By.XPATH, free_offer_xpath)))
-                        if button and button.is_displayed():
-                            self.log(f"Found free offer button: '{button.text}'", Colors.SUCCESS, "🎁 ")
-                            return button
+                        return wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
                     except TimeoutException:
-                        pass
-                    
-                    if reload_if_needed and attempt == 0:
-                        self.log("Free offer button not found, reloading page...", Colors.WARNING, "🔄 ")
-                        self.driver.get("https://chatgpt.com/#pricing")
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                
+                        if reload_if_needed and attempt == 0:
+                            self.log("Get Plus button not found, ensuring Personal tab...", Colors.WARNING, "ℹ️ ")
+                            self.driver.get("https://chatgpt.com/#pricing")
+                            time.sleep(2)
+                            # Ensure Personal tab is active
+                            self.ensure_personal_tab_active()
+                        else:
+                            break
                 return None
 
             def check_payment_error():
                 """Check if payment error message is displayed using proper element"""
                 try:
+                    # Check for error alert element with orange background
                     error_selectors = [
                         "//div[contains(@class, 'bg-orange-500') and @role='alert']//div[contains(@class, 'text-start')]",
                         "//div[@role='alert' and contains(@class, 'border-orange-500')]//div[contains(@class, 'whitespace-pre-wrap')]",
@@ -1421,11 +1913,14 @@ class ChatGPTAutoRegisterWorker:
                 start_time = time.time()
                 while time.time() - start_time < timeout:
                     try:
+                        # Check for payment error first
                         if check_payment_error():
                             return "PAYMENT_ERROR"
                         
+                        # Check for checkout URL
                         current_url = self.driver.current_url or ""
                         if "/checkout/" in current_url.lower() or "pay.openai.com" in current_url.lower():
+                            # Check for invalid verify URL (e.g. /checkout/verify?stripe_session_id=)
                             if "verify?stripe_session_id" in current_url.lower() or "/checkout/verify?" in current_url.lower():
                                 self.log("Invalid verify URL detected, need to retry...", Colors.WARNING, "⚠️ ")
                                 return "VERIFY_ERROR"
@@ -1435,83 +1930,22 @@ class ChatGPTAutoRegisterWorker:
                     
                     time.sleep(poll_interval)
                 
-                return None
-
-            def click_button_robust(button, button_name="button"):
-                """Try multiple click methods to ensure button is clicked"""
-                # Method 1: Scroll into view and ActionChains click
-                try:
-                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-                    time.sleep(0.3)
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(button).pause(0.2).click().perform()
-                    self.log(f"Clicked {button_name} (ActionChains)", Colors.SUCCESS, "✅ ")
-                    return True
-                except Exception as e:
-                    self.log(f"ActionChains click failed: {e}", Colors.WARNING, "⚠️ ")
-                
-                # Method 2: Direct click
-                try:
-                    button.click()
-                    self.log(f"Clicked {button_name} (direct click)", Colors.SUCCESS, "✅ ")
-                    return True
-                except Exception as e:
-                    self.log(f"Direct click failed: {e}", Colors.WARNING, "⚠️ ")
-                
-                # Method 3: JavaScript click
-                try:
-                    self.driver.execute_script("arguments[0].click();", button)
-                    self.log(f"Clicked {button_name} (JS click)", Colors.SUCCESS, "✅ ")
-                    return True
-                except Exception as e:
-                    self.log(f"JS click failed: {e}", Colors.WARNING, "⚠️ ")
-                
-                # Method 4: Focus + Enter key
-                try:
-                    self.driver.execute_script("arguments[0].focus();", button)
-                    button.send_keys(Keys.ENTER)
-                    self.log(f"Clicked {button_name} (Enter key)", Colors.SUCCESS, "✅ ")
-                    return True
-                except Exception as e:
-                    self.log(f"Enter key failed: {e}", Colors.WARNING, "⚠️ ")
-                
-                return False
+                return None  # Timeout
 
             def click_plus_and_wait(plus_button, attempt=1):
                 handles_before = list(self.driver.window_handles)
-                url_before = self.driver.current_url
-                
-                # Use robust click method
-                if not click_button_robust(plus_button, f"Plus button (attempt {attempt})"):
-                    self.log("All click methods failed!", Colors.ERROR, "❌ ")
-                    return None
-                
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", plus_button)
+                time.sleep(0.5)
+                plus_button.click()
+                self.log(f"Clicked Get Plus (attempt {attempt})", Colors.SUCCESS, "✅ ")
                 time.sleep(1)
-                
-                # Verify click worked by checking for changes
                 handles_after = self.driver.window_handles
-                url_after = self.driver.current_url
-                
                 new_handles = [handle for handle in handles_after if handle not in handles_before]
                 if new_handles:
                     self.driver.switch_to.window(new_handles[-1])
                     self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
-                elif url_after == url_before:
-                    # No new tab and URL unchanged - button click might not have worked
-                    self.log("No page change detected after click, retrying...", Colors.WARNING, "⚠️ ")
-                    time.sleep(0.5)
-                    # Try JS click again
-                    try:
-                        self.driver.execute_script("arguments[0].click();", plus_button)
-                        time.sleep(1)
-                        handles_after = self.driver.window_handles
-                        new_handles = [handle for handle in handles_after if handle not in handles_before]
-                        if new_handles:
-                            self.driver.switch_to.window(new_handles[-1])
-                            self.log("Switched to checkout tab after retry", Colors.INFO, "🪟 ")
-                    except:
-                        pass
                 
+                # Use polling to check for checkout URL or error
                 self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
                 result = poll_for_checkout_or_error(timeout=30, poll_interval=0.5)
                 
@@ -1524,6 +1958,7 @@ class ChatGPTAutoRegisterWorker:
                 elif result:
                     return result
                 else:
+                    # Timeout - switch back to main window
                     if self.driver.window_handles:
                         try:
                             self.driver.switch_to.window(self.driver.window_handles[0])
@@ -1531,23 +1966,13 @@ class ChatGPTAutoRegisterWorker:
                             pass
                     return None
 
-            # Main logic: locate free offer button in pricing section
-            # (Already checked for "Get Plus" header button above - if we're here, there might be an offer)
-            button = locate_free_offer_button(reload_if_needed=True)
-            
-            if not button:
-                self.log("No free offer button found in pricing section", Colors.WARNING, "ℹ️ ")
-                return None
-            
             # Retry loop for Plus checkout (max 2 attempts for payment errors)
             checkout_url = None
             for attempt in range(1, 3):
-                if attempt > 1:
-                    # Re-locate button after reload
-                    button = locate_free_offer_button(reload_if_needed=True)
-                    if not button:
-                        self.log("Button not found on retry", Colors.WARNING, "ℹ️ ")
-                        return None
+                button = locate_plus_button(reload_if_needed=True)
+                if not button:
+                    self.log("Get Plus button not found", Colors.WARNING, "ℹ️ ")
+                    return None
                 
                 checkout_url = click_plus_and_wait(button, attempt)
                 
@@ -1555,12 +1980,15 @@ class ChatGPTAutoRegisterWorker:
                     error_type = "payment error" if checkout_url == "PAYMENT_ERROR" else "verify URL error"
                     if attempt < 2:
                         self.log(f"Retrying due to {error_type}...", Colors.WARNING, "🔄 ")
+                        # Close error tab and go back
                         if len(self.driver.window_handles) > 1:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
+                        # Navigate back to pricing and ensure Personal tab
                         self.log("Refreshing page to clear error state...", Colors.INFO, "🔄 ")
                         self.driver.refresh()
                         time.sleep(2)
+                        
                         self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
                         self.driver.get("https://chatgpt.com/#pricing")
                         time.sleep(2)
@@ -1581,7 +2009,6 @@ class ChatGPTAutoRegisterWorker:
                     else:
                         self.log("Failed to open checkout after retries", Colors.WARNING, "ℹ️ ")
                         return None
-            
             if checkout_url:
                 self.log(f"Plus Checkout URL: {checkout_url}", Colors.SUCCESS, "✅ ")
             return checkout_url
@@ -1915,7 +2342,15 @@ class ChatGPTAutoRegisterWorker:
                     self.current_retry += 1
                     continue
                 
-                otp = self.wait_and_get_otp(max_attempts=30, wait_seconds=3)
+                # Faster OTP polling: subject-first extraction reduces API load per poll.
+                if NETWORK_MODE == "Fast":
+                    # Faster OTP polling (subject-first extraction is cheap).
+                    if NETWORK_MODE == "Fast":
+                        otp = self.wait_and_get_otp(max_attempts=60, wait_seconds=1)
+                    else:
+                        otp = self.wait_and_get_otp(max_attempts=45, wait_seconds=2)
+                else:
+                    otp = self.wait_and_get_otp(max_attempts=45, wait_seconds=2)
                 if not otp:
                     if self.check_and_handle_timeout():
                         self.cleanup_browser()
@@ -1987,36 +2422,20 @@ class ChatGPTAutoRegisterWorker:
                         
                         if checkout_type == "Plus":
                             checkout_url = self.get_checkout_link()
-                            # Handle NO_OFFER case
-                            if checkout_url == "NO_OFFER":
-                                checkout_url = "No offer"
                         elif checkout_type == "Business":
                             business_checkout_url = self.get_business_checkout_link()
-                            # Handle NO_OFFER case
-                            if business_checkout_url == "NO_OFFER":
-                                business_checkout_url = "No offer"
                         elif checkout_type == "Both":
                             checkout_url = self.get_checkout_link()
-                            
-                            # Handle NO_OFFER case - skip business checkout if no offer
-                            if checkout_url == "NO_OFFER":
-                                checkout_url = "No offer"
-                                business_checkout_url = "No offer"
-                                self.log("No offer available - skipping business checkout", Colors.WARNING, "❌ ")
-                            else:
-                                # Close any new tabs and go back for business link
-                                try:
-                                    while len(self.driver.window_handles) > 1:
-                                        self.driver.switch_to.window(self.driver.window_handles[-1])
-                                        self.driver.close()
-                                    self.driver.switch_to.window(self.driver.window_handles[0])
-                                    time.sleep(1)
-                                except Exception:
-                                    pass
-                                business_checkout_url = self.get_business_checkout_link()
-                                # Handle NO_OFFER case for business
-                                if business_checkout_url == "NO_OFFER":
-                                    business_checkout_url = "No offer"
+                            # Close any new tabs and go back for business link
+                            try:
+                                while len(self.driver.window_handles) > 1:
+                                    self.driver.switch_to.window(self.driver.window_handles[-1])
+                                    self.driver.close()
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                                time.sleep(1)
+                            except Exception:
+                                pass
+                            business_checkout_url = self.get_business_checkout_link()
                     else:
                         self.log("Skipping checkout link - invalid session cookie", Colors.WARNING, "⚠️ ")
                 
@@ -2106,6 +2525,7 @@ class MFAWorker:
         self.recheck_mode = recheck_mode
         self.driver = None
         self.user_data_dir = None
+        self.proxy_bridge = None
         self.stop_event = None
         
         # Popup polling
@@ -2155,6 +2575,12 @@ class MFAWorker:
             options.add_argument('--window-size=900,700')
             options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_argument('--lang=en-US')
+
+            # Improve stability when Chrome window is background/occluded
+            options.add_argument('--disable-background-timer-throttling')
+            options.add_argument('--disable-backgrounding-occluded-windows')
+            options.add_argument('--disable-renderer-backgrounding')
+            options.add_argument('--disable-features=CalculateNativeWinOcclusion')
             
             prefs = {
                 "credentials_enable_service": False,
@@ -2162,6 +2588,11 @@ class MFAWorker:
                 "profile.default_content_setting_values.notifications": 2
             }
             options.add_experimental_option("prefs", prefs)
+            
+            # Apply proxy if enabled
+            self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
+            if proxy_label:
+                self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
             
             with driver_init_lock:
                 try:
@@ -2439,14 +2870,51 @@ class MFAWorker:
             return None
 
     def enter_otp_code(self, otp):
+        """Enter OTP - handles both new (6 separate digit inputs) and old (single field) formats"""
         try:
             wait = WebDriverWait(self.driver, 3)
-            inp = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Code' or @name='code']")))
+            time.sleep(0.5)
+            
+            # NEW FORMAT: Try 6 separate digit inputs first (aria-label="Digit 1" through "Digit 6")
+            try:
+                digit_inputs = []
+                for i in range(1, 7):
+                    inp = self.driver.find_element(By.XPATH, f"//input[@aria-label='Digit {i}']")
+                    if inp and inp.is_displayed():
+                        digit_inputs.append(inp)
+                
+                if len(digit_inputs) == 6 and len(otp) == 6:
+                    self.log("Detected new 6-digit separate input format", Colors.INFO, "ℹ️ ")
+                    for i, digit in enumerate(otp):
+                        try:
+                            digit_inputs[i].click()
+                            time.sleep(0.05)
+                            digit_inputs[i].send_keys(digit)
+                            time.sleep(0.05)
+                        except Exception:
+                            digit_inputs[i].send_keys(digit)
+                    self.log("Entered email OTP (6-digit format)", Colors.SUCCESS, "✅ ")
+                    
+                    # Click Continue button
+                    btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]")))
+                    btn.click()
+                    self.log("Clicked Continue (OTP)", Colors.SUCCESS, "✅ ")
+                    time.sleep(3)
+                    return True
+            except Exception:
+                pass
+            
+            # OLD FORMAT: Single input field
+            inp = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Code' or @name='code' or @id='code']")))
+            if not inp.is_displayed():
+                raise Exception("Code input not visible")
+            
+            self.log("Detected old single-field OTP format", Colors.INFO, "ℹ️ ")
             inp.clear()
             for c in otp:
                 inp.send_keys(c)
                 time.sleep(0.05)
-            self.log("Entered email OTP", Colors.SUCCESS, "✅ ")
+            self.log("Entered email OTP (single-field format)", Colors.SUCCESS, "✅ ")
             
             btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]")))
             btn.click()
@@ -2772,6 +3240,13 @@ class MFAWorker:
                 pass
             self.driver = None
 
+        if self.proxy_bridge:
+            try:
+                self.proxy_bridge.stop()
+            except Exception:
+                pass
+            self.proxy_bridge = None
+
         
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             try:
@@ -2966,6 +3441,7 @@ class CheckoutCaptureWorker:
         self.checkout_type = checkout_type  # "Plus", "Business", or "Both"
         self.driver = None
         self.user_data_dir = None
+        self.proxy_bridge = None
         self.stop_event = None
         self.net = NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"])
         
@@ -2993,6 +3469,17 @@ class CheckoutCaptureWorker:
             options.add_argument("--disable-popup-blocking")
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument("--lang=en-US")  # Force English UI
+
+            # Improve stability when Chrome window is background/occluded
+            options.add_argument('--disable-background-timer-throttling')
+            options.add_argument('--disable-backgrounding-occluded-windows')
+            options.add_argument('--disable-renderer-backgrounding')
+            options.add_argument('--disable-features=CalculateNativeWinOcclusion')
+            
+            # Apply proxy if enabled
+            self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
+            if proxy_label:
+                self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
             
             # Use lock to prevent race condition when multiple threads initialize ChromeDriver
             with driver_init_lock:
@@ -3024,6 +3511,13 @@ class CheckoutCaptureWorker:
             except:
                 pass
             self.driver = None
+
+        if self.proxy_bridge:
+            try:
+                self.proxy_bridge.stop()
+            except Exception:
+                pass
+            self.proxy_bridge = None
 
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             try:
@@ -3069,14 +3563,9 @@ class CheckoutCaptureWorker:
             # Start popup polling thread
             self.start_popup_polling()
             
-            # Wait for page to stabilize and check for offer availability
-            is_ready, has_offer = self.wait_for_page_stable_after_cookie_import()
-            self.has_free_offer = has_offer  # Store for later use
-            
-            if not is_ready:
+            # Wait for page to stabilize (Free offer button appears twice due to auto-reload)
+            if not self.wait_for_page_stable_after_cookie_import():
                 self.log("Warning: Page may not be fully stable", Colors.WARNING, "⚠️ ")
-            elif not has_offer:
-                self.log("Account has NO free Plus offer", Colors.WARNING, "💰 ")
             
             return True
             
@@ -3087,44 +3576,39 @@ class CheckoutCaptureWorker:
     def wait_for_page_stable_after_cookie_import(self, max_wait_seconds=30):
         """
         Wait for the page to stabilize after cookie import.
-        Look for header button (button-glimmer-cta) and check if it's "Free offer" or "Get Plus".
+        Simply wait for 'Free offer' button to appear once, then proceed to #pricing.
         
-        Returns:
-            tuple (is_ready, has_offer):
-                - (True, True) = page ready, has free offer
-                - (True, False) = page ready, no offer (Get Plus button found)
-                - (False, False) = timeout
+        Returns True if button found, False if timeout
         """
-        self.log("Waiting for header button (Free offer or Get Plus)...", Colors.INFO, "⏳ ")
+        self.log("Waiting for Free offer button...", Colors.INFO, "⏳ ")
         
-        # XPath for header button with button-glimmer-cta class
-        header_button_xpath = "//button[contains(@class, 'button-glimmer-cta')]"
+        # XPath for 'Free offer' button based on the provided HTML
+        free_offer_xpath = (
+            "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Free offer')]"
+            " | //button[contains(text(), 'Free offer')]"
+            " | //button[.//text()[contains(., 'Free offer')]]"
+        )
         
         start_time = time.time()
         poll_interval = 0.3
         
         while time.time() - start_time < max_wait_seconds:
             try:
-                buttons = self.driver.find_elements(By.XPATH, header_button_xpath)
-                for btn in buttons:
-                    if btn and btn.is_displayed():
-                        btn_text = btn.text.strip().lower()
-                        
-                        if 'free offer' in btn_text or 'free' in btn_text:
-                            self.log(f"Found 'Free offer' button - offer available!", Colors.SUCCESS, "🎁 ")
-                            time.sleep(0.5)
-                            return (True, True)  # page ready, has offer
-                        elif 'get plus' in btn_text or 'upgrade' in btn_text:
-                            self.log(f"Found 'Get Plus' button - NO OFFER available", Colors.WARNING, "💰 ")
-                            return (True, False)  # page ready, no offer
-                            
+                buttons = self.driver.find_elements(By.XPATH, free_offer_xpath)
+                button_visible = any(btn.is_displayed() for btn in buttons if btn)
+                
+                if button_visible:
+                    self.log("Free offer button found, page ready!", Colors.SUCCESS, "✅ ")
+                    time.sleep(0.5)
+                    return True
+                    
             except Exception:
                 pass
             
             time.sleep(poll_interval)
         
-        self.log("Timeout waiting for header button", Colors.WARNING, "⚠️ ")
-        return (False, False)  # timeout
+        self.log("Timeout waiting for Free offer button", Colors.WARNING, "⚠️ ")
+        return False
     
     def start_popup_polling(self):
         """Start background thread to continuously check and dismiss onboarding popup"""
@@ -3574,20 +4058,18 @@ class CheckoutCaptureWorker:
             return False
     
     def save_no_plus_offer(self):
-        """Save 'No offer' to Excel column C (Plus) and D (Business) when account has no free offer"""
+        """Save 'no Plus offer' to Excel column C when account has no free Plus offer"""
         try:
             with file_lock:
                 wb = load_workbook(self.excel_file)
                 ws = wb.active
-                # Save "No offer" to BOTH Plus (C) and Business (D) columns
-                ws.cell(row=self.row_index, column=3, value="No offer")
-                ws.cell(row=self.row_index, column=4, value="No offer")
+                ws.cell(row=self.row_index, column=3, value="no Plus offer")
                 wb.save(self.excel_file)
                 wb.close()
-                self.log("Saved 'No offer' to Plus and Business columns", Colors.SUCCESS, "💾 ")
+                self.log("Saved 'no Plus offer' to Excel", Colors.SUCCESS, "💾 ")
             return True
         except Exception as e:
-            self.log(f"Failed to save No offer: {e}", Colors.ERROR, "❌ ")
+            self.log(f"Failed to save no Plus offer: {e}", Colors.ERROR, "❌ ")
             return False
     
     def run(self):
@@ -3604,32 +4086,21 @@ class CheckoutCaptureWorker:
             
             plus_url = None
             business_url = None
+            no_plus_offer = False
             
-            # FIRST: Check if no offer was detected during cookie import
-            # This applies to ALL checkout types (Plus, Business, Both)
-            if hasattr(self, 'has_free_offer') and not self.has_free_offer:
-                # No free offer detected from header button - skip ALL checkout
-                self.log("No free offer available - saving 'No offer' to Excel", Colors.WARNING, "💰 ")
-                self.save_no_plus_offer()
-                self.log(f"No offer available for {self.email} - saved to Excel", Colors.WARNING, "💰 ")
-                self.cleanup_browser()
-                return True  # Consider success since we saved the info
-            
-            # Has offer - proceed with checkout capture
             if self.checkout_type in ["Plus", "Both"]:
                 result = self.get_plus_checkout()
                 
-                # Handle NO_PLUS_OFFER case (detected from pricing page)
+                # Handle NO_PLUS_OFFER case
                 if result == "NO_PLUS_OFFER":
+                    no_plus_offer = True
                     self.log("Account has no Plus offer, saving to Excel...", Colors.WARNING, "⚠️ ")
                     self.save_no_plus_offer()
-                    self.cleanup_browser()
-                    return True
                 else:
                     plus_url = result
                 
                 # Close extra tabs for Business
-                if self.checkout_type == "Both" and plus_url:
+                if self.checkout_type == "Both" and (plus_url or no_plus_offer):
                     try:
                         while len(self.driver.window_handles) > 1:
                             self.driver.switch_to.window(self.driver.window_handles[-1])
@@ -3639,7 +4110,6 @@ class CheckoutCaptureWorker:
                     except:
                         pass
             
-            # Get Business checkout if needed
             if self.checkout_type in ["Business", "Both"]:
                 business_url = self.get_business_checkout()
             
@@ -3647,6 +4117,17 @@ class CheckoutCaptureWorker:
             if plus_url or business_url:
                 self.save_to_excel(plus_url, business_url)
                 self.log(f"✅ Completed for {self.email}", Colors.SUCCESS, "🎉 ")
+                self.cleanup_browser()
+                return True
+            elif no_plus_offer and self.checkout_type == "Plus":
+                # Only Plus was requested and no offer available
+                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
+                self.cleanup_browser()
+                return True  # Still consider success since we saved the info
+            elif no_plus_offer and business_url:
+                # No Plus offer but got Business
+                self.save_to_excel(None, business_url)
+                self.log(f"✅ Business link captured for {self.email}", Colors.SUCCESS, "🎉 ")
                 self.cleanup_browser()
                 return True
             else:
@@ -4768,20 +5249,20 @@ class App(ctk.CTk):
         
         ctk.CTkFrame(adv_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
         
-        # Network Mode selector
-        self.reg_network_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_network_frame.pack(fill="x", padx=16, pady=(6, 4))
+        # Network + Email Mode (same row)
+        self.reg_network_email_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        self.reg_network_email_frame.pack(fill="x", padx=16, pady=(6, 4))
         
         ctk.CTkLabel(
-            self.reg_network_frame, 
-            text="🌐  Network Mode:", 
+            self.reg_network_email_frame, 
+            text="🌐  Network:", 
             font=self.font_label,
             text_color=self.colors["text_secondary"]
-        ).pack(side="left", padx=(0, 16))
+        ).pack(side="left", padx=(0, 6))
         
         self.reg_network_var = ctk.StringVar(value="Fast")
         self.reg_network_menu = ctk.CTkOptionMenu(
-            self.reg_network_frame, 
+            self.reg_network_email_frame, 
             values=["Fast", "VPN/Slow"], 
             variable=self.reg_network_var, 
             font=self.font_label,
@@ -4792,35 +5273,22 @@ class App(ctk.CTk):
             dropdown_hover_color=self.colors["bg_card_hover"],
             dropdown_text_color=self.colors["text_primary"],
             text_color=self.colors["text_primary"],
-            width=120,
+            width=110,
             height=32,
             corner_radius=8
         )
         self.reg_network_menu.pack(side="left")
         
-        # Network mode info
-        self.reg_network_info = ctk.CTkLabel(
-            self.reg_network_frame,
-            text="⚡ Fast: Stable network | 🐢 VPN/Slow: Unstable/VPN",
-            font=ctk.CTkFont(size=11),
-            text_color=self.colors["text_muted"]
-        )
-        self.reg_network_info.pack(side="right")
-        
-        # Email Mode selector
-        self.reg_email_mode_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_email_mode_frame.pack(fill="x", padx=16, pady=(4, 4))
-        
         ctk.CTkLabel(
-            self.reg_email_mode_frame, 
-            text="📧  Email Mode:", 
+            self.reg_network_email_frame, 
+            text="📧  Email:", 
             font=self.font_label,
             text_color=self.colors["text_secondary"]
-        ).pack(side="left", padx=(0, 16))
+        ).pack(side="left", padx=(20, 6))
         
         self.reg_email_mode_var = ctk.StringVar(value="TinyHost")
         self.reg_email_mode_menu = ctk.CTkOptionMenu(
-            self.reg_email_mode_frame, 
+            self.reg_network_email_frame, 
             values=["TinyHost", "OAuth2"], 
             variable=self.reg_email_mode_var,
             command=self.on_email_mode_change,
@@ -4832,7 +5300,7 @@ class App(ctk.CTk):
             dropdown_hover_color=self.colors["bg_card_hover"],
             dropdown_text_color=self.colors["text_primary"],
             text_color=self.colors["text_primary"],
-            width=120,
+            width=110,
             height=32,
             corner_radius=8
         )
@@ -4840,7 +5308,7 @@ class App(ctk.CTk):
         
         # OAuth2 status label (shows loaded accounts count)
         self.reg_oauth2_status = ctk.CTkLabel(
-            self.reg_email_mode_frame,
+            self.reg_network_email_frame,
             text="",
             font=ctk.CTkFont(size=11),
             text_color=self.colors["text_muted"]
@@ -4849,7 +5317,7 @@ class App(ctk.CTk):
         
         # OAuth2 Refresh button
         self.reg_oauth2_refresh = ctk.CTkButton(
-            self.reg_email_mode_frame,
+            self.reg_network_email_frame,
             text="🔄",
             width=36,
             height=32,
@@ -4925,6 +5393,76 @@ class App(ctk.CTk):
             text_color=self.colors["text_muted"]
         )
         self.reg_password_info.pack(side="right")
+        
+        # ═══ PROXY CONFIGURATION (single compact row) ═══
+        self.reg_proxy_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        self.reg_proxy_frame.pack(fill="x", padx=16, pady=(4, 6))
+        
+        self.reg_proxy_var = ctk.BooleanVar(value=PROXY_ENABLED)
+        self.reg_proxy_switch = ctk.CTkSwitch(
+            self.reg_proxy_frame,
+            text="",
+            variable=self.reg_proxy_var,
+            font=self.font_label,
+            text_color=self.colors["text_secondary"],
+            fg_color=self.colors["bg_elevated"],
+            progress_color=self.colors["accent_primary"],
+            button_color=self.colors["text_primary"],
+            button_hover_color=self.colors["accent_primary"],
+            width=40,
+            command=self.toggle_proxy_inputs
+        )
+        self.reg_proxy_switch.pack(side="left")
+        
+        ctk.CTkLabel(
+            self.reg_proxy_frame,
+            text="🌐 Proxy:",
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).pack(side="left", padx=(6, 0))
+        
+        self.reg_proxy_string_var = ctk.StringVar(value=PROXY_STRING)
+        self.reg_proxy_entry = ctk.CTkEntry(
+            self.reg_proxy_frame,
+            textvariable=self.reg_proxy_string_var,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"],
+            text_color=self.colors["text_primary"],
+            placeholder_text="user:pass@host:port",
+            width=280,
+            height=32,
+            corner_radius=8
+        )
+        self.reg_proxy_entry.pack(side="left", padx=(8, 0))
+        
+        # Save proxy button
+        self.reg_proxy_save = ctk.CTkButton(
+            self.reg_proxy_frame,
+            text="💾",
+            width=36,
+            height=32,
+            fg_color=self.colors["accent_tertiary"],
+            hover_color=self.colors["accent_primary"],
+            corner_radius=8,
+            font=ctk.CTkFont(size=14),
+            command=self.save_proxy_to_file
+        )
+        self.reg_proxy_save.pack(side="left", padx=(6, 0))
+        
+        # Proxy status info (tiny, right-aligned)
+        self.reg_proxy_info = ctk.CTkLabel(
+            self.reg_proxy_frame,
+            text="✓" if PROXY_ENABLED and PROXY_STRING else "",
+            font=ctk.CTkFont(size=10),
+            text_color=self.colors["accent_green"] if PROXY_ENABLED else self.colors["text_muted"]
+        )
+        self.reg_proxy_info.pack(side="left", padx=(4, 0))
+        
+        # Set initial proxy input state based on switch
+        proxy_state = "normal" if PROXY_ENABLED else "disabled"
+        self.reg_proxy_entry.configure(state=proxy_state)
+        self.reg_proxy_save.configure(state=proxy_state)
         
         # Checkout Switch
         self.reg_adv_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
@@ -5730,12 +6268,11 @@ class App(ctk.CTk):
                 email_label.grid(row=0, column=1, padx=4, pady=2, sticky="w")
                 self.checkout_account_widgets.append(email_label)
                 
-                # Plus status - check for "No offer" or "no Plus offer"
-                plus_url = account["plus_url"]
-                if plus_url and ("no offer" in str(plus_url).lower() or "no plus offer" in str(plus_url).lower()):
+                # Plus status
+                if account["plus_url"] == "no Plus offer":
                     plus_status = "⛔"
                     plus_color = self.colors["error"]
-                elif plus_url:
+                elif account["plus_url"]:
                     plus_status = "✅"
                     plus_color = self.colors["accent_green"]
                 else:
@@ -5751,17 +6288,9 @@ class App(ctk.CTk):
                 plus_label.grid(row=0, column=2, padx=4, pady=2, sticky="w")
                 self.checkout_account_widgets.append(plus_label)
                 
-                # Business status - check for "No offer" or "no Plus offer"
-                business_url = account["business_url"]
-                if business_url and ("no offer" in str(business_url).lower() or "no plus offer" in str(business_url).lower()):
-                    business_status = "⛔"
-                    business_color = self.colors["error"]
-                elif business_url:
-                    business_status = "✅"
-                    business_color = self.colors["accent_green"]
-                else:
-                    business_status = "❌"
-                    business_color = self.colors["text_muted"]
+                # Business status
+                business_status = "✅" if account["business_url"] else "❌"
+                business_color = self.colors["accent_green"] if account["business_url"] else self.colors["text_muted"]
                 business_label = ctk.CTkLabel(
                     row_frame, 
                     text=business_status,
@@ -6402,6 +6931,59 @@ class App(ctk.CTk):
             
         except Exception as e:
             _toast(self, f"❌ Failed to save: {str(e)}", toast_type="error")
+    
+    def toggle_proxy_inputs(self):
+        """Enable/disable proxy inputs based on switch state"""
+        global PROXY_ENABLED
+        enabled = self.reg_proxy_var.get()
+        PROXY_ENABLED = enabled
+        state = "normal" if enabled else "disabled"
+        self.reg_proxy_entry.configure(state=state)
+        self.reg_proxy_save.configure(state=state)
+        
+        if enabled:
+            self.reg_proxy_info.configure(text="ON", text_color=self.colors["accent_green"])
+        else:
+            self.reg_proxy_info.configure(text="", text_color=self.colors["text_muted"])
+    
+    def save_proxy_to_file(self):
+        """Save proxy configuration to JSON file"""
+        global PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+        
+        proxy_string = self.reg_proxy_string_var.get().strip()
+        enabled = self.reg_proxy_var.get()
+        
+        if not proxy_string:
+            _toast(self, "❌ Proxy string cannot be empty!", toast_type="error")
+            return
+        
+        # Auto-detect format and validate
+        detected = detect_proxy_format(proxy_string)
+        if not detected:
+            _toast(self, "❌ Cannot detect proxy format! Use user:pass@host:port or host:port:user:pass", toast_type="error")
+            return
+        
+        proxy_info, urls = parse_proxy(proxy_string, detected)
+        if not proxy_info:
+            _toast(self, "❌ Invalid proxy! Check your input.", toast_type="error")
+            return
+        
+        # Save to config file
+        if save_proxy_config(enabled, proxy_string, detected):
+            PROXY_ENABLED = enabled
+            PROXY_STRING = proxy_string
+            PROXY_FORMAT = detected
+            
+            _toast(self, f"✅ Proxy saved: {proxy_info['host']}:{proxy_info['port']}", toast_type="success")
+            self.reg_proxy_info.configure(text="✓", text_color=self.colors["accent_green"])
+            
+            # Reset info text after 2 seconds
+            self.after(2000, lambda: self.reg_proxy_info.configure(
+                text="ON" if enabled else "",
+                text_color=self.colors["accent_green"] if enabled else self.colors["text_muted"]
+            ))
+        else:
+            _toast(self, "❌ Failed to save proxy config!", toast_type="error")
             
     def update_status(self, state="IDLE", color=None, details=""):
         # Map state to icon (keep consistent neutral color for all states)
@@ -6562,6 +7144,16 @@ class App(ctk.CTk):
         self.reg_password_toggle.configure(state=state)
         self.reg_password_save.configure(state=state)
         
+        # Lock proxy inputs
+        self.reg_proxy_switch.configure(state=state)
+        if is_running:
+            self.reg_proxy_entry.configure(state="disabled")
+            self.reg_proxy_save.configure(state="disabled")
+        else:
+            proxy_state = "normal" if self.reg_proxy_var.get() else "disabled"
+            self.reg_proxy_entry.configure(state=proxy_state)
+            self.reg_proxy_save.configure(state=proxy_state)
+        
         if self.mfa_mode_var.get() == "Multithread":
             self.mfa_threads_entry.configure(state=state)
             self.mfa_delay_entry.configure(state=state)
@@ -6610,10 +7202,25 @@ class App(ctk.CTk):
         self.update_stats(0, 0)
         
         # settings
-        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, NETWORK_MODE, oauth2_accounts
+        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, NETWORK_MODE, oauth2_accounts, PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
         GET_CHECKOUT_LINK = self.reg_checkout_var.get()
         GET_CHECKOUT_TYPE = self.reg_checkout_type_var.get()
         NETWORK_MODE = self.reg_network_var.get()
+        
+        # Apply proxy settings from GUI
+        PROXY_ENABLED = self.reg_proxy_var.get()
+        PROXY_STRING = self.reg_proxy_string_var.get().strip()
+        if PROXY_ENABLED and PROXY_STRING:
+            detected_fmt = detect_proxy_format(PROXY_STRING)
+            if detected_fmt:
+                PROXY_FORMAT = detected_fmt
+            proxy_info, _ = parse_proxy(PROXY_STRING)
+            if proxy_info:
+                print(f"🌐 Proxy enabled: {proxy_info['host']}:{proxy_info['port']}")
+            else:
+                print(f"⚠️ Invalid proxy string, running without proxy")
+                PROXY_ENABLED = False
+        
         email_mode = self.reg_email_mode_var.get()  # "TinyHost" or "OAuth2"
         mode = self.reg_mode_var.get()
         try:
