@@ -1690,30 +1690,97 @@ class ChatGPTAutoRegisterWorker:
             
             self.human_like_delay(0.2, 0.4)
             
-            # Press Tab to move to DOB field
-            name_input.send_keys(Keys.TAB)
-
-            
             # Random DOB (MM/DD/YYYY format)
             year = random.randint(1999, 2006)
             month = random.randint(1, 12)
             day = random.randint(1, 12)
             dob = f"{month:02d}/{day:02d}/{year}"
-            
-            # Type DOB character by character.
-            # Avoid ActionChains in multithread/background mode (can be focus-dependent).
-            typed = False
-            if getattr(self, 'num_threads', 1) > 1:
-                try:
-                    active_el = self.driver.switch_to.active_element
-                    for char in dob:
-                        active_el.send_keys(char)
-                        time.sleep(random.uniform(0.03, 0.08))
-                    typed = True
-                except Exception:
-                    typed = False
+            dob_iso = f"{year}-{month:02d}-{day:02d}"
+            dob_iso_swapped = f"{year}-{day:02d}-{month:02d}"
 
-            if not typed:
+            if getattr(self, 'num_threads', 1) > 1:
+                # Multi-thread/background-safe path: target DateField segments directly.
+                def _set_segment(seg_el, value_text):
+                    try:
+                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", seg_el)
+                    except Exception:
+                        pass
+                    try:
+                        self.driver.execute_script("arguments[0].focus(); arguments[0].click();", seg_el)
+                    except Exception:
+                        try:
+                            seg_el.click()
+                        except Exception:
+                            return False
+
+                    try:
+                        seg_el.send_keys(Keys.CONTROL, 'a')
+                        seg_el.send_keys(Keys.DELETE)
+                    except Exception:
+                        pass
+
+                    try:
+                        seg_el.send_keys(str(value_text))
+                        time.sleep(0.05)
+                        return True
+                    except Exception:
+                        return False
+
+                filled = False
+                for attempt in range(2):
+                    try:
+                        birthday_group = wait.until(
+                            EC.presence_of_element_located((By.XPATH, "//div[contains(@id,'birthday') and @role='group']"))
+                        )
+                        month_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='month'][contenteditable='true']")
+                        day_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='day'][contenteditable='true']")
+                        year_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='year'][contenteditable='true']")
+                    except Exception:
+                        self.log(f"Could not find DOB segments (attempt {attempt + 1}/2)", Colors.WARNING, "⚠️ ")
+                        time.sleep(0.2)
+                        continue
+
+                    ok = (
+                        _set_segment(month_seg, f"{month:02d}")
+                        and _set_segment(day_seg, f"{day:02d}")
+                        and _set_segment(year_seg, f"{year}")
+                    )
+                    if not ok:
+                        time.sleep(0.2)
+                        continue
+
+                    try:
+                        year_seg.send_keys(Keys.TAB)
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+
+                    current_hidden = ""
+                    try:
+                        hidden_birthday = self.driver.find_element(By.CSS_SELECTOR, "input[type='hidden'][name='birthday']")
+                        current_hidden = hidden_birthday.get_attribute("value") or ""
+                    except Exception:
+                        pass
+
+                    if current_hidden in (dob_iso, dob_iso_swapped):
+                        filled = True
+                        break
+
+                    self.log(
+                        f"Birthday verify failed (attempt {attempt + 1}/2): hidden='{current_hidden}', expected='{dob_iso}' (or '{dob_iso_swapped}')",
+                        Colors.WARNING,
+                        "⚠️ "
+                    )
+                    time.sleep(0.25)
+
+                if not filled:
+                    self.log(f"Could not set Birthday correctly: {dob}", Colors.ERROR, "❌ ")
+                    return False
+            else:
+                # Sequential mode can keep keyboard flow.
+                name_input.send_keys(Keys.TAB)
+
+                typed = False
                 try:
                     actions = ActionChains(self.driver)
                     for char in dob:
@@ -1724,9 +1791,9 @@ class ChatGPTAutoRegisterWorker:
                 except Exception:
                     typed = False
 
-            if not typed:
-                self.log("Could not type DOB", Colors.ERROR, "❌ ")
-                return False
+                if not typed:
+                    self.log("Could not type DOB", Colors.ERROR, "❌ ")
+                    return False
             
             self.log(f"Entered DOB: {dob}", Colors.SUCCESS, "✅ ")
             
