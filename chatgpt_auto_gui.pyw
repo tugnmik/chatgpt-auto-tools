@@ -1623,7 +1623,6 @@ class ChatGPTAutoRegisterWorker:
                     clicked = True
                 except Exception:
                     pass
-            self.human_like_delay(0.2, 0.4)
             
             code_input.clear()
             self.human_like_typing(code_input, otp)
@@ -1637,7 +1636,12 @@ class ChatGPTAutoRegisterWorker:
             return False
     
     def enter_name_and_dob(self):
-        """Enter name and DOB"""
+        """Enter name and DOB — works for both single-thread and multi-thread.
+        
+        Primary method: find each birthday segment explicitly, focus via JS,
+        type digits via element.send_keys (no window focus needed).
+        Fallback: ActionChains chain (needs window focus but proven working).
+        """
         try:
             wait = WebDriverWait(self.driver, self.net.get("element_timeout", 5))
             
@@ -1662,138 +1666,132 @@ class ChatGPTAutoRegisterWorker:
             
             self.driver.execute_script("arguments[0].scrollIntoView(true);", name_input)
 
-            clicked = False
-            try:
-                name_input.click()
-                clicked = True
-            except Exception:
-                pass
-
-            if not clicked:
-                try:
-                    self.driver.execute_script("arguments[0].click();", name_input)
-                    clicked = True
-                except Exception:
-                    pass
-
-            if not clicked and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(name_input).click().perform()
-                    clicked = True
-                except Exception:
-                    pass
+            # Click name input — JS focus+click works without window focus
+            self.driver.execute_script("arguments[0].focus(); arguments[0].click();", name_input)
             
             name_input.clear()
             self.human_like_typing(name_input, "GPT")
             self.log("Entered name: GPT", Colors.SUCCESS, "✅ ")
             
-            self.human_like_delay(0.2, 0.4)
+            self.human_like_delay(0.2, 0.3)
             
-            # Random DOB (MM/DD/YYYY format)
-            year = random.randint(1999, 2006)
+            # Random DOB
+            year = random.randint(1997, 2006)
             month = random.randint(1, 12)
-            day = random.randint(1, 12)
+            day = random.randint(1, 28)
             dob = f"{month:02d}/{day:02d}/{year}"
             dob_iso = f"{year}-{month:02d}-{day:02d}"
-            dob_iso_swapped = f"{year}-{day:02d}-{month:02d}"
 
-            if getattr(self, 'num_threads', 1) > 1:
-                # Multi-thread/background-safe path: target DateField segments directly.
-                def _set_segment(seg_el, value_text):
-                    try:
-                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", seg_el)
-                    except Exception:
-                        pass
-                    try:
-                        self.driver.execute_script("arguments[0].focus(); arguments[0].click();", seg_el)
-                    except Exception:
-                        try:
-                            seg_el.click()
-                        except Exception:
-                            return False
-
-                    try:
-                        seg_el.send_keys(Keys.CONTROL, 'a')
-                        seg_el.send_keys(Keys.DELETE)
-                    except Exception:
-                        pass
-
-                    try:
-                        seg_el.send_keys(str(value_text))
-                        time.sleep(0.05)
-                        return True
-                    except Exception:
-                        return False
-
-                filled = False
-                for attempt in range(2):
-                    try:
-                        birthday_group = wait.until(
-                            EC.presence_of_element_located((By.XPATH, "//div[contains(@id,'birthday') and @role='group']"))
-                        )
-                        month_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='month'][contenteditable='true']")
-                        day_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='day'][contenteditable='true']")
-                        year_seg = birthday_group.find_element(By.CSS_SELECTOR, "div[data-type='year'][contenteditable='true']")
-                    except Exception:
-                        self.log(f"Could not find DOB segments (attempt {attempt + 1}/2)", Colors.WARNING, "⚠️ ")
-                        time.sleep(0.2)
-                        continue
-
-                    ok = (
-                        _set_segment(month_seg, f"{month:02d}")
-                        and _set_segment(day_seg, f"{day:02d}")
-                        and _set_segment(year_seg, f"{year}")
-                    )
-                    if not ok:
-                        time.sleep(0.2)
-                        continue
-
-                    try:
-                        year_seg.send_keys(Keys.TAB)
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
-
-                    current_hidden = ""
-                    try:
-                        hidden_birthday = self.driver.find_element(By.CSS_SELECTOR, "input[type='hidden'][name='birthday']")
-                        current_hidden = hidden_birthday.get_attribute("value") or ""
-                    except Exception:
-                        pass
-
-                    if current_hidden in (dob_iso, dob_iso_swapped):
-                        filled = True
-                        break
-
-                    self.log(
-                        f"Birthday verify failed (attempt {attempt + 1}/2): hidden='{current_hidden}', expected='{dob_iso}' (or '{dob_iso_swapped}')",
-                        Colors.WARNING,
-                        "⚠️ "
-                    )
-                    time.sleep(0.25)
-
-                if not filled:
-                    self.log(f"Could not set Birthday correctly: {dob}", Colors.ERROR, "❌ ")
-                    return False
-            else:
-                # Sequential mode can keep keyboard flow.
-                name_input.send_keys(Keys.TAB)
-
-                typed = False
+            # --- METHOD 1: Segment-by-segment send_keys (no window focus needed) ---
+            filled = False
+            for attempt in range(2):
+                if filled:
+                    break
                 try:
+                    # Press Tab to move to birthday field first
+                    if attempt == 0:
+                        name_input.send_keys(Keys.TAB)
+                        self.human_like_delay(0.1, 0.2)
+
+                    birthday_group = self.driver.find_element(
+                        By.CSS_SELECTOR, "div[id*='birthday'][role='group']"
+                    )
+                    month_seg = birthday_group.find_element(
+                        By.CSS_SELECTOR, "div[data-type='month'][contenteditable='true']"
+                    )
+                    day_seg = birthday_group.find_element(
+                        By.CSS_SELECTOR, "div[data-type='day'][contenteditable='true']"
+                    )
+                    year_seg = birthday_group.find_element(
+                        By.CSS_SELECTOR, "div[data-type='year'][contenteditable='true']"
+                    )
+
+                    # Type month
+                    self.driver.execute_script("arguments[0].focus();", month_seg)
+                    time.sleep(0.05)
+                    for ch in f"{month:02d}":
+                        month_seg.send_keys(ch)
+                        time.sleep(random.uniform(0.08, 0.15))
+                    time.sleep(0.15)
+
+                    # Type day
+                    self.driver.execute_script("arguments[0].focus();", day_seg)
+                    time.sleep(0.05)
+                    for ch in f"{day:02d}":
+                        day_seg.send_keys(ch)
+                        time.sleep(random.uniform(0.08, 0.15))
+                    time.sleep(0.15)
+
+                    # Type year
+                    self.driver.execute_script("arguments[0].focus();", year_seg)
+                    time.sleep(0.05)
+                    for ch in str(year):
+                        year_seg.send_keys(ch)
+                        time.sleep(random.uniform(0.08, 0.15))
+
+                    time.sleep(0.3)
+
+                    # Verify hidden birthday value
+                    try:
+                        hidden = self.driver.find_element(
+                            By.CSS_SELECTOR, "input[type='hidden'][name='birthday']"
+                        )
+                        hidden_val = hidden.get_attribute("value") or ""
+                    except Exception:
+                        hidden_val = ""
+
+                    if hidden_val == dob_iso:
+                        filled = True
+                        self.log(f"DOB set correctly (segment method, attempt {attempt + 1})", Colors.SUCCESS, "✅ ")
+                    else:
+                        self.log(
+                            f"Segment method attempt {attempt + 1}: hidden='{hidden_val}', expected='{dob_iso}'",
+                            Colors.WARNING, "⚠️ "
+                        )
+                except Exception as e:
+                    self.log(f"Segment method attempt {attempt + 1} error: {e}", Colors.WARNING, "⚠️ ")
+
+            # --- METHOD 2: ActionChains fallback (same as proven working commit) ---
+            if not filled:
+                try:
+                    self.log("Trying ActionChains method...", Colors.INFO, "🔄 ")
+                    # Re-focus name input and Tab to birthday
+                    self.driver.execute_script("arguments[0].focus();", name_input)
+                    time.sleep(0.1)
+                    name_input.send_keys(Keys.TAB)
+                    self.human_like_delay(0.2, 0.4)
+
                     actions = ActionChains(self.driver)
                     for char in dob:
                         actions.send_keys(char)
                         actions.pause(random.uniform(0.1, 0.3))
                     actions.perform()
-                    typed = True
-                except Exception:
-                    typed = False
 
-                if not typed:
-                    self.log("Could not type DOB", Colors.ERROR, "❌ ")
-                    return False
+                    time.sleep(0.3)
+
+                    # Verify
+                    try:
+                        hidden = self.driver.find_element(
+                            By.CSS_SELECTOR, "input[type='hidden'][name='birthday']"
+                        )
+                        hidden_val = hidden.get_attribute("value") or ""
+                    except Exception:
+                        hidden_val = ""
+
+                    if hidden_val == dob_iso:
+                        filled = True
+                        self.log("DOB set correctly (ActionChains method)", Colors.SUCCESS, "✅ ")
+                    else:
+                        self.log(
+                            f"ActionChains method: hidden='{hidden_val}', expected='{dob_iso}'",
+                            Colors.WARNING, "⚠️ "
+                        )
+                except Exception as e:
+                    self.log(f"ActionChains method error: {e}", Colors.WARNING, "⚠️ ")
+
+            if not filled:
+                self.log(f"Could not set Birthday correctly: {dob}", Colors.ERROR, "❌ ")
+                return False
             
             self.log(f"Entered DOB: {dob}", Colors.SUCCESS, "✅ ")
             
@@ -1817,8 +1815,6 @@ class ChatGPTAutoRegisterWorker:
                 
                 if checkbox and not checkbox.is_selected():
                     self.driver.execute_script("arguments[0].scrollIntoView(true);", checkbox)
-                    
-                    # Use JavaScript click for checkbox (more reliable)
                     self.driver.execute_script("arguments[0].click();", checkbox)
                     self.log("Clicked 'I agree to all of the following' checkbox", Colors.SUCCESS, "✅ ")
             except Exception as checkbox_error:
@@ -3443,7 +3439,19 @@ def load_mfa_accounts_recheck(excel_file, reverse_order=False):
     return accounts
 
 
-def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay=2, slot_index=0, is_first_batch=True, oauth2_account=None, recheck_mode=False):
+def run_mfa_worker(
+    thread_id,
+    account,
+    excel_file,
+    stop_event=None,
+    thread_delay=2,
+    slot_index=0,
+    is_first_batch=True,
+    oauth2_account=None,
+    recheck_mode=False,
+    register_worker=None,
+    unregister_worker=None,
+):
     """Run MFA worker thread with retries and staggered start
     
     Delay logic:
@@ -3478,8 +3486,22 @@ def run_mfa_worker(thread_id, account, excel_file, stop_event=None, thread_delay
             recheck_mode=recheck_mode
         )
         worker.stop_event = stop_event
-        
-        result = worker.run()
+
+        if callable(register_worker):
+            try:
+                register_worker(worker)
+            except Exception:
+                pass
+
+        try:
+            result = worker.run()
+        finally:
+            if callable(unregister_worker):
+                try:
+                    unregister_worker(worker)
+                except Exception:
+                    pass
+
         if result:
             return True, account["email"]
             
@@ -5131,6 +5153,9 @@ class App(ctk.CTk):
         self.running = False
         self.stop_event = threading.Event()
         self.log_buffer = []
+        self._active_workers = set()
+        self._active_executors = set()
+        self._active_runtime_lock = threading.Lock()
         
         # ═══ ENTRANCE ANIMATIONS ═══
         self.after(100, self._play_entrance_animations)
@@ -6515,7 +6540,9 @@ class App(ctk.CTk):
                 0, 
                 True, 
                 oauth2_system_acc,
-                recheck_mode=True
+                recheck_mode=True,
+                register_worker=self._register_worker,
+                unregister_worker=self._unregister_worker,
             )
             
             with count_lock:
@@ -6531,7 +6558,9 @@ class App(ctk.CTk):
             
         # Run logic (similar to regular MFA but calling wrapper)
         if len(accounts) >= 2 and threads > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+            self._register_executor(executor)
+            try:
                 futures = []
                 for idx, account in enumerate(accounts):
                     if self.stop_event.is_set():
@@ -6548,6 +6577,12 @@ class App(ctk.CTk):
                     if self.stop_event.is_set(): break
                     try: future.result()
                     except: pass
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._unregister_executor(executor)
         else:
             # Sequential
             for idx, account in enumerate(accounts):
@@ -6630,8 +6665,12 @@ class App(ctk.CTk):
                     checkout_type=checkout_type
                 )
                 worker.stop_event = self.stop_event
-                
-                result = worker.run()
+
+                self._register_worker(worker)
+                try:
+                    result = worker.run()
+                finally:
+                    self._unregister_worker(worker)
                 
                 with count_lock:
                     if result:
@@ -6647,7 +6686,9 @@ class App(ctk.CTk):
                 return result, account["email"]
             
             # Run with ThreadPoolExecutor
-            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+            self._register_executor(executor)
+            try:
                 futures = []
                 for idx, account in enumerate(selected):
                     if self.stop_event.is_set():
@@ -6671,11 +6712,18 @@ class App(ctk.CTk):
                 # Wait for all futures
                 for future in concurrent.futures.as_completed(futures):
                     if self.stop_event.is_set():
+                        executor.shutdown(wait=False, cancel_futures=True)
                         break
                     try:
                         future.result()
                     except Exception as e:
                         print(f"Error in worker: {e}")
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._unregister_executor(executor)
         else:
             # Sequential mode
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Checkout Capture | Type: {checkout_type} | Accounts: {len(selected)}")
@@ -6699,8 +6747,12 @@ class App(ctk.CTk):
                     checkout_type=checkout_type
                 )
                 worker.stop_event = self.stop_event
-                
-                result = worker.run()
+
+                self._register_worker(worker)
+                try:
+                    result = worker.run()
+                finally:
+                    self._unregister_worker(worker)
                 
                 if result:
                     success_count += 1
@@ -7227,8 +7279,72 @@ class App(ctk.CTk):
 
     def stop_process(self):
         self.stop_event.set()
-        self.update_status("STOPPING", self.colors["warning"], "Waiting for threads to finish...")
-        _toast(self, "⏹ Stopping automation...", toast_type="warning")
+        self.update_status("STOPPING", self.colors["warning"], "Force stopping now...")
+        self._force_stop_all_runtime()
+        _toast(self, "⏹ Force stop sent (closing browsers now)", toast_type="warning")
+
+    def _register_worker(self, worker):
+        if not worker:
+            return
+        with self._active_runtime_lock:
+            self._active_workers.add(worker)
+
+    def _unregister_worker(self, worker):
+        if not worker:
+            return
+        with self._active_runtime_lock:
+            self._active_workers.discard(worker)
+
+    def _register_executor(self, executor):
+        if not executor:
+            return
+        with self._active_runtime_lock:
+            self._active_executors.add(executor)
+
+    def _unregister_executor(self, executor):
+        if not executor:
+            return
+        with self._active_runtime_lock:
+            self._active_executors.discard(executor)
+
+    def _force_stop_worker(self, worker):
+        if not worker:
+            return
+        try:
+            if hasattr(worker, 'stop_event'):
+                worker.stop_event = self.stop_event
+        except Exception:
+            pass
+
+        try:
+            drv = getattr(worker, 'driver', None)
+            if drv:
+                drv.quit()
+        except Exception:
+            pass
+
+        for cleanup_method in ('cleanup_browser', 'cleanup'):
+            try:
+                method = getattr(worker, cleanup_method, None)
+                if callable(method):
+                    method()
+                    break
+            except Exception:
+                continue
+
+    def _force_stop_all_runtime(self):
+        with self._active_runtime_lock:
+            executors = list(self._active_executors)
+            workers = list(self._active_workers)
+
+        for executor in executors:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+        for worker in workers:
+            self._force_stop_worker(worker)
 
     # --- LOG UTILS ---
     def clear_logs(self):
@@ -7367,7 +7483,11 @@ class App(ctk.CTk):
                         oauth2_account=oauth2_account
                     )
                     worker.stop_event = self.stop_event
-                    success, result = worker.run()
+                    self._register_worker(worker)
+                    try:
+                        success, result = worker.run()
+                    finally:
+                        self._unregister_worker(worker)
                     if success:
                         success_count += 1
                         print("✅ Success!")
@@ -7422,7 +7542,11 @@ class App(ctk.CTk):
                     oauth2_account=oauth2_account
                 )
                 worker.stop_event = stop_event
-                success, result = worker.run()
+                self._register_worker(worker)
+                try:
+                    success, result = worker.run()
+                finally:
+                    self._unregister_worker(worker)
                 
                 # Mark OAuth2 account as registered if success
                 if success and email_mode_inner == "OAuth2" and oauth2_row_num:
@@ -7432,7 +7556,9 @@ class App(ctk.CTk):
 
 
             
-            with ThreadPoolExecutor(max_workers=threads) as executor:
+            executor = ThreadPoolExecutor(max_workers=threads)
+            self._register_executor(executor)
+            try:
                 # Submit tasks
                 futures = {}
                 for i in range(count):
@@ -7479,6 +7605,12 @@ class App(ctk.CTk):
                         print(f"Error: {e}")
                     
                     self.update_stats(success_count, failed_count)
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._unregister_executor(executor)
 
         final_msg = "COMPLETED" if not self.stop_event.is_set() else "STOPPED"
         color = self.colors["success"] if not self.stop_event.is_set() else self.colors["warning"]
@@ -7568,7 +7700,15 @@ class App(ctk.CTk):
                 oauth2_acc = oauth2_map.get(account['email'].lower())
                 
                 try:
-                    result, email = run_mfa_worker(1, account, excel_file, self.stop_event, oauth2_account=oauth2_acc)
+                    result, email = run_mfa_worker(
+                        1,
+                        account,
+                        excel_file,
+                        self.stop_event,
+                        oauth2_account=oauth2_acc,
+                        register_worker=self._register_worker,
+                        unregister_worker=self._unregister_worker,
+                    )
                     if result:
                         success_count += 1
                         print(f"✅ MFA Enabled: {email}")
@@ -7585,7 +7725,9 @@ class App(ctk.CTk):
                     time.sleep(3)
         else:
             self.update_status("RUNNING", self.colors["info"], f"🔐 Running with {threads} threads (delay: {mfa_thread_delay}s)...")
-            with ThreadPoolExecutor(max_workers=threads) as executor:
+            executor = ThreadPoolExecutor(max_workers=threads)
+            self._register_executor(executor)
+            try:
                 futures = {}
                 for idx, account in enumerate(accounts):
                     if self.stop_event.is_set():
@@ -7599,7 +7741,20 @@ class App(ctk.CTk):
                     batch_number = idx // threads        # Which batch this account belongs to
                     is_first_batch = (batch_number == 0) # First batch has no base delay
                     # Pass slot-based delay parameters
-                    future = executor.submit(run_mfa_worker, thread_id, account, excel_file, self.stop_event, mfa_thread_delay, slot_index, is_first_batch, oauth2_acc)
+                    future = executor.submit(
+                        run_mfa_worker,
+                        thread_id,
+                        account,
+                        excel_file,
+                        self.stop_event,
+                        mfa_thread_delay,
+                        slot_index,
+                        is_first_batch,
+                        oauth2_acc,
+                        False,
+                        self._register_worker,
+                        self._unregister_worker,
+                    )
                     futures[future] = account
                 
                 for future in as_completed(futures):
@@ -7616,6 +7771,12 @@ class App(ctk.CTk):
                         print(f"Error: {e}")
                     
                     self.update_stats(success_count, fail_count)
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._unregister_executor(executor)
 
         final_msg = "COMPLETED" if not self.stop_event.is_set() else "STOPPED"
         color = self.colors["success"] if not self.stop_event.is_set() else self.colors["warning"]
