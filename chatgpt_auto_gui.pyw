@@ -348,7 +348,7 @@ def load_proxy_config():
         if os.path.exists(PROXY_CONFIG_FILE):
             with open(PROXY_CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-            PROXY_ENABLED = config.get("enabled", False)
+            PROXY_ENABLED = False  # Always start with proxy disabled
             PROXY_STRING = config.get("proxy_string", "")
             PROXY_FORMAT = config.get("format", "username:password@hostname:port")
             return PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
@@ -2958,11 +2958,20 @@ class MFAWorker:
                             digit_inputs[i].send_keys(digit)
                     self.log("Entered email OTP (6-digit format)", Colors.SUCCESS, "✅ ")
                     
-                    # Click Continue button
-                    btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]")))
-                    btn.click()
-                    self.log("Clicked Continue (OTP)", Colors.SUCCESS, "✅ ")
-                    time.sleep(3)
+                    # Check if Continue button exists (sometimes present, sometimes auto-redirects)
+                    time.sleep(1)
+                    try:
+                        continue_btn = WebDriverWait(self.driver, 3).until(
+                            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]"))
+                        )
+                        if continue_btn and continue_btn.is_displayed():
+                            self.driver.execute_script("arguments[0].click();", continue_btn)
+                            self.log("Clicked Continue (6-digit OTP)", Colors.SUCCESS, "✅ ")
+                            time.sleep(3)
+                    except Exception:
+                        # No Continue button = auto-redirect mode, just wait
+                        self.log("No Continue button, waiting for auto-redirect...", Colors.INFO, "ℹ️ ")
+                        time.sleep(2)
                     return True
             except Exception:
                 pass
@@ -3263,6 +3272,247 @@ class MFAWorker:
             self.log(f"Error in MFA enrollment: {e}", Colors.ERROR, "❌ ")
             return None
     
+    def disable_mfa(self):
+        """Disable orphaned MFA (enabled on web but no key in Excel).
+        Flow: toggle off → password → Try another method → Email → OTP → Remove → confirm"""
+        try:
+            self.log("Disabling orphaned MFA...", Colors.WARNING, "🔄 ")
+            
+            # Step 1: Click the toggle to start disabling (it's currently checked/enabled)
+            try:
+                strict_selectors = [
+                    "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                    "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                    "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
+                ]
+                
+                toggle = None
+                for selector in strict_selectors:
+                    try:
+                        elements = self.driver.find_elements(By.XPATH, selector)
+                        for elem in elements:
+                            if elem.is_displayed():
+                                toggle = elem
+                                break
+                        if toggle:
+                            break
+                    except:
+                        continue
+                
+                if not toggle:
+                    self.log("Could not find MFA toggle to disable", Colors.ERROR, "❌ ")
+                    return False
+                
+                self.driver.execute_script("arguments[0].click();", toggle)
+                self.log("Clicked MFA toggle to disable", Colors.SUCCESS, "✅ ")
+                time.sleep(2)
+            except Exception as e:
+                self.log(f"Error clicking toggle to disable: {e}", Colors.ERROR, "❌ ")
+                return False
+            
+            # Step 2: Handle password verification → Continue
+            try:
+                url = self.driver.current_url
+                page_source = self.driver.page_source.lower()
+                
+                if "auth.openai.com" in url or "log-in/password" in url or "enter your password" in page_source:
+                    self.log("Entering password for MFA disable...", Colors.INFO, "🔑 ")
+                    if not self._enter_password_and_click_continue():
+                        return False
+                    time.sleep(1)
+            except Exception as e:
+                self.log(f"Error during password step: {e}", Colors.ERROR, "❌ ")
+                return False
+            
+            # Step 3: Check for "Try another method" and click it
+            try:
+                page_source = self.driver.page_source.lower()
+                url = self.driver.current_url
+                
+                # Check if we're on a verification page that has "Try another method"
+                try_another_selectors = [
+                    "//a[contains(text(), 'Try another method')]",
+                    "//a[@href='/mfa-challenge']",
+                    "//a[contains(@href, 'mfa-challenge') and contains(text(), 'Try another')]",
+                ]
+                
+                try_another_link = None
+                for selector in try_another_selectors:
+                    try:
+                        elem = WebDriverWait(self.driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        if elem and elem.is_displayed():
+                            try_another_link = elem
+                            break
+                    except:
+                        continue
+                
+                if try_another_link:
+                    self.log("Clicking 'Try another method'...", Colors.INFO, "🔄 ")
+                    self.driver.execute_script("arguments[0].click();", try_another_link)
+                    time.sleep(1)
+                else:
+                    # Maybe already on email verification or method selection page
+                    self.log("'Try another method' not found, checking current page...", Colors.INFO, "ℹ️ ")
+            except Exception as e:
+                self.log(f"Error finding 'Try another method': {e}", Colors.WARNING, "⚠️ ")
+            
+            # Step 4: Select "Email" method
+            try:
+                email_selectors = [
+                    "//a[@href='/mfa-challenge/email-otp']",
+                    "//a[contains(@href, 'email-otp')]",
+                    "//a[.//div[contains(text(), 'Email')]]",
+                    "//a[contains(text(), 'Email')]",
+                ]
+                
+                email_link = None
+                for selector in email_selectors:
+                    try:
+                        elem = WebDriverWait(self.driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        if elem and elem.is_displayed():
+                            email_link = elem
+                            break
+                    except:
+                        continue
+                
+                if email_link:
+                    self.log("Selecting 'Email' verification method...", Colors.INFO, "📧 ")
+                    self.driver.execute_script("arguments[0].click();", email_link)
+                    time.sleep(1)
+                else:
+                    # Maybe page went directly to email OTP
+                    self.log("Email method link not found, checking if already on OTP page...", Colors.INFO, "ℹ️ ")
+            except Exception as e:
+                self.log(f"Error selecting Email method: {e}", Colors.WARNING, "⚠️ ")
+            
+            # Step 5: Handle email OTP verification
+            self.log("Waiting for email OTP...", Colors.INFO, "📧 ")
+            if not self._handle_email_otp_verification():
+                return False
+            
+            # Step 6: Navigate back to Security settings and click toggle again
+            try:
+                self.log("Navigating back to Security settings...", Colors.INFO, "🔄 ")
+                self.driver.get("https://chatgpt.com/#settings/Security")
+                time.sleep(3)
+                
+                # Wait for "Authenticator app" text to appear
+                for _ in range(5):
+                    if "Authenticator app" in self.driver.page_source:
+                        break
+                    time.sleep(2)
+                
+                time.sleep(1)
+                
+                # Find and click the toggle (still checked)
+                strict_selectors = [
+                    "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                    "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
+                    "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
+                ]
+                
+                toggle = None
+                for selector in strict_selectors:
+                    try:
+                        elements = self.driver.find_elements(By.XPATH, selector)
+                        for elem in elements:
+                            if elem.is_displayed():
+                                toggle = elem
+                                break
+                        if toggle:
+                            break
+                    except:
+                        continue
+                
+                if toggle:
+                    state = toggle.get_attribute("data-state")
+                    self.log(f"Toggle state: {state}", Colors.INFO, "🔍 ")
+                    self.driver.execute_script("arguments[0].click();", toggle)
+                    self.log("Clicked MFA toggle again to trigger Remove dialog", Colors.SUCCESS, "✅ ")
+                    time.sleep(2)
+                else:
+                    self.log("Could not find MFA toggle after returning to Security", Colors.ERROR, "❌ ")
+                    return False
+            except Exception as e:
+                self.log(f"Error navigating back to toggle: {e}", Colors.ERROR, "❌ ")
+                return False
+            
+            # Step 7: Wait for "Remove Authenticator App" dialog and click Remove
+            try:
+                self.log("Waiting for Remove dialog...", Colors.INFO, "🗑️ ")
+                
+                remove_selectors = [
+                    "//button[contains(@class, 'btn-danger') and .//div[contains(text(), 'Remove')]]",
+                    "//button[contains(@class, 'btn-danger')]",
+                    "//button[.//div[contains(text(), 'Remove')]]",
+                    "//button[contains(., 'Remove')]",
+                ]
+                
+                remove_btn = None
+                for selector in remove_selectors:
+                    try:
+                        remove_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        if remove_btn and remove_btn.is_displayed():
+                            break
+                        else:
+                            remove_btn = None
+                    except:
+                        continue
+                
+                if not remove_btn:
+                    self.log("Remove button not found in dialog", Colors.ERROR, "❌ ")
+                    return False
+                
+                self.driver.execute_script("arguments[0].click();", remove_btn)
+                self.log("Clicked Remove button", Colors.SUCCESS, "✅ ")
+                time.sleep(3)
+            except Exception as e:
+                self.log(f"Error clicking Remove: {e}", Colors.ERROR, "❌ ")
+                return False
+            
+            # Step 7: Wait for "Authenticator app disabled" success alert
+            try:
+                disabled_selectors = [
+                    "//*[@role='alert' and contains(., 'Authenticator app disabled')]",
+                    "//*[contains(text(), 'Authenticator app disabled')]",
+                    "//*[@data-testid='mfa-disable-success']",
+                ]
+                
+                success_found = False
+                for selector in disabled_selectors:
+                    try:
+                        elements = self.driver.find_elements(By.XPATH, selector)
+                        if elements:
+                            for elem in elements:
+                                if elem.is_displayed():
+                                    success_found = True
+                                    break
+                    except:
+                        continue
+                    if success_found:
+                        break
+                
+                if success_found:
+                    self.log("MFA disabled successfully!", Colors.SUCCESS, "🎉 ")
+                else:
+                    self.log("Disable confirmation not found, but Remove was clicked", Colors.WARNING, "⚠️ ")
+                
+                return True
+                
+            except Exception as e:
+                self.log(f"Error checking disable confirmation: {e}", Colors.WARNING, "⚠️ ")
+                return True  # Remove was clicked, likely succeeded
+                
+        except Exception as e:
+            self.log(f"Error disabling MFA: {e}", Colors.ERROR, "❌ ")
+            return False
+    
     def activate_mfa(self, enroll_data):
         """Activate MFA by entering OTP"""
         try:
@@ -3333,8 +3583,12 @@ class MFAWorker:
                 return False
             
             if enroll_data.get("status") == "already_enabled":
-                self.log(f"MFA already enabled for {self.email} (Recheck passed)", Colors.SUCCESS, "🎉 ")
-                return True
+                self.log(f"MFA enabled but no 2FA key in Excel. Disabling to re-enroll...", Colors.WARNING, "⚠️ ")
+                if self.disable_mfa():
+                    self.log(f"MFA disabled for {self.email}. Will re-enroll on retry.", Colors.SUCCESS, "✅ ")
+                else:
+                    self.log(f"Failed to disable MFA for {self.email}", Colors.ERROR, "❌ ")
+                return False  # Return False to trigger retry → re-enroll with new key
 
             totp_secret = self.activate_mfa(enroll_data)
             if not totp_secret:
@@ -7105,6 +7359,11 @@ class App(ctk.CTk):
             _toast(self, "❌ Failed to save proxy config!", toast_type="error")
             
     def update_status(self, state="IDLE", color=None, details=""):
+        # Thread-safety: schedule on main thread if called from background thread
+        import threading as _threading
+        if _threading.current_thread() is not _threading.main_thread():
+            self.after(0, lambda: self.update_status(state, color, details))
+            return
         # Map state to icon (keep consistent neutral color for all states)
         state_icons = {
             "IDLE": "●",
@@ -7140,6 +7399,11 @@ class App(ctk.CTk):
             
     def update_stats(self, success, failed):
         """Update stats cards with animated counters"""
+        # Thread-safety: schedule on main thread if called from background thread
+        import threading as _threading
+        if _threading.current_thread() is not _threading.main_thread():
+            self.after(0, lambda: self.update_stats(success, failed))
+            return
         # Get current values
         def get_current(lbl):
             try: 
@@ -7179,6 +7443,11 @@ class App(ctk.CTk):
             self.progress_percent.configure(text=f"{percent}% success rate")
 
     def lock_ui(self, is_running):
+        # Thread-safety: schedule on main thread if called from background thread
+        import threading as _threading
+        if _threading.current_thread() is not _threading.main_thread():
+            self.after(0, lambda: self.lock_ui(is_running))
+            return
         self.running = is_running
         state = "disabled" if is_running else "normal"
         stop_state = "normal" if is_running else "disabled"
@@ -7617,19 +7886,20 @@ class App(ctk.CTk):
         self.update_status(final_msg, color, f"✨ Success: {success_count} | Failed: {failed_count}")
         print(f"\n{'🎉' if not self.stop_event.is_set() else '🛑'} {final_msg}! Success: {success_count} | Failed: {failed_count}")
         
-        # Show completion toast
+        # Show completion toast (schedule on main thread)
         if not self.stop_event.is_set():
-            _toast(self, f"✅ Completed! {success_count} accounts", toast_type="success")
+            self.after(0, lambda: _toast(self, f"✅ Completed! {success_count} accounts", toast_type="success"))
         else:
-            _toast(self, f"⏹ Stopped. {success_count} completed", toast_type="warning")
+            self.after(0, lambda: _toast(self, f"⏹ Stopped. {success_count} completed", toast_type="warning"))
         
         self.lock_ui(False)
-        # Restore status with neutral color (like IDLE)
-        self.status_indicator.configure(
-            text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}",
+        # Restore status with neutral color (like IDLE) - schedule on main thread
+        stopped = self.stop_event.is_set()
+        self.after(0, lambda: self.status_indicator.configure(
+            text=f"{'✓' if not stopped else '◼'} {final_msg}",
             fg_color=self.colors["bg_elevated"],
             border_color=self.colors["border_subtle"]
-        )
+        ))
 
     def start_mfa_thread(self):
         threading.Thread(target=self.run_mfa).start()
@@ -7783,19 +8053,20 @@ class App(ctk.CTk):
         self.update_status(final_msg, color, f"🔐 MFA Success: {success_count} | Failed: {fail_count}")
         print(f"\n{'🎉' if not self.stop_event.is_set() else '🛑'} MFA {final_msg}! Success: {success_count} | Failed: {fail_count}")
         
-        # Show completion toast
+        # Show completion toast (schedule on main thread)
         if not self.stop_event.is_set():
-            _toast(self, f"🔐 MFA enabled for {success_count} accounts!", toast_type="success")
+            self.after(0, lambda: _toast(self, f"🔐 MFA enabled for {success_count} accounts!", toast_type="success"))
         else:
-            _toast(self, f"⏹ MFA stopped. {success_count} completed", toast_type="warning")
+            self.after(0, lambda: _toast(self, f"⏹ MFA stopped. {success_count} completed", toast_type="warning"))
         
         self.lock_ui(False)
-        # Restore status with neutral color (like IDLE)
-        self.status_indicator.configure(
-            text=f"{'✓' if not self.stop_event.is_set() else '◼'} {final_msg}",
+        # Restore status with neutral color (like IDLE) - schedule on main thread
+        stopped = self.stop_event.is_set()
+        self.after(0, lambda: self.status_indicator.configure(
+            text=f"{'✓' if not stopped else '◼'} {final_msg}",
             fg_color=self.colors["bg_elevated"],
             border_color=self.colors["border_subtle"]
-        )
+        ))
 
 if __name__ == "__main__":
     app = App()
