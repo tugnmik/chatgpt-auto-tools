@@ -1919,6 +1919,43 @@ class ChatGPTAutoRegisterWorker:
             # Ensure Personal tab is active (not Business)
             self.ensure_personal_tab_active()
             
+            # === Price check: detect if Plus has free offer ===
+            try:
+                plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
+                line_through_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and contains(@class, 'line-through')]"
+                actual_price_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]"
+                
+                line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
+                actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
+                
+                has_line_through = any(el.is_displayed() for el in line_through_elements if el)
+                
+                actual_price = None
+                for price_elem in actual_price_elements:
+                    if price_elem.is_displayed():
+                        actual_price = price_elem.text.strip()
+                        break
+                
+                self.log(f"Price check: line-through={has_line_through}, actual={actual_price}", Colors.INFO, "🔍 ")
+                
+                if has_line_through and actual_price:
+                    digits = ''.join(filter(str.isdigit, actual_price))
+                    if not digits or int(digits) == 0:
+                        self.log(f"Plus FREE offer detected! (original crossed out, current: {actual_price})", Colors.SUCCESS, "✅ ")
+                    else:
+                        self.log(f"Plus discounted price: {actual_price}", Colors.INFO, "💰 ")
+                elif actual_price:
+                    digits = ''.join(filter(str.isdigit, actual_price))
+                    if digits and int(digits) > 0:
+                        self.log(f"Plus price is {actual_price} - no free offer available", Colors.WARNING, "⚠️ ")
+                        return None
+                else:
+                    # No line-through AND no actual price -> no Plus offer
+                    self.log("No Plus pricing found - no free offer available", Colors.WARNING, "⚠️ ")
+                    return None
+            except Exception as e:
+                self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
+            
             button_xpath = (
                 # Priority 1: data-testid selector (most reliable from screenshot)
                 "//button[@data-testid='select-plan-button-plus-upgrade']"
@@ -4134,6 +4171,10 @@ class CheckoutCaptureWorker:
                                 return "NO_PLUS_OFFER"
                             else:
                                 self.log(f"Plus offer detected: {actual_price}", Colors.SUCCESS, "✅ ")
+                        else:
+                            # No line-through AND no actual price -> no Plus offer
+                            self.log("No Plus pricing found - no free offer available", Colors.WARNING, "⚠️ ")
+                            return "NO_PLUS_OFFER"
                                 
                     except Exception as e:
                         self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
