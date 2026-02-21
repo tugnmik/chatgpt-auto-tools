@@ -1922,8 +1922,8 @@ class ChatGPTAutoRegisterWorker:
             # === Price check: detect if Plus has free offer ===
             try:
                 plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
-                line_through_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and contains(@class, 'line-through')]"
-                actual_price_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]"
+                line_through_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and contains(@class, 'line-through')]"
+                actual_price_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and not(contains(@class, 'line-through'))]"
                 
                 line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
                 actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
@@ -1956,35 +1956,44 @@ class ChatGPTAutoRegisterWorker:
             except Exception as e:
                 self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
             
-            button_xpath = (
-                # Priority 1: data-testid selector (most reliable from screenshot)
-                "//button[@data-testid='select-plan-button-plus-upgrade']"
-                # Priority 2: "Try for" text (covers "Try for ₩0", "Try for $0", "Try for free", etc.)
+            # Text-based fallback XPath (excludes generic 'claim offer' to avoid sidebar button)
+            fallback_button_xpath = (
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
+                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                 " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                # Fallback: legacy selectors
-                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
                 " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
                 " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
-                " | //button[contains(normalize-space(.), 'Dùng bản Plus')]"
-                " | //a[contains(normalize-space(.), 'Dùng bản Plus')]"
             )
 
             def locate_plus_button(reload_if_needed):
-                attempts = 2 if reload_if_needed else 1
-                for attempt in range(attempts):
-                    try:
-                        return wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
-                    except TimeoutException:
-                        if reload_if_needed and attempt == 0:
-                            self.log("Get Plus button not found, ensuring Personal tab...", Colors.WARNING, "ℹ️ ")
-                            self.driver.get("https://chatgpt.com/#pricing")
-                            time.sleep(2)
-                            # Ensure Personal tab is active
-                            self.ensure_personal_tab_active()
-                        else:
-                            break
+                """Two-phase button lookup: data-testid first, then text-based fallback."""
+                # Phase 1: Try data-testid (unique to Plus column, avoids sidebar button)
+                try:
+                    return wait.until(EC.element_to_be_clickable((By.XPATH, 
+                        "//button[@data-testid='select-plan-button-plus-upgrade']")))
+                except:
+                    pass
+                
+                # Phase 2: Try text-based selectors
+                try:
+                    return wait.until(EC.element_to_be_clickable((By.XPATH, fallback_button_xpath)))
+                except TimeoutException:
+                    if reload_if_needed:
+                        self.log("Get Plus button not found, ensuring Personal tab...", Colors.WARNING, "ℹ️ ")
+                        self.driver.get("https://chatgpt.com/#pricing")
+                        time.sleep(2)
+                        self.ensure_personal_tab_active()
+                        # Retry both phases after reload
+                        try:
+                            return wait.until(EC.element_to_be_clickable((By.XPATH, 
+                                "//button[@data-testid='select-plan-button-plus-upgrade']")))
+                        except:
+                            pass
+                        try:
+                            return wait.until(EC.element_to_be_clickable((By.XPATH, fallback_button_xpath)))
+                        except:
+                            pass
                 return None
 
             def check_payment_error():
@@ -2036,7 +2045,9 @@ class ChatGPTAutoRegisterWorker:
                 handles_before = list(self.driver.window_handles)
                 self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", plus_button)
                 time.sleep(0.5)
-                plus_button.click()
+                
+                # Use native JS click (the correct Plus column button is unobstructed)
+                self.driver.execute_script("arguments[0].click();", plus_button)
                 self.log(f"Clicked Get Plus (attempt {attempt})", Colors.SUCCESS, "✅ ")
                 time.sleep(1)
                 handles_after = self.driver.window_handles
@@ -3956,17 +3967,21 @@ class CheckoutCaptureWorker:
     def wait_for_page_stable_after_cookie_import(self, max_wait_seconds=30):
         """
         Wait for the page to stabilize after cookie import.
-        Simply wait for 'Free offer' button to appear once, then proceed to #pricing.
+        Wait for offer button ('Claim offer' / 'Free offer') to appear once, then proceed.
         
         Returns True if button found, False if timeout
         """
-        self.log("Waiting for Free offer button...", Colors.INFO, "⏳ ")
+        self.log("Waiting for offer button...", Colors.INFO, "⏳ ")
         
-        # XPath for 'Free offer' button based on the provided HTML
-        free_offer_xpath = (
+        # XPath for offer button - covers both 'Free offer' and 'Claim offer' variants
+        offer_button_xpath = (
             "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Free offer')]"
             " | //button[contains(text(), 'Free offer')]"
             " | //button[.//text()[contains(., 'Free offer')]]"
+            " | //button[contains(., 'Claim offer')]"
+            " | //button[.//text()[contains(., 'Claim offer')]]"
+            " | //button[@aria-label='Claim offer']"
+            " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim offer')]"
         )
         
         start_time = time.time()
@@ -3974,11 +3989,11 @@ class CheckoutCaptureWorker:
         
         while time.time() - start_time < max_wait_seconds:
             try:
-                buttons = self.driver.find_elements(By.XPATH, free_offer_xpath)
+                buttons = self.driver.find_elements(By.XPATH, offer_button_xpath)
                 button_visible = any(btn.is_displayed() for btn in buttons if btn)
                 
                 if button_visible:
-                    self.log("Free offer button found, page ready!", Colors.SUCCESS, "✅ ")
+                    self.log("Offer button found, page ready!", Colors.SUCCESS, "✅ ")
                     time.sleep(0.5)
                     return True
                     
@@ -3987,7 +4002,7 @@ class CheckoutCaptureWorker:
             
             time.sleep(poll_interval)
         
-        self.log("Timeout waiting for Free offer button", Colors.WARNING, "⚠️ ")
+        self.log("Timeout waiting for offer button", Colors.WARNING, "⚠️ ")
         return False
     
     def start_popup_polling(self):
@@ -4137,9 +4152,9 @@ class CheckoutCaptureWorker:
                         plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
                         
                         # Find line-through price (original price)
-                        line_through_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and contains(@class, 'line-through')]"
+                        line_through_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and contains(@class, 'line-through')]"
                         # Find non-line-through price (actual/discounted price)
-                        actual_price_xpath = f"{plus_column_xpath}//div[contains(@class, 'text-5xl') and not(contains(@class, 'line-through'))]"
+                        actual_price_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and not(contains(@class, 'line-through'))]"
                         
                         line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
                         actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
@@ -4180,28 +4195,42 @@ class CheckoutCaptureWorker:
                         self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
 
                 
-                # Find and click Plus button - includes "Try for free", "Try for ₩0", "Get Plus", etc.
-                button_xpath = (
-                    "//button[@data-testid='select-plan-button-plus-upgrade']"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                )
-
-                
+                # Find and click Plus button
+                # IMPORTANT: Try data-testid FIRST (unique to Plus column button)
+                # XPath union '|' returns elements in document order, so the sidebar
+                # "Claim offer" button (different from Plus column "Claim free offer")
+                # would be matched first if we use a single union query.
                 button = None
+                
+                # Phase 1: Try data-testid (most reliable, unique to Plus column)
                 try:
-                    button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
+                    button = wait.until(EC.element_to_be_clickable((By.XPATH, 
+                        "//button[@data-testid='select-plan-button-plus-upgrade']")))  
                 except:
-                    self.log("Plus upgrade button not found, ensuring Personal tab...", Colors.WARNING, "⚠️ ")
-                    # Try to switch to Personal tab and retry finding button
-                    self.ensure_personal_tab_active()
-                    time.sleep(1)
+                    pass
+                
+                # Phase 2: Fallback to text-based selectors if data-testid not found
+                if not button:
+                    fallback_xpath = (
+                        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
+                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
+                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
+                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
+                    )
                     try:
-                        button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
+                        button = wait.until(EC.element_to_be_clickable((By.XPATH, fallback_xpath)))
                     except:
-                        self.log("Plus upgrade button still not found", Colors.WARNING, "⚠️ ")
+                        self.log("Plus upgrade button not found, ensuring Personal tab...", Colors.WARNING, "⚠️ ")
+                        self.ensure_personal_tab_active()
+                        time.sleep(1)
+                        try:
+                            button = wait.until(EC.element_to_be_clickable((By.XPATH, 
+                                "//button[@data-testid='select-plan-button-plus-upgrade']")))  
+                        except:
+                            try:
+                                button = wait.until(EC.element_to_be_clickable((By.XPATH, fallback_xpath)))
+                            except:
+                                self.log("Plus upgrade button still not found", Colors.WARNING, "⚠️ ")
                 
                 if not button:
                     if attempt < max_attempts:
@@ -4210,7 +4239,13 @@ class CheckoutCaptureWorker:
                 
                 handles_before = list(self.driver.window_handles)
                 button_text = button.text.strip() if button.text else "Plus"
-                button.click()
+                
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+                time.sleep(0.5)
+                
+                # Use native JS click (the correct Plus column button is unobstructed)
+                self.driver.execute_script("arguments[0].click();", button)
+                
                 self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
                 time.sleep(1)
                 
