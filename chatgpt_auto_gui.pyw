@@ -1955,11 +1955,42 @@ class ChatGPTAutoRegisterWorker:
         
         # --- (Add more popup handlers below as needed) ---
     
+    def detect_get_plus_button(self):
+        """Detect 'Get Plus' button in header (button-glimmer-cta).
+        If present, it means the account has NO free offer.
+        Returns True if 'Get Plus' button found (no offer), False otherwise.
+        """
+        if not self.driver:
+            return False
+        try:
+            get_plus_selectors = [
+                "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]",
+                "//button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]",
+                "//div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]",
+            ]
+            for xpath in get_plus_selectors:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, xpath)
+                    if any(el.is_displayed() for el in elements):
+                        self.log("Detected 'Get Plus' button in header - NO free offer!", Colors.WARNING, "🚫 ")
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+    
     def get_checkout_link(self):
         """Navigate to pricing section and capture checkout URL"""
         try:
             if not self.driver:
                 return None
+            
+            # Early detection: check for 'Get Plus' header button before navigating to pricing
+            if self.detect_get_plus_button():
+                self.log("Account has no free offer (Get Plus detected), skipping checkout", Colors.WARNING, "⚠️ ")
+                return None
+            
             self.log("Navigating to pricing to capture checkout link...", Colors.INFO, "💳 ")
             time.sleep(1.5)  # Wait after getting session cookie
             try:
@@ -2151,11 +2182,11 @@ class ChatGPTAutoRegisterWorker:
                         if len(self.driver.window_handles) > 1:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to pricing and ensure Personal tab
-                        self.log("Refreshing page to clear error state...", Colors.INFO, "🔄 ")
-                        self.driver.refresh()
-                        time.sleep(2)
-                        
+                        # FULL REFRESH first to clear error state/banner
+                        self.log("Full refresh to clear error state...", Colors.INFO, "🔄 ")
+                        self.driver.get("https://chatgpt.com")
+                        time.sleep(3)
+                        # Then navigate to pricing
                         self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
                         self.driver.get("https://chatgpt.com/#pricing")
                         time.sleep(2)
@@ -4014,7 +4045,11 @@ class CheckoutCaptureWorker:
             self.start_popup_polling()
             
             # Wait for page to stabilize (Free offer button appears twice due to auto-reload)
-            if not self.wait_for_page_stable_after_cookie_import():
+            stable_result = self.wait_for_page_stable_after_cookie_import()
+            if stable_result == "NO_OFFER":
+                self.log("No free offer detected during page load", Colors.WARNING, "⚠️ ")
+                return "NO_OFFER"
+            elif not stable_result:
                 self.log("Warning: Page may not be fully stable", Colors.WARNING, "⚠️ ")
             
             return True
@@ -4027,8 +4062,9 @@ class CheckoutCaptureWorker:
         """
         Wait for the page to stabilize after cookie import.
         Wait for offer button ('Claim offer' / 'Free offer') to appear once, then proceed.
+        Also detects 'Get Plus' button in header — if found, means NO free offer.
         
-        Returns True if button found, False if timeout
+        Returns True if offer button found, 'NO_OFFER' if Get Plus detected, False if timeout
         """
         self.log("Waiting for offer button...", Colors.INFO, "⏳ ")
         
@@ -4043,11 +4079,19 @@ class CheckoutCaptureWorker:
             " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim offer')]"
         )
         
+        # XPath for 'Get Plus' button in header (means NO free offer)
+        get_plus_xpath = (
+            "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]"
+            " | //button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]"
+            " | //div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]"
+        )
+        
         start_time = time.time()
         poll_interval = 0.3
         
         while time.time() - start_time < max_wait_seconds:
             try:
+                # Check for offer button first
                 buttons = self.driver.find_elements(By.XPATH, offer_button_xpath)
                 button_visible = any(btn.is_displayed() for btn in buttons if btn)
                 
@@ -4055,6 +4099,12 @@ class CheckoutCaptureWorker:
                     self.log("Offer button found, page ready!", Colors.SUCCESS, "✅ ")
                     time.sleep(0.5)
                     return True
+                
+                # Check for 'Get Plus' button (means no free offer)
+                get_plus_buttons = self.driver.find_elements(By.XPATH, get_plus_xpath)
+                if any(btn.is_displayed() for btn in get_plus_buttons if btn):
+                    self.log("Detected 'Get Plus' button - NO free offer available!", Colors.WARNING, "🚫 ")
+                    return "NO_OFFER"
                     
             except Exception:
                 pass
@@ -4132,6 +4182,31 @@ class CheckoutCaptureWorker:
                     continue
             return False
         except:
+            return False
+
+    def detect_get_plus_button(self):
+        """Detect 'Get Plus' button in header (button-glimmer-cta).
+        If present, it means the account has NO free offer.
+        Returns True if 'Get Plus' button found (no offer), False otherwise.
+        """
+        if not self.driver:
+            return False
+        try:
+            get_plus_selectors = [
+                "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]",
+                "//button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]",
+                "//div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]",
+            ]
+            for xpath in get_plus_selectors:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, xpath)
+                    if any(el.is_displayed() for el in elements):
+                        self.log("Detected 'Get Plus' button in header - NO free offer!", Colors.WARNING, "🚫 ")
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
             return False
 
     def poll_for_checkout_or_error(self, timeout=30, poll_interval=0.5):
@@ -4328,8 +4403,12 @@ class CheckoutCaptureWorker:
                         if len(self.driver.window_handles) > 1:
                             self.driver.close()
                             self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to pricing page and ensure Personal tab
-                        self.log("Refreshing and navigating back to pricing...", Colors.INFO, "🔄 ")
+                        # FULL REFRESH first to clear error state/banner
+                        self.log("Full refresh to clear error state...", Colors.INFO, "🔄 ")
+                        self.driver.get("https://chatgpt.com")
+                        time.sleep(3)
+                        # Then navigate to pricing
+                        self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
                         self.driver.get(plus_url)
                         time.sleep(2)
                         self.ensure_personal_tab_active()
@@ -4558,9 +4637,24 @@ class CheckoutCaptureWorker:
             if not self.setup_driver():
                 return False
             
-            if not self.import_cookies():
+            import_result = self.import_cookies()
+            if import_result == "NO_OFFER":
+                # Get Plus detected during cookie import — no free offer
+                self.save_no_plus_offer()
+                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
+                self.cleanup_browser()
+                return True  # Saved info, considered success
+            elif not import_result:
                 self.cleanup_browser()
                 return False
+            
+            # Early detection: check for 'Get Plus' button before going to pricing
+            if self.detect_get_plus_button():
+                self.log("Account has no free offer (Get Plus detected)", Colors.WARNING, "⚠️ ")
+                self.save_no_plus_offer()
+                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
+                self.cleanup_browser()
+                return True  # Saved info, considered success
             
             plus_url = None
             business_url = None
