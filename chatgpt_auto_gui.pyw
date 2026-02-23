@@ -1902,6 +1902,59 @@ class ChatGPTAutoRegisterWorker:
         except Exception:
             return False
     
+    def detect_and_close_popups(self):
+        """Detect and close any popups/overlays that may block automation.
+        Each popup type is handled independently so new handlers can be added easily.
+        """
+        if not self.driver:
+            return
+        
+        # --- Handler 1: Study Mode popup ("Try it now" / "Learn anything, step by step") ---
+        try:
+            try_it_now_elements = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'flex') and contains(@class, 'items-center') and contains(@class, 'justify-center') and normalize-space(text())='Try it now']"
+                " | //button[.//div[normalize-space(text())='Try it now']]"
+            )
+            if try_it_now_elements and any(el.is_displayed() for el in try_it_now_elements):
+                self.log("Detected Study Mode popup ('Try it now')", Colors.WARNING, "🔔 ")
+                # Find and click the close button (data-testid="close-button")
+                close_btn = None
+                close_selectors = [
+                    (By.CSS_SELECTOR, "button[data-testid='close-button']"),
+                    (By.XPATH, "//button[@aria-label='Close']"),
+                    (By.CSS_SELECTOR, "button[aria-label='Close']"),
+                ]
+                for by, sel in close_selectors:
+                    try:
+                        candidates = self.driver.find_elements(by, sel)
+                        for btn in candidates:
+                            if btn.is_displayed():
+                                close_btn = btn
+                                break
+                        if close_btn:
+                            break
+                    except Exception:
+                        continue
+                
+                if close_btn:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", close_btn)
+                        self.log("Closed Study Mode popup", Colors.SUCCESS, "✅ ")
+                    except Exception:
+                        try:
+                            close_btn.click()
+                            self.log("Closed Study Mode popup (fallback click)", Colors.SUCCESS, "✅ ")
+                        except Exception as e:
+                            self.log(f"Failed to click close button: {e}", Colors.WARNING, "⚠️ ")
+                    time.sleep(0.5)
+                else:
+                    self.log("Study Mode popup detected but close button not found", Colors.WARNING, "⚠️ ")
+        except Exception:
+            pass  # Silently skip if detection fails
+        
+        # --- (Add more popup handlers below as needed) ---
+    
     def get_checkout_link(self):
         """Navigate to pricing section and capture checkout URL"""
         try:
@@ -1915,6 +1968,9 @@ class ChatGPTAutoRegisterWorker:
                 pass
             time.sleep(1.5)
             wait = WebDriverWait(self.driver, 2)
+            
+            # Detect and close any popups before interacting with pricing UI
+            self.detect_and_close_popups()
             
             # Ensure Personal tab is active (not Business)
             self.ensure_personal_tab_active()
@@ -2520,6 +2576,9 @@ class ChatGPTAutoRegisterWorker:
                 
                 # Get cookies directly after DOB (skip Skip and final Continue buttons)
                 self.log("Registration complete! Getting cookies...", Colors.SUCCESS, "✅ ")
+                
+                # Detect and close any popups before proceeding
+                self.detect_and_close_popups()
                 
                 cookies = self.get_cookies_json()
                 
