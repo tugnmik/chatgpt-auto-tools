@@ -4138,6 +4138,12 @@ class CheckoutCaptureWorker:
                     break
                 
                 button_selectors = [
+                    # Generic close buttons (Study Mode popup, etc.)
+                    "//button[@data-testid='close-button']",
+                    "//button[@aria-label='Close']",
+                    "//button[contains(@class, 'flex h-9 w-9 items-center justify-center')]",
+                    
+                    # Text-based buttons (Onboarding, etc.)
                     "//button[.//div[contains(text(), \"Okay, let's go\")]]",
                     "//button[contains(., \"Okay, let's go\")]",
                     "//div[@role='dialog']//button[contains(., 'Okay')]",
