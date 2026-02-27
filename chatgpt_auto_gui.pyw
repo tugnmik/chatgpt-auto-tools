@@ -31,6 +31,11 @@ import socket
 import select
 import pyotp
 from openpyxl import Workbook, load_workbook
+try:
+    import tls_client
+except ImportError:
+    os.system("pip install tls-client")
+    import tls_client
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
 from datetime import datetime
@@ -1980,416 +1985,177 @@ class ChatGPTAutoRegisterWorker:
         except Exception:
             return False
     
-    def get_checkout_link(self):
-        """Navigate to pricing section and capture checkout URL"""
+    # ==================== API-BASED CHECKOUT ====================
+    
+    def get_random_fingerprint(self):
+        """Tạo ngẫu nhiên tổ hợp TLS Fingerprint và User-Agent khớp nhau"""
+        os_windows = ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64"]
+        os_mac = ["Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3", "Macintosh; Intel Mac OS X 14_0"]
+        
+        fingerprints = []
+        chrome_versions = [110, 112, 114, 116, 118, 119, 120]
+        for ver in chrome_versions:
+            for os_val in os_windows + os_mac:
+                fingerprints.append({"id": f"chrome_{ver}", "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"})
+        
+        firefox_versions = [108, 110, 117, 120]
+        for ver in firefox_versions:
+            for os_val in os_windows + os_mac:
+                fingerprints.append({"id": f"firefox_{ver}", "ua": f"Mozilla/5.0 ({os_val}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"})
+        
+        safari_ids = [("safari_15_6_1", "15.6.1"), ("safari_16_0", "16.0")]
+        for s_id, ver in safari_ids:
+            for os_val in os_mac:
+                fingerprints.append({"id": s_id, "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Safari/605.1.15"})
+        
+        return random.choice(fingerprints)
+    
+    def _cookies_to_header_string(self, cookies_list):
+        """Convert cookies list [{name, value}...] to 'name=value; name2=value2'"""
+        parts = []
+        for c in cookies_list:
+            name = c.get("name", "")
+            value = c.get("value", "")
+            if name:
+                parts.append(f"{name}={value}")
+        return "; ".join(parts)
+    
+    def _fetch_access_token_from_cookies(self, cookie_header):
+        """Gọi GET /api/auth/session với cookie → trả về accessToken"""
+        fp = self.get_random_fingerprint()
+        session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
+        lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
+        
+        headers = {
+            "User-Agent": fp["ua"],
+            "Accept": "*/*",
+            "Accept-Language": lang,
+            "Referer": "https://chatgpt.com/",
+            "Origin": "https://chatgpt.com",
+            "Cookie": cookie_header,
+        }
+        
+        time.sleep(random.uniform(0.3, 0.8))
+        resp = session.get("https://chatgpt.com/api/auth/session", headers=headers)
+        
+        if resp.status_code != 200:
+            self.log(f"Session API error: {resp.status_code}", Colors.ERROR, "❌ ")
+            return None
+        
         try:
-            if not self.driver:
+            data = resp.json()
+        except Exception:
+            self.log("Session API response not JSON", Colors.ERROR, "❌ ")
+            return None
+        
+        token = data.get("accessToken")
+        if not token:
+            self.log("No accessToken in session response", Colors.ERROR, "❌ ")
+            return None
+        
+        email = data.get("user", {}).get("email", "?")
+        self.log(f"Got accessToken for {email}", Colors.SUCCESS, "🔑 ")
+        return token
+    
+    def _call_checkout_api(self, access_token, payload):
+        """Gọi POST /backend-api/payments/checkout → trả về checkout URL"""
+        fp = self.get_random_fingerprint()
+        session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
+        lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": fp["ua"],
+            "Accept-Language": lang,
+            "Referer": "https://chatgpt.com/",
+            "Origin": "https://chatgpt.com"
+        }
+        
+        time.sleep(random.uniform(0.5, 1.5))
+        resp = session.post("https://chatgpt.com/backend-api/payments/checkout", headers=headers, json=payload)
+        
+        if resp.status_code != 200:
+            self.log(f"Checkout API error: {resp.status_code} - {resp.text[:80]}", Colors.ERROR, "❌ ")
+            return None
+        
+        try:
+            res_json = resp.json()
+        except Exception:
+            self.log("Checkout API response not JSON", Colors.ERROR, "❌ ")
+            return None
+        
+        final_link = res_json.get("url")
+        if not final_link and res_json.get("checkout_session_id"):
+            sid = res_json.get("checkout_session_id")
+            final_link = f"https://chatgpt.com/checkout/openai_llc/{sid}"
+        
+        return final_link
+    
+    def get_checkout_link_via_api(self, cookies_list):
+        """Lấy Plus checkout link qua API (thay vì browser)"""
+        try:
+            self.log("Lấy Plus checkout link qua API...", Colors.INFO, "🔗 ")
+            
+            cookie_header = self._cookies_to_header_string(cookies_list)
+            access_token = self._fetch_access_token_from_cookies(cookie_header)
+            if not access_token:
                 return None
             
-            # Early detection: check for 'Get Plus' header button before navigating to pricing
-            if self.detect_get_plus_button():
-                self.log("Account has no free offer (Get Plus detected), skipping checkout", Colors.WARNING, "⚠️ ")
-                return None
+            payload = {
+                "plan_name": "chatgptplusplan",
+                "billing_details": {"country": "VN", "currency": "VND"},
+                "checkout_ui_mode": "custom",
+                "promo_campaign": {"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": False}
+            }
             
-            self.log("Navigating to pricing to capture checkout link...", Colors.INFO, "💳 ")
-            time.sleep(1.5)  # Wait after getting session cookie
-            try:
-                self.driver.execute_script("location.hash = '#pricing';")
-            except Exception:
-                pass
-            time.sleep(1.5)
-            wait = WebDriverWait(self.driver, 2)
+            url = self._call_checkout_api(access_token, payload)
             
-            # Detect and close any popups before interacting with pricing UI
-            self.detect_and_close_popups()
+            if url:
+                self.log(f"Plus Checkout URL (API): {url}", Colors.SUCCESS, "✅ ")
+            else:
+                self.log("Không lấy được Plus link qua API", Colors.WARNING, "⚠️ ")
             
-            # Ensure Personal tab is active (not Business)
-            self.ensure_personal_tab_active()
-            
-            # === Price check: detect if Plus has free offer ===
-            try:
-                plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
-                line_through_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and contains(@class, 'line-through')]"
-                actual_price_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and not(contains(@class, 'line-through'))]"
-                
-                line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
-                actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
-                
-                has_line_through = any(el.is_displayed() for el in line_through_elements if el)
-                
-                actual_price = None
-                for price_elem in actual_price_elements:
-                    if price_elem.is_displayed():
-                        actual_price = price_elem.text.strip()
-                        break
-                
-                self.log(f"Price check: line-through={has_line_through}, actual={actual_price}", Colors.INFO, "🔍 ")
-                
-                if has_line_through and actual_price:
-                    digits = ''.join(filter(str.isdigit, actual_price))
-                    if not digits or int(digits) == 0:
-                        self.log(f"Plus FREE offer detected! (original crossed out, current: {actual_price})", Colors.SUCCESS, "✅ ")
-                    else:
-                        self.log(f"Plus discounted price: {actual_price}", Colors.INFO, "💰 ")
-                elif actual_price:
-                    digits = ''.join(filter(str.isdigit, actual_price))
-                    if digits and int(digits) > 0:
-                        self.log(f"Plus price is {actual_price} - no free offer available", Colors.WARNING, "⚠️ ")
-                        return None
-                else:
-                    # No line-through AND no actual price -> no Plus offer
-                    self.log("No Plus pricing found - no free offer available", Colors.WARNING, "⚠️ ")
-                    return None
-            except Exception as e:
-                self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
-            
-            # Text-based fallback XPath (excludes generic 'claim offer' to avoid sidebar button)
-            fallback_button_xpath = (
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
-                " | //a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
-            )
-
-            def locate_plus_button(reload_if_needed):
-                """Two-phase button lookup: data-testid first, then text-based fallback."""
-                # Phase 1: Try data-testid (unique to Plus column, avoids sidebar button)
-                try:
-                    return wait.until(EC.element_to_be_clickable((By.XPATH, 
-                        "//button[@data-testid='select-plan-button-plus-upgrade']")))
-                except:
-                    pass
-                
-                # Phase 2: Try text-based selectors
-                try:
-                    return wait.until(EC.element_to_be_clickable((By.XPATH, fallback_button_xpath)))
-                except TimeoutException:
-                    if reload_if_needed:
-                        self.log("Get Plus button not found, ensuring Personal tab...", Colors.WARNING, "ℹ️ ")
-                        self.driver.get("https://chatgpt.com/#pricing")
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                        # Retry both phases after reload
-                        try:
-                            return wait.until(EC.element_to_be_clickable((By.XPATH, 
-                                "//button[@data-testid='select-plan-button-plus-upgrade']")))
-                        except:
-                            pass
-                        try:
-                            return wait.until(EC.element_to_be_clickable((By.XPATH, fallback_button_xpath)))
-                        except:
-                            pass
-                return None
-
-            def check_payment_error():
-                """Check if payment error message is displayed using proper element"""
-                try:
-                    # Check for error alert element with orange background
-                    error_selectors = [
-                        "//div[contains(@class, 'bg-orange-500') and @role='alert']//div[contains(@class, 'text-start')]",
-                        "//div[@role='alert' and contains(@class, 'border-orange-500')]//div[contains(@class, 'whitespace-pre-wrap')]",
-                        "//div[contains(@class, 'bg-orange-500')]//div[contains(., 'payments page encountered an error')]",
-                    ]
-                    for selector in error_selectors:
-                        try:
-                            error_elements = self.driver.find_elements(By.XPATH, selector)
-                            for el in error_elements:
-                                if "payments page encountered an error" in el.text.lower():
-                                    return True
-                        except:
-                            continue
-                    return False
-                except:
-                    return False
-
-            def poll_for_checkout_or_error(timeout=30, poll_interval=0.5):
-                """Poll continuously for checkout URL or payment error"""
-                start_time = time.time()
-                while time.time() - start_time < timeout:
-                    try:
-                        # Check for payment error first
-                        if check_payment_error():
-                            return "PAYMENT_ERROR"
-                        
-                        # Check for checkout URL
-                        current_url = self.driver.current_url or ""
-                        if "/checkout/" in current_url.lower() or "pay.openai.com" in current_url.lower():
-                            # Check for invalid verify URL (e.g. /checkout/verify?stripe_session_id=)
-                            if "verify?stripe_session_id" in current_url.lower() or "/checkout/verify?" in current_url.lower():
-                                self.log("Invalid verify URL detected, need to retry...", Colors.WARNING, "⚠️ ")
-                                return "VERIFY_ERROR"
-                            return current_url
-                    except:
-                        pass
-                    
-                    time.sleep(poll_interval)
-                
-                return None  # Timeout
-
-            def click_plus_and_wait(plus_button, attempt=1):
-                handles_before = list(self.driver.window_handles)
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", plus_button)
-                time.sleep(0.5)
-                
-                # Use native JS click (the correct Plus column button is unobstructed)
-                self.driver.execute_script("arguments[0].click();", plus_button)
-                self.log(f"Clicked Get Plus (attempt {attempt})", Colors.SUCCESS, "✅ ")
-                time.sleep(1)
-                handles_after = self.driver.window_handles
-                new_handles = [handle for handle in handles_after if handle not in handles_before]
-                if new_handles:
-                    self.driver.switch_to.window(new_handles[-1])
-                    self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
-                
-                # Use polling to check for checkout URL or error
-                self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
-                result = poll_for_checkout_or_error(timeout=30, poll_interval=0.5)
-                
-                if result == "PAYMENT_ERROR":
-                    self.log("Payment page error detected!", Colors.WARNING, "⚠️ ")
-                    return "PAYMENT_ERROR"
-                elif result == "VERIFY_ERROR":
-                    self.log("Invalid verify URL detected!", Colors.WARNING, "⚠️ ")
-                    return "VERIFY_ERROR"
-                elif result:
-                    return result
-                else:
-                    # Timeout - switch back to main window
-                    if self.driver.window_handles:
-                        try:
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        except Exception:
-                            pass
-                    return None
-
-            # Retry loop for Plus checkout (max 2 attempts for payment errors)
-            checkout_url = None
-            for attempt in range(1, 3):
-                button = locate_plus_button(reload_if_needed=True)
-                if not button:
-                    self.log("Get Plus button not found", Colors.WARNING, "ℹ️ ")
-                    return None
-                
-                checkout_url = click_plus_and_wait(button, attempt)
-                
-                if checkout_url == "PAYMENT_ERROR" or checkout_url == "VERIFY_ERROR":
-                    error_type = "payment error" if checkout_url == "PAYMENT_ERROR" else "verify URL error"
-                    if attempt < 2:
-                        self.log(f"Retrying due to {error_type}...", Colors.WARNING, "🔄 ")
-                        # Close error tab and go back
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        # FULL REFRESH first to clear error state/banner
-                        self.log("Full refresh to clear error state...", Colors.INFO, "🔄 ")
-                        self.driver.get("https://chatgpt.com")
-                        time.sleep(3)
-                        # Then navigate to pricing
-                        self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
-                        self.driver.get("https://chatgpt.com/#pricing")
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                        time.sleep(1)
-                        continue
-                    else:
-                        self.log(f"{error_type.capitalize()} persists, cannot capture Plus link", Colors.ERROR, "❌ ")
-                        return None
-                elif checkout_url:
-                    break
-                else:
-                    if attempt < 2:
-                        self.log("Checkout page did not load, retrying...", Colors.WARNING, "🔄 ")
-                        self.driver.get("https://chatgpt.com/#pricing")
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                    else:
-                        self.log("Failed to open checkout after retries", Colors.WARNING, "ℹ️ ")
-                        return None
-            if checkout_url:
-                self.log(f"Plus Checkout URL: {checkout_url}", Colors.SUCCESS, "✅ ")
-            return checkout_url
+            return url
         except Exception as e:
-            self.log(f"Could not capture checkout link: {e}", Colors.WARNING, "ℹ️ ")
+            self.log(f"API checkout error: {e}", Colors.ERROR, "❌ ")
             return None
     
-    def get_business_checkout_link(self):
-        """Navigate to Business pricing and capture checkout URL"""
+    def get_business_checkout_link_via_api(self, cookies_list):
+        """Lấy Business/Team checkout link qua API (thay vì browser)"""
         try:
-            if not self.driver:
+            self.log("Lấy Business checkout link qua API...", Colors.INFO, "💼 ")
+            
+            cookie_header = self._cookies_to_header_string(cookies_list)
+            access_token = self._fetch_access_token_from_cookies(cookie_header)
+            if not access_token:
                 return None
-            self.log("Navigating to Business pricing...", Colors.INFO, "💼 ")
             
-            # Navigate to Business team pricing page
-            business_url = "https://chatgpt.com/?numSeats=5&selectedPlan=month&referrer=#team-pricing-seat-selection"
-            self.driver.get(business_url)
-            time.sleep(3)
+            payload = {
+                "plan_name": "chatgptteamplan",
+                "team_plan_data": {
+                    "workspace_name": "SABUBULEX",
+                    "price_interval": "month",
+                    "seat_quantity": 5
+                },
+                "billing_details": {"country": "VN", "currency": "VND"},
+                "checkout_ui_mode": "custom",
+                "promo_campaign": {
+                    "promo_campaign_id": "team-1-month-free",
+                    "is_coupon_from_query_param": True
+                }
+            }
             
-            wait = WebDriverWait(self.driver, 7)
+            url = self._call_checkout_api(access_token, payload)
             
-            # Find and click "Continue to billing" button
-            continue_billing_xpath = (
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue to billing')]"
-                " | //button[contains(@class, 'btn-green') and contains(., 'Continue to billing')]"
-                " | //button[contains(@class, 'btn-green') and contains(., 'billing')]"
-                " | //button[contains(., 'Continue to billing')]"
-            )
+            if url:
+                self.log(f"Business Checkout URL (API): {url}", Colors.SUCCESS, "✅ ")
+            else:
+                self.log("Không lấy được Business link qua API", Colors.WARNING, "⚠️ ")
             
-            def locate_continue_button():
-                try:
-                    return wait.until(EC.element_to_be_clickable((By.XPATH, continue_billing_xpath)))
-                except TimeoutException:
-                    self.log("Continue to billing button not found, retrying...", Colors.WARNING, "⚠️ ")
-                    # Retry with page reload
-                    self.driver.get(business_url)
-                    time.sleep(3)
-                    try:
-                        return wait.until(EC.element_to_be_clickable((By.XPATH, continue_billing_xpath)))
-                    except TimeoutException:
-                        return None
-            
-            def check_payment_error():
-                """Check if payment error message is displayed using proper element"""
-                try:
-                    # Check for error alert element with orange background
-                    error_selectors = [
-                        "//div[contains(@class, 'bg-orange-500') and @role='alert']//div[contains(@class, 'text-start')]",
-                        "//div[@role='alert' and contains(@class, 'border-orange-500')]//div[contains(@class, 'whitespace-pre-wrap')]",
-                        "//div[contains(@class, 'bg-orange-500')]//div[contains(., 'payments page encountered an error')]",
-                    ]
-                    for selector in error_selectors:
-                        try:
-                            error_elements = self.driver.find_elements(By.XPATH, selector)
-                            for el in error_elements:
-                                if "payments page encountered an error" in el.text.lower():
-                                    return True
-                        except:
-                            continue
-                    return False
-                except:
-                    return False
-
-            def poll_for_checkout_or_error(timeout=30, poll_interval=0.5):
-                """Poll continuously for checkout URL or payment error"""
-                start_time = time.time()
-                while time.time() - start_time < timeout:
-                    try:
-                        # Check for payment error first
-                        if check_payment_error():
-                            return "PAYMENT_ERROR"
-                        
-                        # Check for checkout URL
-                        current_url = self.driver.current_url or ""
-                        if "/checkout/" in current_url.lower() or "pay.openai.com" in current_url.lower():
-                            # Check for invalid verify URL (e.g. /checkout/verify?stripe_session_id=)
-                            if "verify?stripe_session_id" in current_url.lower() or "/checkout/verify?" in current_url.lower():
-                                self.log("Invalid verify URL detected, need to retry...", Colors.WARNING, "⚠️ ")
-                                return "VERIFY_ERROR"
-                            return current_url
-                    except:
-                        pass
-                    
-                    time.sleep(poll_interval)
-                
-                return None  # Timeout
-
-            def click_continue_and_wait(button, attempt=1):
-                handles_before = list(self.driver.window_handles)
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-                time.sleep(0.5)
-                
-                # Try multiple click methods
-                try:
-                    button.click()
-                except Exception:
-                    try:
-                        self.driver.execute_script("arguments[0].click();", button)
-                    except Exception:
-                        from selenium.webdriver.common.action_chains import ActionChains
-                        ActionChains(self.driver).move_to_element(button).click().perform()
-                
-                self.log(f"Clicked Continue to billing (attempt {attempt})", Colors.SUCCESS, "✅ ")
-                time.sleep(1)
-                
-                # Check for new tab
-                handles_after = self.driver.window_handles
-                new_handles = [h for h in handles_after if h not in handles_before]
-                if new_handles:
-                    self.driver.switch_to.window(new_handles[-1])
-                    self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
-                
-                # Use polling to check for checkout URL or error
-                self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
-                result = poll_for_checkout_or_error(timeout=30, poll_interval=0.5)
-                
-                if result == "PAYMENT_ERROR":
-                    self.log("Payment page error detected!", Colors.WARNING, "⚠️ ")
-                    return "PAYMENT_ERROR"
-                elif result == "VERIFY_ERROR":
-                    self.log("Invalid verify URL detected!", Colors.WARNING, "⚠️ ")
-                    return "VERIFY_ERROR"
-                elif result:
-                    return result
-                else:
-                    self.log(f"Timeout waiting for checkout (attempt {attempt})", Colors.WARNING, "⏱️ ")
-                    # Switch back to main window if checkout didn't load
-                    if self.driver.window_handles:
-                        try:
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        except Exception:
-                            pass
-                    return None
-            
-            # Retry loop for clicking Continue to billing (max 3 attempts)
-            checkout_url = None
-            max_click_attempts = 3
-            
-            for attempt in range(1, max_click_attempts + 1):
-                button = locate_continue_button()
-                if not button:
-                    if attempt < max_click_attempts:
-                        self.log(f"Button not found, retrying... ({attempt}/{max_click_attempts})", Colors.WARNING, "🔄 ")
-                        self.driver.get(business_url)
-                        time.sleep(3)
-                        continue
-                    else:
-                        self.log("Continue to billing button not found after all attempts", Colors.WARNING, "ℹ️ ")
-                        return None
-                
-                checkout_url = click_continue_and_wait(button, attempt)
-                
-                if checkout_url == "PAYMENT_ERROR" or checkout_url == "VERIFY_ERROR":
-                    error_type = "payment error" if checkout_url == "PAYMENT_ERROR" else "verify URL error"
-                    if attempt < max_click_attempts:
-                        self.log(f"Retrying due to {error_type}... ({attempt + 1}/{max_click_attempts})", Colors.WARNING, "🔄 ")
-                        # Close error tab and go back
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        self.driver.get(business_url)
-                        time.sleep(3)
-                        continue
-                    else:
-                        self.log(f"{error_type.capitalize()} persists, cannot capture Business link", Colors.ERROR, "❌ ")
-                        return None
-                elif checkout_url:
-                    break  # Success, exit loop
-                elif attempt < max_click_attempts:
-                    self.log(f"Retrying click... ({attempt + 1}/{max_click_attempts})", Colors.WARNING, "🔄 ")
-                    # Reload page for next attempt
-                    try:
-                        self.driver.get(business_url)
-                        time.sleep(3)
-                    except Exception:
-                        pass
-            
-            if checkout_url:
-                self.log(f"Business Checkout URL: {checkout_url}", Colors.SUCCESS, "✅ ")
-            return checkout_url
-            
+            return url
         except Exception as e:
-            self.log(f"Could not capture Business checkout link: {e}", Colors.WARNING, "ℹ️ ")
+            self.log(f"API business checkout error: {e}", Colors.ERROR, "❌ ")
             return None
     
     def save_account_info(self, cookies, checkout_url=None, business_checkout_url=None):
@@ -2622,21 +2388,12 @@ class ChatGPTAutoRegisterWorker:
                         checkout_type = GET_CHECKOUT_TYPE
                         
                         if checkout_type == "Plus":
-                            checkout_url = self.get_checkout_link()
+                            checkout_url = self.get_checkout_link_via_api(cookies)
                         elif checkout_type == "Business":
-                            business_checkout_url = self.get_business_checkout_link()
+                            business_checkout_url = self.get_business_checkout_link_via_api(cookies)
                         elif checkout_type == "Both":
-                            checkout_url = self.get_checkout_link()
-                            # Close any new tabs and go back for business link
-                            try:
-                                while len(self.driver.window_handles) > 1:
-                                    self.driver.switch_to.window(self.driver.window_handles[-1])
-                                    self.driver.close()
-                                self.driver.switch_to.window(self.driver.window_handles[0])
-                                time.sleep(1)
-                            except Exception:
-                                pass
-                            business_checkout_url = self.get_business_checkout_link()
+                            checkout_url = self.get_checkout_link_via_api(cookies)
+                            business_checkout_url = self.get_business_checkout_link_via_api(cookies)
                     else:
                         self.log("Skipping checkout link - invalid session cookie", Colors.WARNING, "⚠️ ")
                 
@@ -3920,683 +3677,10 @@ class CheckoutCaptureWorker:
         self.excel_file = excel_file
         self.row_index = row_index
         self.checkout_type = checkout_type  # "Plus", "Business", or "Both"
-        self.driver = None
-        self.user_data_dir = None
-        self.proxy_bridge = None
-        self.stop_event = None
-        self.net = NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"])
-        
-        # Popup polling
-        self._popup_polling_active = False
-        self._popup_polling_thread = None
-        self._popup_dismissed = False
         
     def log(self, message, color=Colors.INFO, emoji=""):
         safe_print(self.thread_id, message, color, emoji)
-    
-    def setup_driver(self):
-        """Initialize Chrome driver with lock to prevent race condition"""
-        try:
-            self.log("Initializing browser...", Colors.INFO, "🔄 ")
-            
-            timestamp = int(time.time())
-            random_suffix = random.randint(1000, 9999)
-            self.user_data_dir = tempfile.mkdtemp(prefix=f"chrome_checkout_T{self.thread_id}_{timestamp}_{random_suffix}_")
-            
-            options = uc.ChromeOptions()
-            options.add_argument(f"--user-data-dir={self.user_data_dir}")
-            options.add_argument("--no-first-run")
-            options.add_argument("--no-default-browser-check")
-            options.add_argument("--disable-popup-blocking")
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("--lang=en-US")  # Force English UI
 
-            # Improve stability when Chrome window is background/occluded
-            options.add_argument('--disable-background-timer-throttling')
-            options.add_argument('--disable-backgrounding-occluded-windows')
-            options.add_argument('--disable-renderer-backgrounding')
-            options.add_argument('--disable-features=CalculateNativeWinOcclusion')
-            
-            # Apply proxy if enabled
-            self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
-            if proxy_label:
-                self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
-            
-            # Use lock to prevent race condition when multiple threads initialize ChromeDriver
-            with driver_init_lock:
-                self.driver = uc.Chrome(options=options, version_main=CHROME_VERSION_MAIN)
-            
-            # Window size same as MFA module
-            window_width = 900
-            window_height = 700
-            x_offset = (self.thread_id - 1) * 80
-            y_offset = (self.thread_id - 1) * 40
-            self.driver.set_window_size(window_width, window_height)
-            self.driver.set_window_position(x_offset, y_offset)
-            
-            self.log("Browser ready!", Colors.SUCCESS, "✅ ")
-            return True
-            
-        except Exception as e:
-            self.log(f"Failed to start browser: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def cleanup_browser(self):
-        """Close browser and clean up"""
-        # Stop popup polling thread first
-        self.stop_popup_polling()
-        
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
-            self.driver = None
-
-        if self.proxy_bridge:
-            try:
-                self.proxy_bridge.stop()
-            except Exception:
-                pass
-            self.proxy_bridge = None
-
-        if self.user_data_dir and os.path.exists(self.user_data_dir):
-            try:
-                shutil.rmtree(self.user_data_dir, ignore_errors=True)
-            except:
-                pass
-    
-    def import_cookies(self):
-        """Import cookies into browser"""
-        try:
-            self.log("Importing cookies...", Colors.INFO, "🍪 ")
-            
-            # First navigate to the domain
-            self.driver.get("https://chatgpt.com")
-            time.sleep(2)
-            
-            # Parse and import cookies
-            cookies = json.loads(self.cookie_json)
-            for cookie in cookies:
-                try:
-                    # Clean up cookie for selenium
-                    cookie_dict = {
-                        'name': cookie.get('name'),
-                        'value': cookie.get('value'),
-                        'domain': cookie.get('domain', '.chatgpt.com'),
-                        'path': cookie.get('path', '/'),
-                    }
-                    if cookie.get('secure'):
-                        cookie_dict['secure'] = True
-                    if cookie.get('httpOnly'):
-                        cookie_dict['httpOnly'] = True
-                        
-                    self.driver.add_cookie(cookie_dict)
-                except Exception:
-                    continue
-            
-            # Refresh to apply cookies
-            self.driver.refresh()
-            time.sleep(self.net["extra_wait"])
-            
-            self.log("Cookies imported!", Colors.SUCCESS, "✅ ")
-            
-            # Start popup polling thread
-            self.start_popup_polling()
-            
-            # Wait for page to stabilize (Free offer button appears twice due to auto-reload)
-            stable_result = self.wait_for_page_stable_after_cookie_import()
-            if stable_result == "NO_OFFER":
-                self.log("No free offer detected during page load", Colors.WARNING, "⚠️ ")
-                return "NO_OFFER"
-            elif not stable_result:
-                self.log("Warning: Page may not be fully stable", Colors.WARNING, "⚠️ ")
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"Failed to import cookies: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def wait_for_page_stable_after_cookie_import(self, max_wait_seconds=30):
-        """
-        Wait for the page to stabilize after cookie import.
-        Wait for offer button ('Claim offer' / 'Free offer') to appear once, then proceed.
-        Also detects 'Get Plus' button in header — if found, means NO free offer.
-        
-        Returns True if offer button found, 'NO_OFFER' if Get Plus detected, False if timeout
-        """
-        self.log("Waiting for offer button...", Colors.INFO, "⏳ ")
-        
-        # XPath for offer button - covers both 'Free offer' and 'Claim offer' variants
-        offer_button_xpath = (
-            "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Free offer')]"
-            " | //button[contains(text(), 'Free offer')]"
-            " | //button[.//text()[contains(., 'Free offer')]]"
-            " | //button[contains(., 'Claim offer')]"
-            " | //button[.//text()[contains(., 'Claim offer')]]"
-            " | //button[@aria-label='Claim offer']"
-            " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim offer')]"
-        )
-        
-        # XPath for 'Get Plus' button in header (means NO free offer)
-        get_plus_xpath = (
-            "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]"
-            " | //button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]"
-            " | //div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]"
-        )
-        
-        start_time = time.time()
-        poll_interval = 0.3
-        
-        while time.time() - start_time < max_wait_seconds:
-            try:
-                # Check for offer button first
-                buttons = self.driver.find_elements(By.XPATH, offer_button_xpath)
-                button_visible = any(btn.is_displayed() for btn in buttons if btn)
-                
-                if button_visible:
-                    self.log("Offer button found, page ready!", Colors.SUCCESS, "✅ ")
-                    time.sleep(0.5)
-                    return True
-                
-                # Check for 'Get Plus' button (means no free offer)
-                get_plus_buttons = self.driver.find_elements(By.XPATH, get_plus_xpath)
-                if any(btn.is_displayed() for btn in get_plus_buttons if btn):
-                    self.log("Detected 'Get Plus' button - NO free offer available!", Colors.WARNING, "🚫 ")
-                    return "NO_OFFER"
-                    
-            except Exception:
-                pass
-            
-            time.sleep(poll_interval)
-        
-        self.log("Timeout waiting for offer button", Colors.WARNING, "⚠️ ")
-        return False
-    
-    def start_popup_polling(self):
-        """Start background thread to continuously check and dismiss onboarding popup"""
-        if self._popup_polling_active or self._popup_dismissed:
-            return
-        
-        self._popup_polling_active = True
-        self._popup_polling_thread = threading.Thread(target=self._popup_polling_loop, daemon=True)
-        self._popup_polling_thread.start()
-    
-    def stop_popup_polling(self):
-        """Stop the popup polling thread"""
-        self._popup_polling_active = False
-        if self._popup_polling_thread and self._popup_polling_thread.is_alive():
-            self._popup_polling_thread.join(timeout=2)
-        self._popup_polling_thread = None
-    
-    def _popup_polling_loop(self):
-        """Background loop to check for onboarding popup every 2 seconds"""
-        while self._popup_polling_active and not self._popup_dismissed:
-            try:
-                if not self.driver:
-                    break
-                
-                button_selectors = [
-                    # Generic close buttons (Study Mode popup, etc.)
-                    "//button[@data-testid='close-button']",
-                    "//button[@aria-label='Close']",
-                    "//button[contains(@class, 'flex h-9 w-9 items-center justify-center')]",
-                    
-                    # Text-based buttons (Onboarding, etc.)
-                    "//button[.//div[contains(text(), \"Okay, let's go\")]]",
-                    "//button[contains(., \"Okay, let's go\")]",
-                    "//div[@role='dialog']//button[contains(., 'Okay')]",
-                    "//button[.//div[contains(text(), 'Not now')]]",
-                    "//button[contains(., 'Not now')]",
-                ]
-                
-                for selector in button_selectors:
-                    try:
-                        buttons = self.driver.find_elements(By.XPATH, selector)
-                        for btn in buttons:
-                            if btn.is_displayed():
-                                self.driver.execute_script("arguments[0].click();", btn)
-                                self.log("Dismissed onboarding popup", Colors.SUCCESS, "✅ ")
-                                self._popup_dismissed = True
-                                self._popup_polling_active = False
-                                return
-                    except:
-                        continue
-            except:
-                pass
-            
-            # Poll every 2 seconds
-            time.sleep(2)
-
-    
-    def check_payment_error(self):
-        """Check if payment error message is displayed using proper element"""
-        try:
-            error_selectors = [
-                "//div[contains(@class, 'bg-orange-500') and @role='alert']//div[contains(@class, 'text-start')]",
-                "//div[@role='alert' and contains(@class, 'border-orange-500')]//div[contains(@class, 'whitespace-pre-wrap')]",
-                "//div[contains(@class, 'bg-orange-500')]//div[contains(., 'payments page encountered an error')]",
-            ]
-            for selector in error_selectors:
-                try:
-                    error_elements = self.driver.find_elements(By.XPATH, selector)
-                    for el in error_elements:
-                        if "payments page encountered an error" in el.text.lower():
-                            return True
-                except:
-                    continue
-            return False
-        except:
-            return False
-
-    def detect_get_plus_button(self):
-        """Detect 'Get Plus' button in header (button-glimmer-cta).
-        If present, it means the account has NO free offer.
-        Returns True if 'Get Plus' button found (no offer), False otherwise.
-        """
-        if not self.driver:
-            return False
-        try:
-            get_plus_selectors = [
-                "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]",
-                "//button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]",
-                "//div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]",
-            ]
-            for xpath in get_plus_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, xpath)
-                    if any(el.is_displayed() for el in elements):
-                        self.log("Detected 'Get Plus' button in header - NO free offer!", Colors.WARNING, "🚫 ")
-                        return True
-                except Exception:
-                    continue
-            return False
-        except Exception:
-            return False
-
-    def poll_for_checkout_or_error(self, timeout=30, poll_interval=0.5):
-        """Poll continuously for checkout URL or payment error"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                # Check for payment error first
-                if self.check_payment_error():
-                    return "PAYMENT_ERROR"
-                
-                # Check for checkout URL
-                current_url = self.driver.current_url or ""
-                if "/checkout/" in current_url.lower() or "pay.openai.com" in current_url.lower():
-                    # Check for invalid verify URL (e.g. /checkout/verify?stripe_session_id=)
-                    if "verify?stripe_session_id" in current_url.lower() or "/checkout/verify?" in current_url.lower():
-                        self.log("Invalid verify URL detected, need to retry...", Colors.WARNING, "⚠️ ")
-                        return "VERIFY_ERROR"
-                    return current_url
-            except:
-                pass
-            
-            time.sleep(poll_interval)
-        
-        return None  # Timeout
-
-    def ensure_personal_tab_active(self):
-        """Ensure Personal tab is active, not Business tab"""
-        try:
-            # Check if Personal tab is active (data-state="on" means active)
-            personal_active_xpath = "//button[@role='radio' and contains(., 'Personal') and @data-state='on']"
-            personal_inactive_xpath = "//button[@role='radio' and contains(., 'Personal') and @data-state='off']"
-            
-            # Check if Personal is already active
-            active_tabs = self.driver.find_elements(By.XPATH, personal_active_xpath)
-            if active_tabs:
-                return True  # Already on Personal tab
-            
-            # Personal is not active, try to click it
-            inactive_tabs = self.driver.find_elements(By.XPATH, personal_inactive_xpath)
-            if inactive_tabs:
-                self.log("Switching to Personal tab...", Colors.INFO, "🔄 ")
-                inactive_tabs[0].click()
-                time.sleep(1)
-                return True
-            
-            return False
-        except Exception as e:
-            return False
-
-    def get_plus_checkout(self):
-        """Get Plus checkout link with retry logic"""
-        plus_url = "https://chatgpt.com/#pricing"
-        max_attempts = 3
-        
-        for attempt in range(1, max_attempts + 1):
-            try:
-                self.log(f"Getting Plus checkout link (attempt {attempt}/{max_attempts})...", Colors.INFO, "💳 ")
-                
-                # Navigate to pricing
-                self.driver.get(plus_url)
-                time.sleep(2)
-                
-                wait = WebDriverWait(self.driver, self.net["element_timeout"])
-                
-                # Ensure Personal tab is active (not Business)
-                self.ensure_personal_tab_active()
-                time.sleep(1)
-                
-                # Check if Plus has free offer by detecting BOTH:
-                # 1. text-5xl line-through (original price, e.g. 29000)
-                # 2. text-5xl without line-through (discounted price, e.g. 0)
-                # If BOTH exist -> has free offer, if only non-line-through with value > 0 -> no offer
-                if attempt == 1:
-                    try:
-                        # XPath for Plus pricing column
-                        plus_column_xpath = "//div[@data-testid='plus-pricing-column-cost']"
-                        
-                        # Find line-through price (original price)
-                        line_through_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and contains(@class, 'line-through')]"
-                        # Find non-line-through price (actual/discounted price)
-                        actual_price_xpath = f"{plus_column_xpath}//div[(contains(@class, 'text-5xl') or contains(@class, 'text-[42px]')) and not(contains(@class, 'line-through'))]"
-                        
-                        line_through_elements = self.driver.find_elements(By.XPATH, line_through_xpath)
-                        actual_price_elements = self.driver.find_elements(By.XPATH, actual_price_xpath)
-                        
-                        has_line_through = any(el.is_displayed() for el in line_through_elements if el)
-                        
-                        actual_price = None
-                        for price_elem in actual_price_elements:
-                            if price_elem.is_displayed():
-                                actual_price = price_elem.text.strip()
-                                break
-                        
-                        self.log(f"Price check: line-through={has_line_through}, actual={actual_price}", Colors.INFO, "🔍 ")
-                        
-                        # Has free offer if: has line-through AND actual price is 0
-                        if has_line_through and actual_price:
-                            # Extract digits from actual price
-                            digits = ''.join(filter(str.isdigit, actual_price))
-                            if not digits or int(digits) == 0:
-                                self.log(f"Plus FREE offer detected! (original crossed out, current: {actual_price})", Colors.SUCCESS, "✅ ")
-                            else:
-                                # Has line-through but price is not 0 - unusual case
-                                self.log(f"Plus discounted price: {actual_price}", Colors.INFO, "💰 ")
-                        elif actual_price:
-                            # No line-through, just regular price
-                            digits = ''.join(filter(str.isdigit, actual_price))
-                            if digits and int(digits) > 0:
-                                self.log(f"Plus price is {actual_price} - no free offer available", Colors.WARNING, "⚠️ ")
-                                return "NO_PLUS_OFFER"
-                            else:
-                                self.log(f"Plus offer detected: {actual_price}", Colors.SUCCESS, "✅ ")
-                        else:
-                            # No line-through AND no actual price -> no Plus offer
-                            self.log("No Plus pricing found - no free offer available", Colors.WARNING, "⚠️ ")
-                            return "NO_PLUS_OFFER"
-                                
-                    except Exception as e:
-                        self.log(f"Could not check price, continuing...", Colors.WARNING, "⚠️ ")
-
-                
-                # Find and click Plus button
-                # IMPORTANT: Try data-testid FIRST (unique to Plus column button)
-                # XPath union '|' returns elements in document order, so the sidebar
-                # "Claim offer" button (different from Plus column "Claim free offer")
-                # would be matched first if we use a single union query.
-                button = None
-                
-                # Phase 1: Try data-testid (most reliable, unique to Plus column)
-                try:
-                    button = wait.until(EC.element_to_be_clickable((By.XPATH, 
-                        "//button[@data-testid='select-plan-button-plus-upgrade']")))  
-                except:
-                    pass
-                
-                # Phase 2: Fallback to text-based selectors if data-testid not found
-                if not button:
-                    fallback_xpath = (
-                        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
-                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                        " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get plus')]"
-                    )
-                    try:
-                        button = wait.until(EC.element_to_be_clickable((By.XPATH, fallback_xpath)))
-                    except:
-                        self.log("Plus upgrade button not found, ensuring Personal tab...", Colors.WARNING, "⚠️ ")
-                        self.ensure_personal_tab_active()
-                        time.sleep(1)
-                        try:
-                            button = wait.until(EC.element_to_be_clickable((By.XPATH, 
-                                "//button[@data-testid='select-plan-button-plus-upgrade']")))  
-                        except:
-                            try:
-                                button = wait.until(EC.element_to_be_clickable((By.XPATH, fallback_xpath)))
-                            except:
-                                self.log("Plus upgrade button still not found", Colors.WARNING, "⚠️ ")
-                
-                if not button:
-                    if attempt < max_attempts:
-                        continue
-                    return None
-                
-                handles_before = list(self.driver.window_handles)
-                button_text = button.text.strip() if button.text else "Plus"
-                
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-                time.sleep(0.5)
-                
-                # Use native JS click (the correct Plus column button is unobstructed)
-                self.driver.execute_script("arguments[0].click();", button)
-                
-                self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
-                time.sleep(1)
-                
-                # Check for new tab
-                handles_after = self.driver.window_handles
-                new_handles = [h for h in handles_after if h not in handles_before]
-                if new_handles:
-                    self.driver.switch_to.window(new_handles[-1])
-                    self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
-                
-                # Use polling to check for checkout URL or error
-                self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
-                result = self.poll_for_checkout_or_error(timeout=30, poll_interval=0.5)
-                
-                if result == "PAYMENT_ERROR" or result == "VERIFY_ERROR":
-                    error_type = "payment error" if result == "PAYMENT_ERROR" else "verify URL error"
-                    self.log(f"{error_type.capitalize()} detected!", Colors.WARNING, "⚠️ ")
-                    if attempt < max_attempts:
-                        self.log(f"Retrying due to {error_type}... ({attempt + 1}/{max_attempts})", Colors.WARNING, "🔄 ")
-                        # Close error tab if exists
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        # FULL REFRESH first to clear error state/banner
-                        self.log("Full refresh to clear error state...", Colors.INFO, "🔄 ")
-                        self.driver.get("https://chatgpt.com")
-                        time.sleep(3)
-                        # Then navigate to pricing
-                        self.log("Navigating back to pricing...", Colors.INFO, "🔄 ")
-                        self.driver.get(plus_url)
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                        time.sleep(1)
-                        continue
-                    else:
-                        self.log(f"{error_type.capitalize()} persists, cannot capture Plus link", Colors.ERROR, "❌ ")
-                        return None
-                elif result:
-                    self.log(f"Plus URL: {result[:50]}...", Colors.SUCCESS, "✅ ")
-                    return result
-                else:
-                    # Timeout
-                    if attempt < max_attempts:
-                        self.log(f"Timeout, retrying... ({attempt + 1}/{max_attempts})", Colors.WARNING, "🔄 ")
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to pricing page
-                        self.driver.get(plus_url)
-                        time.sleep(2)
-                        self.ensure_personal_tab_active()
-                        continue
-                    return None
-                    
-            except Exception as e:
-                self.log(f"Error getting Plus checkout: {e}", Colors.ERROR, "❌ ")
-                if attempt < max_attempts:
-                    if len(self.driver.window_handles) > 1:
-                        try:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        except:
-                            pass
-                    continue
-                return None
-        
-        return None
-    
-    def get_business_checkout(self):
-        """Get Business checkout link with retry logic"""
-        pricing_url = "https://chatgpt.com/#pricing"
-        max_attempts = 3
-        
-        for attempt in range(1, max_attempts + 1):
-            try:
-                self.log(f"Getting Business checkout link (attempt {attempt}/{max_attempts})...", Colors.INFO, "💼 ")
-                
-                # Navigate to pricing page (Business tab is default)
-                self.driver.get(pricing_url)
-                time.sleep(2)
-                
-                wait = WebDriverWait(self.driver, self.net["element_timeout"])
-                
-                # Find and click Business button - includes "Claim free offer", "Try for free", etc.
-                # Using data-testid from the HTML: select-plan-button-teams-create
-                button_xpath = (
-                    "//button[@data-testid='select-plan-button-teams-create']"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim free offer')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for free')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'try for')]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get team')]"
-                )
-                
-                button = None
-                try:
-                    button = wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
-                except:
-                    self.log("Business button not found, retrying...", Colors.WARNING, "⚠️ ")
-                    if attempt < max_attempts:
-                        continue
-                    return None
-                
-                handles_before = list(self.driver.window_handles)
-                button_text = button.text.strip() if button.text else "Business"
-                
-                # Try multiple click methods
-                try:
-                    button.click()
-                except Exception:
-                    try:
-                        self.driver.execute_script("arguments[0].click();", button)
-                    except Exception:
-                        from selenium.webdriver.common.action_chains import ActionChains
-                        ActionChains(self.driver).move_to_element(button).click().perform()
-                
-                self.log(f"Clicked '{button_text}' button", Colors.SUCCESS, "✅ ")
-                time.sleep(2)
-                
-                # Check for new tab
-                handles_after = self.driver.window_handles
-                new_handles = [h for h in handles_after if h not in handles_before]
-                if new_handles:
-                    self.driver.switch_to.window(new_handles[-1])
-                    self.log("Switched to checkout tab", Colors.INFO, "🪟 ")
-                
-                # Check for "Continue to billing" button (seat selection page)
-                # This appears when user needs to select number of seats before checkout
-                continue_billing_xpath = (
-                    "//button[contains(@class, 'btn-green') and .//div[contains(text(), 'Continue to billing')]]"
-                    " | //button[contains(@class, 'btn-green') and contains(., 'Continue to billing')]"
-                    " | //button[.//div[contains(text(), 'Continue to billing')]]"
-                    " | //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue to billing')]"
-                )
-                
-                try:
-                    continue_btn = WebDriverWait(self.driver, 3).until(
-                        EC.element_to_be_clickable((By.XPATH, continue_billing_xpath))
-                    )
-                    if continue_btn:
-                        self.log("Found 'Continue to billing' button, clicking...", Colors.INFO, "💳 ")
-                        try:
-                            continue_btn.click()
-                        except Exception:
-                            self.driver.execute_script("arguments[0].click();", continue_btn)
-                        self.log("Clicked 'Continue to billing'", Colors.SUCCESS, "✅ ")
-                        time.sleep(1)
-                        
-                        # Check for new tab again after clicking Continue to billing
-                        handles_after_billing = self.driver.window_handles
-                        new_handles_billing = [h for h in handles_after_billing if h not in handles_before]
-                        if new_handles_billing and self.driver.current_window_handle not in new_handles_billing:
-                            self.driver.switch_to.window(new_handles_billing[-1])
-                            self.log("Switched to checkout tab after billing", Colors.INFO, "🪟 ")
-                except TimeoutException:
-                    # No "Continue to billing" button, proceed directly to poll checkout
-                    pass
-                except Exception:
-                    # Ignore errors, continue to poll checkout
-                    pass
-                
-                # Use polling to check for checkout URL or error
-                self.log("Waiting for checkout page...", Colors.INFO, "⏳ ")
-                result = self.poll_for_checkout_or_error(timeout=30, poll_interval=0.5)
-                
-                if result == "PAYMENT_ERROR" or result == "VERIFY_ERROR":
-                    error_type = "payment error" if result == "PAYMENT_ERROR" else "verify URL error"
-                    self.log(f"{error_type.capitalize()} detected!", Colors.WARNING, "⚠️ ")
-                    if attempt < max_attempts:
-                        self.log(f"Retrying due to {error_type}... ({attempt + 1}/{max_attempts})", Colors.WARNING, "🔄 ")
-                        # Close error tab if exists
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to pricing page
-                        self.log("Refreshing and navigating back to pricing...", Colors.INFO, "🔄 ")
-                        self.driver.get(pricing_url)
-                        time.sleep(2)
-                        continue
-                    else:
-                        self.log(f"{error_type.capitalize()} persists, cannot capture Business link", Colors.ERROR, "❌ ")
-                        return None
-                elif result:
-                    self.log(f"Business URL: {result[:50]}...", Colors.SUCCESS, "✅ ")
-                    return result
-                else:
-                    # Timeout
-                    if attempt < max_attempts:
-                        self.log(f"Timeout, retrying... ({attempt + 1}/{max_attempts})", Colors.WARNING, "🔄 ")
-                        if len(self.driver.window_handles) > 1:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        # Navigate back to pricing page
-                        self.driver.get(pricing_url)
-                        time.sleep(2)
-                        continue
-                    return None
-                    
-            except Exception as e:
-                self.log(f"Error getting Business checkout: {e}", Colors.ERROR, "❌ ")
-                if attempt < max_attempts:
-                    if len(self.driver.window_handles) > 1:
-                        try:
-                            self.driver.close()
-                            self.driver.switch_to.window(self.driver.window_handles[0])
-                        except:
-                            pass
-                    continue
-                return None
-        
-        return None
-    
     def save_to_excel(self, plus_url=None, business_url=None):
         """Save checkout URLs to Excel"""
         try:
@@ -4636,87 +3720,162 @@ class CheckoutCaptureWorker:
             return False
     
     def run(self):
-        """Run the checkout capture flow"""
+        """Run the checkout capture flow via API (no browser needed)"""
         try:
             self.log(f"Starting checkout capture for {self.email}", Colors.HEADER, "🚀 ")
+
             
-            if not self.setup_driver():
+            # Parse cookies from JSON string
+            try:
+                cookies_list = json.loads(self.cookie_json)
+            except json.JSONDecodeError:
+                self.log("Invalid cookie JSON", Colors.ERROR, "❌ ")
                 return False
             
-            import_result = self.import_cookies()
-            if import_result == "NO_OFFER":
-                # Get Plus detected during cookie import — no free offer
-                self.save_no_plus_offer()
-                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
-                self.cleanup_browser()
-                return True  # Saved info, considered success
-            elif not import_result:
-                self.cleanup_browser()
+            # Convert cookies to header string
+            parts = []
+            for c in cookies_list:
+                name = c.get("name", "")
+                value = c.get("value", "")
+                if name:
+                    parts.append(f"{name}={value}")
+            cookie_header = "; ".join(parts)
+            
+            if not cookie_header:
+                self.log("No cookies to send", Colors.ERROR, "❌ ")
                 return False
             
-            # Early detection: check for 'Get Plus' button before going to pricing
-            if self.detect_get_plus_button():
-                self.log("Account has no free offer (Get Plus detected)", Colors.WARNING, "⚠️ ")
-                self.save_no_plus_offer()
-                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
-                self.cleanup_browser()
-                return True  # Saved info, considered success
+            # Step 1: Get accessToken from cookies via API
+            self.log("Fetching accessToken from cookies...", Colors.INFO, "🔑 ")
             
+            os_windows = ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64"]
+            os_mac = ["Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]
+            
+            fp_list = []
+            for ver in [110, 112, 114, 116, 118, 119, 120]:
+                for os_val in os_windows + os_mac:
+                    fp_list.append({"id": f"chrome_{ver}", "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"})
+            for ver in [108, 110, 117, 120]:
+                for os_val in os_windows + os_mac:
+                    fp_list.append({"id": f"firefox_{ver}", "ua": f"Mozilla/5.0 ({os_val}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"})
+            
+            fp = random.choice(fp_list)
+            session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
+            lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
+            
+            headers = {
+                "User-Agent": fp["ua"],
+                "Accept": "*/*",
+                "Accept-Language": lang,
+                "Referer": "https://chatgpt.com/",
+                "Origin": "https://chatgpt.com",
+                "Cookie": cookie_header,
+            }
+            
+            time.sleep(random.uniform(0.3, 0.8))
+            resp = session.get("https://chatgpt.com/api/auth/session", headers=headers)
+            
+            if resp.status_code != 200:
+                self.log(f"Session API error: {resp.status_code}", Colors.ERROR, "❌ ")
+                return False
+            
+            try:
+                data = resp.json()
+            except Exception:
+                self.log("Session response not JSON", Colors.ERROR, "❌ ")
+                return False
+            
+            access_token = data.get("accessToken")
+            if not access_token:
+                self.log("No accessToken - cookie may be expired", Colors.ERROR, "❌ ")
+                return False
+            
+            user_email = data.get("user", {}).get("email", self.email)
+            self.log(f"Got accessToken for {user_email}", Colors.SUCCESS, "🔑 ")
+            
+            # Step 2: Call checkout API
             plus_url = None
             business_url = None
-            no_plus_offer = False
+            
+            def call_checkout(payload, label):
+                fp2 = random.choice(fp_list)
+                s2 = tls_client.Session(client_identifier=fp2["id"], random_tls_extension_order=True)
+                lang2 = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
+                h2 = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": fp2["ua"],
+                    "Accept-Language": lang2,
+                    "Referer": "https://chatgpt.com/",
+                    "Origin": "https://chatgpt.com"
+                }
+                time.sleep(random.uniform(0.5, 1.5))
+                r = s2.post("https://chatgpt.com/backend-api/payments/checkout", headers=h2, json=payload)
+                
+                if r.status_code != 200:
+                    self.log(f"{label} API error: {r.status_code} - {r.text[:80]}", Colors.ERROR, "❌ ")
+                    return None
+                
+                try:
+                    rj = r.json()
+                except Exception:
+                    self.log(f"{label} response not JSON", Colors.ERROR, "❌ ")
+                    return None
+                
+                url = rj.get("url")
+                if not url and rj.get("checkout_session_id"):
+                    sid = rj.get("checkout_session_id")
+                    url = f"https://chatgpt.com/checkout/openai_llc/{sid}"
+                return url
             
             if self.checkout_type in ["Plus", "Both"]:
-                result = self.get_plus_checkout()
+                self.log("Requesting Plus checkout link...", Colors.INFO, "💳 ")
+                plus_url = call_checkout({
+                    "plan_name": "chatgptplusplan",
+                    "billing_details": {"country": "VN", "currency": "VND"},
+                    "checkout_ui_mode": "custom",
+                    "promo_campaign": {"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": False}
+                }, "Plus")
                 
-                # Handle NO_PLUS_OFFER case
-                if result == "NO_PLUS_OFFER":
-                    no_plus_offer = True
-                    self.log("Account has no Plus offer, saving to Excel...", Colors.WARNING, "⚠️ ")
-                    self.save_no_plus_offer()
+                if plus_url:
+                    self.log(f"Plus URL: {plus_url[:60]}...", Colors.SUCCESS, "✅ ")
                 else:
-                    plus_url = result
-                
-                # Close extra tabs for Business
-                if self.checkout_type == "Both" and (plus_url or no_plus_offer):
-                    try:
-                        while len(self.driver.window_handles) > 1:
-                            self.driver.switch_to.window(self.driver.window_handles[-1])
-                            self.driver.close()
-                        self.driver.switch_to.window(self.driver.window_handles[0])
-                        time.sleep(1)
-                    except:
-                        pass
+                    self.log("Could not get Plus link (no offer or error)", Colors.WARNING, "⚠️ ")
+                    self.save_no_plus_offer()
             
             if self.checkout_type in ["Business", "Both"]:
-                business_url = self.get_business_checkout()
+                self.log("Requesting Business checkout link...", Colors.INFO, "💼 ")
+                business_url = call_checkout({
+                    "plan_name": "chatgptteamplan",
+                    "team_plan_data": {
+                        "workspace_name": "SABUBULEX",
+                        "price_interval": "month",
+                        "seat_quantity": 5
+                    },
+                    "billing_details": {"country": "VN", "currency": "VND"},
+                    "checkout_ui_mode": "custom",
+                    "promo_campaign": {
+                        "promo_campaign_id": "team-1-month-free",
+                        "is_coupon_from_query_param": True
+                    }
+                }, "Business")
+                
+                if business_url:
+                    self.log(f"Business URL: {business_url[:60]}...", Colors.SUCCESS, "✅ ")
+                else:
+                    self.log("Could not get Business link", Colors.WARNING, "⚠️ ")
             
             # Save results
             if plus_url or business_url:
                 self.save_to_excel(plus_url, business_url)
                 self.log(f"✅ Completed for {self.email}", Colors.SUCCESS, "🎉 ")
-                self.cleanup_browser()
-                return True
-            elif no_plus_offer and self.checkout_type == "Plus":
-                # Only Plus was requested and no offer available
-                self.log(f"No Plus offer for {self.email}", Colors.WARNING, "⚠️ ")
-                self.cleanup_browser()
-                return True  # Still consider success since we saved the info
-            elif no_plus_offer and business_url:
-                # No Plus offer but got Business
-                self.save_to_excel(None, business_url)
-                self.log(f"✅ Business link captured for {self.email}", Colors.SUCCESS, "🎉 ")
-                self.cleanup_browser()
                 return True
             else:
                 self.log(f"No checkout URLs captured for {self.email}", Colors.WARNING, "⚠️ ")
-                self.cleanup_browser()
                 return False
-
                 
         except Exception as e:
             self.log(f"Error: {e}", Colors.ERROR, "❌ ")
-            self.cleanup_browser()
             return False
 
 
