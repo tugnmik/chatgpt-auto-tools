@@ -1,19 +1,15 @@
 """
-ChatGPT Auto Registration - MULTITHREADING VERSION
+ChatGPT Auto Registration - MULTITHREADING VERSION (API-First)
 Tự động đăng ký nhiều tài khoản ChatGPT đồng thời
+Optimized: patchright + API calls thay vì Selenium UI automation
 """
 
 import requests
 import time
 import re
 import sys
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import asyncio
+import uuid
 import random
 import string
 import json
@@ -30,7 +26,9 @@ import base64
 import socket
 import select
 import pyotp
+from datetime import datetime, timedelta
 from openpyxl import Workbook, load_workbook
+from patchright.sync_api import sync_playwright
 try:
     import tls_client
 except ImportError:
@@ -38,41 +36,21 @@ except ImportError:
     import tls_client
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
-from datetime import datetime
 
 # Initialize colorama
 init(autoreset=True)
 
 # Locks for thread-safe operations
+import atexit
+import subprocess
 file_lock = threading.Lock()
 print_lock = threading.Lock()
 driver_init_lock = threading.Lock()
 
-# Chrome major version installed locally (update when Chrome updates)
-CHROME_VERSION_MAIN = 144
-
 # Global flag for getting checkout link (set by menu)
 GET_CHECKOUT_LINK = False
 GET_CHECKOUT_TYPE = "Plus"  # Options: "Plus", "Business", "Both"
-NETWORK_MODE = "Fast"  # Options: "Fast" (stable network), "VPN/Slow" (unstable network)
-
-# Network mode settings
-NETWORK_SETTINGS = {
-    "Fast": {
-        "page_load_timeout": 15,
-        "element_timeout": 5,
-        "max_retries": 1,
-        "retry_delay": 1,
-        "extra_wait": 0.5,
-    },
-    "VPN/Slow": {
-        "page_load_timeout": 20,
-        "element_timeout": 7,
-        "max_retries": 2,
-        "retry_delay": 1.5,
-        "extra_wait": 0.8,
-    }
-}
+ENABLE_2FA = False  # Global flag for enabling 2FA during registration
 
 # Default password for registration (editable via GUI)
 DEFAULT_PASSWORD = "Matkhau123!@#"
@@ -399,7 +377,11 @@ class TempMailAPI:
     
     def __init__(self):
         self.base_url = "https://tinyhost.shop"
-        self.proxies = get_proxy_for_requests()
+    
+    @property
+    def proxies(self):
+        """Always use latest proxy settings"""
+        return get_proxy_for_requests()
     
     def get_random_domains(self, limit=10):
         """Lấy danh sách domain ngẫu nhiên"""
@@ -410,6 +392,7 @@ class TempMailAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
+            print(f"[TinyHost] get_random_domains error: {e}")
             return None
     
     def get_emails(self, domain, user, page=1, limit=20):
@@ -421,6 +404,7 @@ class TempMailAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
+            print(f"[TinyHost] get_emails error: {e}")
             return None
     
     def get_email_detail(self, domain, user, email_id):
@@ -431,12 +415,14 @@ class TempMailAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
+            print(f"[TinyHost] get_email_detail error: {e}")
             return None
     
     def generate_email(self):
         """Tạo một email ngẫu nhiên"""
         domains_data = self.get_random_domains(20)
         if not domains_data or not domains_data.get('domains'):
+            print(f"[TinyHost] generate_email: no domains! Response: {domains_data}")
             return None
         
         domain = random.choice(domains_data['domains'])
@@ -651,13 +637,13 @@ def mark_oauth2_registered(row_num, file_path="oauth2.xlsx"):
 
 
 class ChatGPTAutoRegisterWorker:
-    """Worker thread for ChatGPT registration"""
+    """Worker thread for ChatGPT registration (API-First with patchright)"""
     
     def __init__(self, thread_id, num_threads=1, email_mode="TinyHost", oauth2_account=None):
         self.thread_id = thread_id
-        self.num_threads = num_threads  # Total threads for position calculation
-        self.email_mode = email_mode  # "TinyHost" or "OAuth2"
-        self.oauth2_account = oauth2_account  # OAuth2 account data if mode is OAuth2
+        self.num_threads = num_threads
+        self.email_mode = email_mode
+        self.oauth2_account = oauth2_account
         
         # Initialize mail API based on mode
         if email_mode == "OAuth2" and oauth2_account:
@@ -668,7 +654,7 @@ class ChatGPTAutoRegisterWorker:
                 client_id=oauth2_account["client_id"]
             )
             self.email_info = self.mail_api.get_email_info()
-            self.password = DEFAULT_PASSWORD  # Use user-configured password, not oauth2 email password
+            self.password = DEFAULT_PASSWORD
             self.oauth2_row_num = oauth2_account.get("row_num")
         else:
             self.mail_api = TempMailAPI()
@@ -676,1387 +662,364 @@ class ChatGPTAutoRegisterWorker:
             self.password = DEFAULT_PASSWORD
             self.oauth2_row_num = None
         
-        self.driver = None
-        self.user_data_dir = None
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
         self.proxy_bridge = None
         self.stop_event = None
-        self.operation_timeout_detected = False
-        self.max_timeout_retries = 2
+        self.max_retries = 2
         self.current_retry = 0
-        
-        # Network settings based on mode
-        self.net = dict(NETWORK_SETTINGS.get(NETWORK_MODE, NETWORK_SETTINGS["Fast"]))
-        # Multi-thread + multiple visible windows can trigger Chrome occlusion/background throttling.
-        # Add a bit more patience to element waits/retries to avoid focus-dependent failures.
-        if self.num_threads and self.num_threads > 1:
-            self.net["max_retries"] = max(int(self.net.get("max_retries", 1)), 2)
-            self.net["element_timeout"] = max(float(self.net.get("element_timeout", 5)), 7)
-            self.net["page_load_timeout"] = max(float(self.net.get("page_load_timeout", 15)), 20)
         
     def log(self, message, color=Colors.INFO, emoji=""):
         """Log with thread ID"""
         safe_print(self.thread_id, message, color, emoji)
 
-    
     def cleanup_browser(self):
-        """Close browser and remove temporary profile"""
-        if self.driver:
+        """Close patchright browser and cleanup"""
+        if self.page:
             try:
-                self.driver.quit()
+                self.page.close()
             except Exception:
                 pass
-            self.driver = None
-
+            self.page = None
+        if self.context:
+            try:
+                self.context.close()
+            except Exception:
+                pass
+            self.context = None
+        if self.browser:
+            try:
+                # Try to get browser PID before closing
+                browser_pid = None
+                try:
+                    browser_pid = self.browser.process.pid if hasattr(self.browser, 'process') and self.browser.process else None
+                except Exception:
+                    pass
+                self.browser.close()
+                # Force kill if still alive
+                if browser_pid:
+                    try:
+                        import signal
+                        os.kill(browser_pid, signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        pass
+            except Exception:
+                pass
+            self.browser = None
+        if self.playwright:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
         if self.proxy_bridge:
             try:
                 self.proxy_bridge.stop()
             except Exception:
                 pass
             self.proxy_bridge = None
-        if self.user_data_dir and os.path.exists(self.user_data_dir):
-            try:
-                shutil.rmtree(self.user_data_dir, ignore_errors=True)
-            except Exception:
-                pass
-            self.user_data_dir = None
-    
-    def has_operation_timeout_error(self):
-        """Check if the current page shows the OpenAI operation timeout error"""
-        if not self.driver:
-            return False
-        try:
-            body = self.driver.find_element(By.TAG_NAME, "body")
-            text = body.text.lower()
-            return (
-                "operation timed out" in text
-                or "oops, an error occurred" in text
-                or "rất tiếc, đã xảy ra lỗi không xác định" in text
-                or ("thử lại" in text and "operation timed out" in text)
-                or "something went wrong" in text
-                or ("an error occurred" in text and "try again" in text)
-            )
-        except Exception:
-            return False
-    
-    def click_try_again_button(self):
-        """Click 'Try again' button on error page if present"""
-        if not self.driver:
-            return False
-        try:
-            selectors = [
-                "//button[contains(text(), 'Try again')]",
-                "//button[contains(text(), 'Thử lại')]",
-                "//button[contains(@class, 'btn') and contains(text(), 'Try')]",
-                "//a[contains(text(), 'Try again')]",
-            ]
-            for selector in selectors:
-                try:
-                    btn = self.driver.find_element(By.XPATH, selector)
-                    if btn and btn.is_displayed():
-                        btn.click()
-                        self.log("Clicked 'Try again' button", Colors.INFO, "🔄 ")
-                        time.sleep(2)
-                        return True
-                except:
-                    continue
-            return False
-        except:
-            return False
-    
-    def redirected_to_chatgpt_home(self, timeout_seconds=5):
-        """Check if browser navigated to chatgpt.com within a short timeout"""
-        if not self.driver:
-            return False
-        try:
-            wait = WebDriverWait(self.driver, timeout_seconds)
-            wait.until(lambda d: "chatgpt.com" in (d.current_url or "").lower() and "/auth" not in (d.current_url or "").lower())
-            return True
-        except Exception:
-            return False
-    
-    def check_and_handle_timeout(self):
-        """Check for timeout error and return True if detected (caller should retry)"""
-        if self.has_operation_timeout_error():
-            self.operation_timeout_detected = True
-            self.log("Detected 'Operation timed out' error!", Colors.WARNING, "⚠️ ")
-            # Try to click "Try again" button
-            self.click_try_again_button()
-            return True
-        return False
-    
-    def setup_driver(self, max_retries=3):
-        """Initialize undetected Chrome driver with retry"""
+
+    def setup_browser(self, max_retries=3):
+        """Initialize patchright browser with retry"""
         for attempt in range(max_retries):
             try:
                 if self.stop_event and self.stop_event.is_set():
                     return False
-                    
-                self.log(f"Initializing ChromeDriver (attempt {attempt + 1}/{max_retries})...", Colors.INFO, "🔄 ")
                 
-                options = uc.ChromeOptions()
+                self.log(f"Initializing browser (attempt {attempt + 1}/{max_retries})...", Colors.INFO, "🔄 ")
                 
-                # Create separate user-data-dir for each thread
-                timestamp = int(time.time() * 1000)
-                random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-                self.user_data_dir = tempfile.mkdtemp(prefix=f"chrome_chatgpt_T{self.thread_id}_{timestamp}_{random_suffix}_")
-                options.add_argument(f'--user-data-dir={self.user_data_dir}')
+                self.playwright = sync_playwright().start()
                 
-                # Basic options
-                options.add_argument('--no-sandbox')
-                options.add_argument('--disable-dev-shm-usage')
-                options.add_argument('--window-size=900,700')
-                options.add_argument('--disable-blink-features=AutomationControlled')
-                options.add_argument('--lang=en-US')  # Set browser language to English (MM/DD/YYYY format)
-
-                # Improve stability when Chrome windows are background/occluded (multi-thread)
-                options.add_argument('--disable-background-timer-throttling')
-                options.add_argument('--disable-backgrounding-occluded-windows')
-                options.add_argument('--disable-renderer-backgrounding')
-                options.add_argument('--disable-features=CalculateNativeWinOcclusion')
-            
-                
-                # Disable notifications
-                prefs = {
-                    "credentials_enable_service": False,
-                    "profile.password_manager_enabled": False,
-                    "profile.default_content_setting_values.notifications": 2
-                }
-                options.add_experimental_option("prefs", prefs)
+                # Build launch args
+                launch_args = [
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--lang=en-US',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                ]
                 
                 # Apply proxy if enabled
-                self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
-                if proxy_label:
-                    self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
+                proxy_config = None
+                if PROXY_ENABLED and PROXY_STRING:
+                    proxy_info, urls = parse_proxy(PROXY_STRING)
+                    if proxy_info and urls:
+                        host = (proxy_info.get("host") or "").strip()
+                        port = str(proxy_info.get("port") or "").strip()
+                        username = (proxy_info.get("username") or "").strip()
+                        password_p = (proxy_info.get("password") or "").strip()
+                        if host and port.isdigit():
+                            if username and password_p:
+                                proxy_config = {
+                                    "server": f"http://{host}:{port}",
+                                    "username": username,
+                                    "password": password_p,
+                                }
+                            else:
+                                proxy_config = {"server": f"http://{host}:{port}"}
+                            self.log(f"Proxy enabled: {host}:{port}", Colors.INFO, "🌐 ")
                 
-                if attempt > 0:
-                    delay = attempt * 2
-                    self.log(f"Waiting {delay}s before retry...", Colors.WARNING, "⏳ ")
-                    time.sleep(delay)
+                self.browser = self.playwright.chromium.launch(
+                    headless=False,
+                    args=launch_args,
+                    proxy=proxy_config,
+                )
                 
-                # Lock when initializing
-                with driver_init_lock:
-                    try:
-                        self.driver = uc.Chrome(options=options, version_main=CHROME_VERSION_MAIN)
-                    except Exception as version_err:
-                        self.log(f"Version-specific ChromeDriver failed ({version_err}); retrying with auto.", Colors.WARNING, "⚠️ ")
-                        self.driver = uc.Chrome(options=options, version_main=None)
-                
-                # Set size and position based on thread_id (cascade windows)
-                # Use modulo to reset position for each batch of threads
-                window_width = 900
-                window_height = 900
+                # Window positioning for multi-thread
+                viewport_w, viewport_h = 1000, 750
                 position_index = (self.thread_id - 1) % self.num_threads if self.num_threads > 1 else 0
-                x_offset = position_index * 100  # 100px offset per thread
-                y_offset = position_index * 50   # 50px offset per thread
                 
-                self.driver.set_window_size(window_width, window_height)
-                self.driver.set_window_position(x_offset, y_offset)
+                self.context = self.browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                    viewport={"width": viewport_w, "height": viewport_h},
+                )
+                self.page = self.context.new_page()
                 
-                self.log("ChromeDriver initialized!", Colors.SUCCESS, "✅ ")
+                self.log("Browser initialized!", Colors.SUCCESS, "✅ ")
                 return True
                 
             except Exception as e:
-                self.log(f"Error initializing driver (attempt {attempt + 1}): {e}", Colors.WARNING, "⚠️ ")
-                
-                if self.driver:
-                    try:
-                        self.driver.quit()
-                    except:
-                        pass
-                    self.driver = None
-                
-                if self.user_data_dir and os.path.exists(self.user_data_dir):
-                    try:
-                        shutil.rmtree(self.user_data_dir, ignore_errors=True)
-                    except:
-                        pass
-                    self.user_data_dir = None
-                
+                self.log(f"Error initializing browser (attempt {attempt + 1}): {e}", Colors.WARNING, "⚠️ ")
+                self.cleanup_browser()
                 if attempt < max_retries - 1:
-                    if self.stop_event and self.stop_event.is_set():
-                        return False
+                    time.sleep(attempt * 2 + 1)
                     continue
                 else:
-                    self.log("Could not initialize ChromeDriver", Colors.ERROR, "❌ ")
+                    self.log("Could not initialize browser", Colors.ERROR, "❌ ")
                     return False
-        
         return False
-    
-    def human_like_delay(self, min_seconds=0.3, max_seconds=0.8):
-        """Random delay (optimized)"""
-        time.sleep(random.uniform(min_seconds, max_seconds))
-    
-    def human_like_typing(self, element, text):
-        """Type with human-like speed"""
-        for char in text:
-            element.send_keys(char)
-            time.sleep(random.uniform(0.01, 0.04))
-    
-    def move_mouse_randomly(self):
-        """Move mouse randomly (fast)"""
-        # In multi-thread mode, simulated mouse movement can become focus-dependent.
-        # Skip it to keep interactions background-safe.
-        if getattr(self, 'num_threads', 1) > 1:
-            return
-        try:
-            action = ActionChains(self.driver)
-            for _ in range(random.randint(1, 2)):
-                x_offset = random.randint(-30, 30)
-                y_offset = random.randint(-30, 30)
-                action.move_by_offset(x_offset, y_offset).perform()
-                time.sleep(random.uniform(0.05, 0.15))
-        except:
-            pass
-    
-    def navigate_to_chatgpt(self):
-        """Navigate to ChatGPT with retry based on network mode"""
-        max_retries = self.net["max_retries"]
+
+    @staticmethod
+    def _random_name():
+        first = ["James","Robert","John","Michael","David","William","Richard",
+                 "Joseph","Thomas","Christopher","Daniel","Matthew","Anthony",
+                 "Mary","Patricia","Jennifer","Linda","Elizabeth","Jessica","Sarah"]
+        last = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller",
+                "Davis","Rodriguez","Martinez","Wilson","Anderson","Thomas","Taylor"]
+        return random.choice(first), random.choice(last)
+
+    @staticmethod
+    def _random_birthdate():
+        start = datetime(1990, 1, 1)
+        end = datetime(2005, 12, 31)
+        days = random.randint(0, (end - start).days)
+        return (start + timedelta(days=days)).strftime("%Y-%m-%d")
+
+    def _wait_for_otp_tinyhost(self, email, timeout=120):
+        """Wait for OTP from TinyHost email"""
+        mail_api = self.mail_api
+        start_time = time.time()
+        checked_ids = set()
+        pattern = re.compile(r"\b(\d{6})\b")
         
-        for attempt in range(max_retries):
+        while time.time() - start_time < timeout:
+            if self.stop_event and self.stop_event.is_set():
+                return None
             try:
-                if attempt > 0:
-                    self.log(f"Retry accessing ChatGPT ({attempt + 1}/{max_retries})...", Colors.WARNING, "🔄 ")
-                    time.sleep(self.net["retry_delay"])
-                
-                self.driver.get("https://chatgpt.com/")
-                
-                # Wait for page to fully load
-                timeout = self.net["page_load_timeout"] + (attempt * 5)
-                wait = WebDriverWait(self.driver, timeout)
-                wait.until(lambda driver: driver.execute_script("return document.readyState") == "complete")
-                
-                # Additional check: wait for body to have content
-                try:
-                    WebDriverWait(self.driver, self.net["element_timeout"]).until(
-                        lambda d: len(d.find_elements(By.TAG_NAME, "button")) > 0
-                    )
-                except Exception:
-                    pass
-                
-                self.log("Accessed chatgpt.com", Colors.SUCCESS, "✅ ")
-                time.sleep(self.net["extra_wait"])
-                return True
-                
-            except TimeoutException:
-                self.log(f"Page load timeout (attempt {attempt + 1})", Colors.WARNING, "⏳ ")
-                if attempt < max_retries - 1:
-                    continue
-                    
-            except Exception as e:
-                self.log(f"Error accessing ChatGPT: {e}", Colors.ERROR, "❌ ")
-                if attempt < max_retries - 1:
-                    continue
-        
-        self.log(f"Failed to access ChatGPT after {max_retries} attempts", Colors.ERROR, "❌ ")
-        return False
-    
-    def click_login_button(self):
-        """Click Log in button with retry based on network mode"""
-        try:
-            max_retries = self.net["max_retries"]
-            
-            selectors = [
-                "//button[@data-testid='login-button']",
-                "//button[contains(text(), 'Log in')]",
-                "//button[contains(text(), 'Đăng nhập')]",
-                "//a[contains(text(), 'Log in')]",
-                "//a[contains(text(), 'Đăng nhập')]",
-                "//button[contains(@class, 'login')]",
-                "//*[@data-testid='login-button']",
-            ]
-            
-            login_button = None
-            
-            for attempt in range(max_retries):
-                timeout = self.net["element_timeout"] + (attempt * 3)
-                wait = WebDriverWait(self.driver, timeout)
-                
-                if attempt > 0:
-                    self.log(f"Retry finding Login button ({attempt + 1}/{max_retries})...", Colors.WARNING, "🔄 ")
-                    time.sleep(self.net["retry_delay"])
-                    try:
-                        page_state = self.driver.execute_script("return document.readyState")
-                        if page_state != "complete":
-                            self.driver.refresh()
-                            time.sleep(self.net["retry_delay"])
-                    except Exception:
-                        pass
-                
-                for selector in selectors:
-                    try:
-                        login_button = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
-                        if login_button.is_displayed():
-                            break
-                        else:
-                            login_button = None
-                    except TimeoutException:
-                        continue
-                    except Exception:
-                        continue
-                
-                if login_button:
-                    break
-            
-            if not login_button:
-                self.log("Could not find Log in button", Colors.ERROR, "❌ ")
-                return False
-            
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", login_button)
-            self.human_like_delay(0.2, 0.4)
-            
-            # Try multiple click methods
-            click_success = False
-            # Prefer DOM click methods first (more reliable in background windows)
-            try:
-                login_button.click()
-                click_success = True
-            except Exception:
-                pass
-
-            if not click_success:
-                try:
-                    self.driver.execute_script("arguments[0].click();", login_button)
-                    click_success = True
-                except Exception:
-                    pass
-
-            # Optional: only use ActionChains/mouse simulation when single-thread
-            if not click_success and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(login_button).pause(0.3).click().perform()
-                    click_success = True
-                except Exception:
-                    pass
-            
-            if click_success:
-                self.log("Clicked Log in", Colors.SUCCESS, "✅ ")
-
-                def _login_ready(d):
-                    try:
-                        url = (d.current_url or "").lower()
-                    except Exception:
-                        url = ""
-                    if "auth.openai.com" in url or "/auth" in url:
-                        return True
-                    # Some variants render login inline; detect email field.
-                    try:
-                        if d.find_elements(By.CSS_SELECTOR, "input[type='email']"):
-                            return True
-                        if d.find_elements(By.CSS_SELECTOR, "input[name='email']"):
-                            return True
-                        if d.find_elements(By.ID, "email"):
-                            return True
-                    except Exception:
-                        pass
-                    return False
-
-                ready = False
-                try:
-                    WebDriverWait(self.driver, self.net["element_timeout"]).until(_login_ready)
-                    ready = True
-                except Exception:
-                    ready = False
-
-                if not ready:
-                    self.log("Login flow not ready (no email input detected)", Colors.ERROR, "❌ ")
-
-                time.sleep(self.net["extra_wait"])
-                return bool(ready)
-            else:
-                self.log("Failed to click Log in button", Colors.ERROR, "❌ ")
-                return False
-            
-        except Exception as e:
-            self.log(f"Error clicking Log in: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def enter_email_address(self):
-        """Enter email with retry based on network mode"""
-        try:
-            # For OAuth2 mode, email_info is already set in __init__
-            # For TinyHost mode, we need to generate email
-            if not self.email_info:
-                self.email_info = self.mail_api.generate_email()
-                if not self.email_info:
-                    return False
-            
-            email = self.email_info['email']
-            self.log(f"Email: {email}", Colors.INFO, "📧 ")
-            
-            max_retries = self.net["max_retries"]
-            
-            selectors = [
-                (By.ID, "email"),
-                (By.XPATH, "//input[@id='email']"),
-                (By.XPATH, "//input[@aria-label='Địa chỉ email']"),
-                (By.XPATH, "//input[@aria-label='Email address']"),
-                (By.XPATH, "//input[@type='email']"),
-                (By.XPATH, "//input[@name='email']"),
-                (By.XPATH, "//input[@placeholder='Email address']"),
-                (By.XPATH, "//input[contains(@class, 'email')]"),
-            ]
-            
-            email_input = None
-            
-            for attempt in range(max_retries):
-                timeout = self.net["element_timeout"] + (attempt * 3)
-                wait = WebDriverWait(self.driver, timeout)
-                
-                if attempt > 0:
-                    self.log(f"Retry finding email input ({attempt + 1}/{max_retries})...", Colors.WARNING, "🔄 ")
-                    time.sleep(self.net["retry_delay"])
-                    
-                    # Check if page needs refresh (stuck on loading)
-                    try:
-                        page_state = self.driver.execute_script("return document.readyState")
-                        if page_state != "complete":
-                            self.log("Page not fully loaded, waiting...", Colors.INFO, "⏳ ")
-                            WebDriverWait(self.driver, self.net["page_load_timeout"]).until(
-                                lambda d: d.execute_script("return document.readyState") == "complete"
-                            )
-                    except Exception:
-                        pass
-                
-                # Try each selector
-                for by, selector in selectors:
-                    try:
-                        email_input = wait.until(EC.presence_of_element_located((by, selector)))
-                        if email_input.is_displayed():
-                            break
-                        else:
-                            email_input = None
-                    except TimeoutException:
-                        continue
-                    except Exception:
-                        continue
-                
-                if email_input:
-                    break
-                    
-                # If not found and not last attempt, try refreshing the login page
-                if attempt < max_retries - 1:
-                    self.log("Email input not found, refreshing page...", Colors.WARNING, "🔄 ")
-                    try:
-                        # Do NOT force-navigate to auth.openai.com/authorize.
-                        # Instead, refresh chatgpt.com and click Log in again.
-                        self.driver.get("https://chatgpt.com/")
-                        time.sleep(self.net["retry_delay"])
-                        self.click_login_button()
-                        time.sleep(self.net["extra_wait"])
-                    except Exception:
+                domain = email.split("@")[1]
+                user = email.split("@")[0]
+                data = mail_api.get_emails(domain, user, limit=10)
+                if data:
+                    emails_list = data.get("emails", [])
+                    for mail in emails_list:
+                        mail_id = mail.get("id")
+                        if mail_id in checked_ids:
+                            continue
+                        
+                        sender = mail.get("sender", "")
+                        subject = mail.get("subject", "")
+                        
+                        # Filter for OpenAI emails
+                        if "openai" not in sender.lower() and "openai" not in subject.lower():
+                            checked_ids.add(mail_id)
+                            continue
+                        
+                        self.log(f"Checking email [{mail_id}]: '{subject}' from {sender}", Colors.INFO)
+                        
+                        # Try extract from subject
+                        codes = pattern.findall(subject)
+                        if codes:
+                            self.log(f"OTP from subject: {codes[0]}", Colors.SUCCESS, "✅ ")
+                            return codes[0]
+                        
+                        # Try extract from body
+                        body = mail.get("body", "") or ""
+                        html_body = mail.get("html_body", "") or ""
+                        for text in [body, html_body]:
+                            codes = pattern.findall(text)
+                            if codes:
+                                self.log(f"OTP from body: {codes[0]}", Colors.SUCCESS, "✅ ")
+                                return codes[0]
+                        
+                        # Try full detail
                         try:
-                            self.driver.refresh()
+                            detail = mail_api.get_email_detail(domain, user, mail_id)
+                            if detail:
+                                for field in ["subject", "body", "html_body"]:
+                                    text = detail.get(field, "") or ""
+                                    codes = pattern.findall(text)
+                                    if codes:
+                                        self.log(f"OTP from detail.{field}: {codes[0]}", Colors.SUCCESS, "✅ ")
+                                        return codes[0]
                         except Exception:
                             pass
-                        time.sleep(self.net["retry_delay"])
-                        self.click_login_button()
-                        time.sleep(self.net["extra_wait"])
-            
-            if not email_input:
-                self.log(f"Could not find email input after {max_retries} attempts", Colors.ERROR, "❌ ")
-                try:
-                    page_title = self.driver.title
-                    current_url = self.driver.current_url
-                    self.log(f"Current page: {page_title} | URL: {current_url}", Colors.INFO, "ℹ️ ")
-                except Exception:
-                    pass
-                return False
-            
-            # Scroll and interact
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", email_input)
-            self.human_like_delay(0.1, 0.2)
-            
-            # Try multiple click methods
-            clicked = False
-            try:
-                email_input.click()
-                clicked = True
-            except Exception:
-                pass
-
-            if not clicked:
-                try:
-                    self.driver.execute_script("arguments[0].click();", email_input)
-                    clicked = True
-                except Exception:
-                    pass
-
-            if not clicked and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(email_input).click().perform()
-                    clicked = True
-                except Exception:
-                    pass
-            
-            # Clear and type
-            try:
-                email_input.clear()
-            except Exception:
-                self.driver.execute_script("arguments[0].value = '';", email_input)
-            
-            self.human_like_typing(email_input, email)
-            self.log("Entered email", Colors.SUCCESS, "✅ ")
-            
-            self.human_like_delay(0.1, 0.2)
-            return True
-            
-        except Exception as e:
-            self.log(f"Error entering email: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def click_continue_button(self):
-        """Click Continue button with retry based on network mode"""
-        try:
-            max_retries = self.net["max_retries"]
-            
-            selectors = [
-                "//button[contains(text(), 'Tiếp tục')]",
-                "//button[contains(text(), 'Continue')]",
-                "//button[@type='submit']",
-                "//button[contains(@class, 'btn-primary')]",
-                "//button[contains(@class, 'continue')]",
-                "//input[@type='submit']",
-            ]
-            
-            continue_button = None
-            
-            for attempt in range(max_retries):
-                timeout = self.net["element_timeout"] + (attempt * 3)
-                wait = WebDriverWait(self.driver, timeout)
-                
-                if attempt > 0:
-                    self.log(f"Retry finding Continue button ({attempt + 1}/{max_retries})...", Colors.WARNING, "🔄 ")
-                    time.sleep(self.net["retry_delay"])
-                
-                for selector in selectors:
-                    try:
-                        continue_button = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
-                        if continue_button.is_displayed():
-                            break
-                        else:
-                            continue_button = None
-                    except TimeoutException:
-                        continue
-                    except Exception:
-                        continue
-                
-                if continue_button:
-                    break
-            
-            if not continue_button:
-                self.log("Could not find Continue button", Colors.ERROR, "❌ ")
-                return False
-            
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", continue_button)
-            self.human_like_delay(0.1, 0.2)
-            
-            # Try multiple click methods
-            click_success = False
-            try:
-                continue_button.click()
-                click_success = True
-            except Exception:
-                pass
-
-            if not click_success:
-                try:
-                    self.driver.execute_script("arguments[0].click();", continue_button)
-                    click_success = True
-                except Exception:
-                    pass
-
-            if not click_success and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(continue_button).pause(0.2).click().perform()
-                    click_success = True
-                except Exception:
-                    pass
-            
-            if click_success:
-                self.log("Clicked Continue", Colors.SUCCESS, "✅ ")
-            else:
-                self.log("Failed to click Continue button", Colors.ERROR, "❌ ")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"Error clicking Continue: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def enter_password(self):
-        """Enter password with retry based on network mode - handles both log-in and create-account flows"""
-        try:
-            max_retries = self.net["max_retries"]
-            
-            # Check if we're on create-account page (new password) or log-in page (existing password)
-            current_url = self.driver.current_url or ""
-            is_create_account = "create-account" in current_url.lower()
-            if is_create_account:
-                self.log("Detected create-account flow (new password)", Colors.INFO, "ℹ️ ")
-            
-            # Selectors for both flows: log-in (existing) and create-account (new password)
-            selectors = [
-                # CREATE ACCOUNT flow (new password) - check FIRST
-                (By.XPATH, "//input[@name='new-password']"),
-                (By.XPATH, "//input[@autocomplete='new-password']"),
-                (By.XPATH, "//input[contains(@id, 'new-password')]"),
-                # LOG IN flow (existing password)
-                (By.ID, "password"),
-                (By.XPATH, "//input[@id='password']"),
-                (By.XPATH, "//input[@name='password']"),
-                (By.XPATH, "//input[@aria-label='Password']"),
-                (By.XPATH, "//input[@aria-label='Mật khẩu']"),
-                # Generic fallback
-                (By.XPATH, "//input[@type='password']"),
-                (By.XPATH, "//input[contains(@class, 'password')]"),
-            ]
-            
-            password_input = None
-            
-            for attempt in range(max_retries):
-                timeout = self.net["element_timeout"] + (attempt * 3)
-                wait = WebDriverWait(self.driver, timeout)
-                
-                if attempt > 0:
-                    self.log(f"Retry finding password input ({attempt + 1}/{max_retries})...", Colors.WARNING, "🔄 ")
-                    time.sleep(self.net["retry_delay"])
-                    
-                    # Check page state
-                    try:
-                        page_state = self.driver.execute_script("return document.readyState")
-                        if page_state != "complete":
-                            self.log("Waiting for page to load...", Colors.INFO, "⏳ ")
-                            WebDriverWait(self.driver, self.net["page_load_timeout"]).until(
-                                lambda d: d.execute_script("return document.readyState") == "complete"
-                            )
-                    except Exception:
-                        pass
-                
-                for by, selector in selectors:
-                    try:
-                        password_input = wait.until(EC.presence_of_element_located((by, selector)))
-                        if password_input.is_displayed():
-                            break
-                        else:
-                            password_input = None
-                    except TimeoutException:
-                        continue
-                    except Exception:
-                        continue
-                
-                if password_input:
-                    break
-            
-            if not password_input:
-                self.log(f"Could not find password input after {max_retries} attempts", Colors.ERROR, "❌ ")
-                try:
-                    current_url = self.driver.current_url
-                    self.log(f"Current URL: {current_url}", Colors.INFO, "ℹ️ ")
-                    # Log page title for debugging
-                    page_title = self.driver.title
-                    self.log(f"Page title: {page_title}", Colors.INFO, "ℹ️ ")
-                except Exception:
-                    pass
-                return False
-            
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", password_input)
-        
-            
-            # Try multiple click methods
-            clicked = False
-            try:
-                password_input.click()
-                clicked = True
-            except Exception:
-                pass
-
-            if not clicked:
-                try:
-                    self.driver.execute_script("arguments[0].click();", password_input)
-                    clicked = True
-                except Exception:
-                    pass
-
-            if not clicked and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(password_input).click().perform()
-                    clicked = True
-                except Exception:
-                    pass
-            
-            self.human_like_delay(0.1, 0.2)
-            
-            # Clear and type
-            try:
-                password_input.clear()
-            except Exception:
-                self.driver.execute_script("arguments[0].value = '';", password_input)
-            
-            self.human_like_typing(password_input, self.password)
-            self.log("Entered password", Colors.SUCCESS, "✅ ")
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"Error entering password: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def extract_otp_from_email(self, email_text):
-        """Extract 6-digit OTP"""
-        patterns = [
-            r'\b(\d{6})\b',
-            r'code[:\s]+(\d{6})',
-            r'OTP[:\s]+(\d{6})',
-            r'verification[:\s]+(\d{6})',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, email_text, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-    
-    def resend_otp_email(self):
-        """Click Resend email button"""
-        try:
-            wait = WebDriverWait(self.driver, 1)
-            
-            selectors = [
-                "//button[contains(text(), 'Gửi lại email')]",
-                "//button[contains(text(), 'Resend email')]",
-                "//button[@name='intent' and @value='resend-code']",
-            ]
-            
-            resend_button = None
-            for selector in selectors:
-                try:
-                    resend_button = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
-                    break
-                except:
-                    continue
-            
-            if resend_button:
-                self.move_mouse_randomly()
-                ActionChains(self.driver).move_to_element(resend_button).pause(0.5).click().perform()
-                self.log("Clicked Resend email", Colors.SUCCESS, "✅ ")
-                return True
-            else:
-                return False
-            
-        except Exception as e:
-            return False
-    
-    def wait_and_get_otp(self, max_attempts=15, wait_seconds=5, max_resend=2):
-        """Wait and get OTP from email"""
-        self.log("Waiting for OTP...", Colors.INFO, "📧 ")
-        
-        resend_count = 0
-        checked_email_ids = set()
-        tinyhost_empty_streak = 0
-        
-        for attempt in range(max_attempts):
-            # Check for timeout error during OTP wait
-            if self.has_operation_timeout_error():
-                self.log("Timeout error detected while waiting for OTP!", Colors.WARNING, "⚠️ ")
-                self.operation_timeout_detected = True
-                return None
-            
-            # Different logic for OAuth2 vs TinyHost mode
-            if self.email_mode == "OAuth2":
-                # OAuth2 mode: use DongVanOAuth2API
-                messages_data = self.mail_api.fetch_messages()
-                if messages_data:
-                    otp = self.mail_api.extract_code_from_messages(messages_data)
-                    if otp:
-                        self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
-                        return otp
-            else:
-                # TinyHost mode: use TempMailAPI
-                username = self.email_info['username']
-                domain = self.email_info['domain']
-                
-                emails_data = self.mail_api.get_emails(domain, username, page=1, limit=5)
-
-                if not emails_data:
-                    tinyhost_empty_streak += 1
-                    # Log occasionally to avoid spamming
-                    if tinyhost_empty_streak in (1, 5, 10, 15):
-                        self.log(
-                            f"TinyHost inbox fetch returned empty/None (streak={tinyhost_empty_streak})",
-                            Colors.WARNING,
-                            "⚠️ "
-                        )
-                else:
-                    tinyhost_empty_streak = 0
-                
-                if emails_data and emails_data.get('emails'):
-                    for email_item in emails_data['emails']:
-                        sender = email_item.get('sender', '').lower()
-                        subject = email_item.get('subject', '').lower()
                         
-                        if 'openai' in sender or 'verification' in subject or 'code' in subject:
-                            # Fast path: OTP often appears in subject (e.g., "Your ChatGPT code is 123456")
-                            otp_from_subject = self.extract_otp_from_email(subject)
-                            if otp_from_subject:
-                                self.log(f"Got OTP: {otp_from_subject}", Colors.SUCCESS, "✅ ")
-                                return otp_from_subject
-
-                            email_id = email_item.get('id')
-                            if not email_id:
-                                continue
-                            if email_id in checked_email_ids:
-                                continue
-                            checked_email_ids.add(email_id)
-
-                            # Slow path: fetch detail only for the newest matching message.
-                            email_detail = self.mail_api.get_email_detail(domain, username, email_id)
-                            if email_detail:
-                                body = email_detail.get('body', '')
-                                html_body = email_detail.get('html_body', '')
-                                full_content = f"{body} {html_body}"
-                                otp = self.extract_otp_from_email(full_content)
-                                if otp:
-                                    self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
-                                    return otp
-
-                            # Don't spam detail calls in one polling cycle
-                            break
+                        checked_ids.add(mail_id)
+            except Exception as e:
+                self.log(f"Email poll error: {e}", Colors.WARNING)
             
-            # Resend if needed (only for TinyHost mode)
-            if self.email_mode != "OAuth2" and attempt == max_attempts // 3 and resend_count < max_resend:
-                if self.resend_otp_email():
-                    resend_count += 1
-                    self.log(f"Resent email ({resend_count}/{max_resend})", Colors.INFO, "📧 ")
-            
-            # Check stop event and timeout during wait
-            for _ in range(wait_seconds * 2):
-                if self.stop_event and self.stop_event.is_set():
-                    self.log("Process stopped by user", Colors.WARNING, "🛑 ")
-                    return None
-                # Check for timeout error periodically
-                if self.has_operation_timeout_error():
-                    self.log("Timeout error detected during OTP wait!", Colors.WARNING, "⚠️ ")
-                    self.operation_timeout_detected = True
-                    return None
-                time.sleep(0.5)
+            remaining = int(timeout - (time.time() - start_time))
+            if remaining > 0 and remaining % 10 == 0:
+                self.log(f"Waiting for OTP... ({remaining}s remaining)", Colors.INFO, "⏳ ")
+            time.sleep(1)
         
-        self.log("Timeout - Did not receive OTP", Colors.ERROR, "❌ ")
+        self.log(f"OTP timeout after {timeout}s", Colors.ERROR, "❌ ")
         return None
-    
-    def enter_otp_code(self, otp):
-        """Enter OTP - handles both new (6 separate digit inputs) and old (single field) formats"""
-        try:
-            wait = WebDriverWait(self.driver, 2)
-            time.sleep(0.5)
-            
-            # NEW FORMAT: Try 6 separate digit inputs first (aria-label="Digit 1" through "Digit 6")
-            try:
-                digit_inputs = []
-                for i in range(1, 7):
-                    inp = self.driver.find_element(By.XPATH, f"//input[@aria-label='Digit {i}']")
-                    if inp and inp.is_displayed():
-                        digit_inputs.append(inp)
-                
-                if len(digit_inputs) == 6 and len(otp) == 6:
-                    self.log("Detected new 6-digit separate input format", Colors.INFO, "ℹ️ ")
-                    for i, digit in enumerate(otp):
-                        try:
-                            digit_inputs[i].click()
-                            time.sleep(0.05)
-                            digit_inputs[i].send_keys(digit)
-                            time.sleep(0.05)
-                        except Exception:
-                            # Fallback: direct send_keys
-                            digit_inputs[i].send_keys(digit)
-                    self.log("Entered OTP (6-digit format)", Colors.SUCCESS, "✅ ")
-                    self.human_like_delay(0.2, 0.4)
-                    return True
-            except Exception:
-                pass
-            
-            # OLD FORMAT: Single input field
-            selectors = [
-                (By.ID, "code"),
-                (By.XPATH, "//input[@id='code']"),
-                (By.XPATH, "//input[@name='code']"),
-                (By.XPATH, "//input[@inputmode='numeric']"),
-                (By.XPATH, "//input[@placeholder='Code']"),
-            ]
-            
-            code_input = None
-            for by, selector in selectors:
-                try:
-                    code_input = wait.until(EC.presence_of_element_located((by, selector)))
-                    if code_input.is_displayed():
-                        break
-                    else:
-                        code_input = None
-                except:
-                    continue
-            
-            if not code_input:
-                self.log("Could not find code input (old or new format)", Colors.ERROR, "❌ ")
-                return False
-            
-            self.log("Detected old single-field OTP format", Colors.INFO, "ℹ️ ")
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", code_input)
-            self.human_like_delay(0.2, 0.4)
 
-            clicked = False
-            try:
-                code_input.click()
-                clicked = True
-            except Exception:
-                pass
-
-            if not clicked:
-                try:
-                    self.driver.execute_script("arguments[0].click();", code_input)
-                    clicked = True
-                except Exception:
-                    pass
-
-            if not clicked and getattr(self, 'num_threads', 1) <= 1:
-                try:
-                    self.move_mouse_randomly()
-                    ActionChains(self.driver).move_to_element(code_input).click().perform()
-                    clicked = True
-                except Exception:
-                    pass
-            
-            code_input.clear()
-            self.human_like_typing(code_input, otp)
-            self.log("Entered OTP (single-field format)", Colors.SUCCESS, "✅ ")
-            
-            self.human_like_delay(0.2, 0.4)
-            return True
-            
-        except Exception as e:
-            self.log(f"Error entering OTP: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def enter_name_and_dob(self):
-        """Enter name and DOB — works for both single-thread and multi-thread.
+    def _wait_for_otp_oauth2(self, timeout=120):
+        """Wait for OTP from OAuth2 email"""
+        start_time = time.time()
+        last_code = None
         
-        Primary method: find each birthday segment explicitly, focus via JS,
-        type digits via element.send_keys (no window focus needed).
-        Fallback: ActionChains chain (needs window focus but proven working).
-        """
-        try:
-            wait = WebDriverWait(self.driver, self.net.get("element_timeout", 5))
-            
-            name_selectors = [
-                (By.ID, "name"),
-                (By.XPATH, "//input[@id='name']"),
-                (By.XPATH, "//input[@name='name']"),
-                (By.XPATH, "//input[@autocomplete='name']"),
-            ]
-            
-            name_input = None
-            for by, selector in name_selectors:
-                try:
-                    name_input = wait.until(EC.presence_of_element_located((by, selector)))
-                    break
-                except:
-                    continue
-            
-            if not name_input:
-                self.log("Could not find name input", Colors.ERROR, "❌ ")
-                return False
-            
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", name_input)
-
-            # Click name input — JS focus+click works without window focus
-            self.driver.execute_script("arguments[0].focus(); arguments[0].click();", name_input)
-            
-            name_input.clear()
-            self.human_like_typing(name_input, "GPT")
-            self.log("Entered name: GPT", Colors.SUCCESS, "✅ ")
-            
-            self.human_like_delay(0.2, 0.3)
-            
-            # Random DOB
-            year = random.randint(1997, 2006)
-            month = random.randint(1, 12)
-            day = random.randint(1, 28)
-            dob = f"{month:02d}/{day:02d}/{year}"
-            dob_iso = f"{year}-{month:02d}-{day:02d}"
-
-            # --- METHOD 1: Segment-by-segment send_keys (no window focus needed) ---
-            filled = False
-            for attempt in range(2):
-                if filled:
-                    break
-                try:
-                    # Press Tab to move to birthday field first
-                    if attempt == 0:
-                        name_input.send_keys(Keys.TAB)
-                        self.human_like_delay(0.1, 0.2)
-
-                    birthday_group = self.driver.find_element(
-                        By.CSS_SELECTOR, "div[id*='birthday'][role='group']"
-                    )
-                    month_seg = birthday_group.find_element(
-                        By.CSS_SELECTOR, "div[data-type='month'][contenteditable='true']"
-                    )
-                    day_seg = birthday_group.find_element(
-                        By.CSS_SELECTOR, "div[data-type='day'][contenteditable='true']"
-                    )
-                    year_seg = birthday_group.find_element(
-                        By.CSS_SELECTOR, "div[data-type='year'][contenteditable='true']"
-                    )
-
-                    # Type month
-                    self.driver.execute_script("arguments[0].focus();", month_seg)
-                    time.sleep(0.05)
-                    for ch in f"{month:02d}":
-                        month_seg.send_keys(ch)
-                        time.sleep(random.uniform(0.08, 0.15))
-                    time.sleep(0.15)
-
-                    # Type day
-                    self.driver.execute_script("arguments[0].focus();", day_seg)
-                    time.sleep(0.05)
-                    for ch in f"{day:02d}":
-                        day_seg.send_keys(ch)
-                        time.sleep(random.uniform(0.08, 0.15))
-                    time.sleep(0.15)
-
-                    # Type year
-                    self.driver.execute_script("arguments[0].focus();", year_seg)
-                    time.sleep(0.05)
-                    for ch in str(year):
-                        year_seg.send_keys(ch)
-                        time.sleep(random.uniform(0.08, 0.15))
-
-                    time.sleep(0.3)
-
-                    # Verify hidden birthday value
-                    try:
-                        hidden = self.driver.find_element(
-                            By.CSS_SELECTOR, "input[type='hidden'][name='birthday']"
-                        )
-                        hidden_val = hidden.get_attribute("value") or ""
-                    except Exception:
-                        hidden_val = ""
-
-                    if hidden_val == dob_iso:
-                        filled = True
-                        self.log(f"DOB set correctly (segment method, attempt {attempt + 1})", Colors.SUCCESS, "✅ ")
-                    else:
-                        self.log(
-                            f"Segment method attempt {attempt + 1}: hidden='{hidden_val}', expected='{dob_iso}'",
-                            Colors.WARNING, "⚠️ "
-                        )
-                except Exception as e:
-                    self.log(f"Segment method attempt {attempt + 1} error: {e}", Colors.WARNING, "⚠️ ")
-
-            # --- METHOD 2: ActionChains fallback (same as proven working commit) ---
-            if not filled:
-                try:
-                    self.log("Trying ActionChains method...", Colors.INFO, "🔄 ")
-                    # Re-focus name input and Tab to birthday
-                    self.driver.execute_script("arguments[0].focus();", name_input)
-                    time.sleep(0.1)
-                    name_input.send_keys(Keys.TAB)
-                    self.human_like_delay(0.2, 0.4)
-
-                    actions = ActionChains(self.driver)
-                    for char in dob:
-                        actions.send_keys(char)
-                        actions.pause(random.uniform(0.1, 0.3))
-                    actions.perform()
-
-                    time.sleep(0.3)
-
-                    # Verify
-                    try:
-                        hidden = self.driver.find_element(
-                            By.CSS_SELECTOR, "input[type='hidden'][name='birthday']"
-                        )
-                        hidden_val = hidden.get_attribute("value") or ""
-                    except Exception:
-                        hidden_val = ""
-
-                    if hidden_val == dob_iso:
-                        filled = True
-                        self.log("DOB set correctly (ActionChains method)", Colors.SUCCESS, "✅ ")
-                    else:
-                        self.log(
-                            f"ActionChains method: hidden='{hidden_val}', expected='{dob_iso}'",
-                            Colors.WARNING, "⚠️ "
-                        )
-                except Exception as e:
-                    self.log(f"ActionChains method error: {e}", Colors.WARNING, "⚠️ ")
-
-            if not filled:
-                self.log(f"Could not set Birthday correctly: {dob}", Colors.ERROR, "❌ ")
-                return False
-            
-            self.log(f"Entered DOB: {dob}", Colors.SUCCESS, "✅ ")
-            
-            # Check and click "I agree to all of the following" checkbox if present
+        while time.time() - start_time < timeout:
+            if self.stop_event and self.stop_event.is_set():
+                return None
             try:
-                checkbox_selectors = [
-                    (By.XPATH, "//input[@name='allCheckboxes']"),
-                    (By.XPATH, "//input[contains(@id, 'allCheckboxes')]"),
-                    (By.XPATH, "//label[contains(., 'I agree to all')]//input[@type='checkbox']"),
-                ]
-                
-                checkbox = None
-                for by, selector in checkbox_selectors:
-                    try:
-                        checkbox = WebDriverWait(self.driver, 1).until(
-                            EC.presence_of_element_located((by, selector))
-                        )
-                        break
-                    except:
-                        continue
-                
-                if checkbox and not checkbox.is_selected():
-                    self.driver.execute_script("arguments[0].scrollIntoView(true);", checkbox)
-                    self.driver.execute_script("arguments[0].click();", checkbox)
-                    self.log("Clicked 'I agree to all of the following' checkbox", Colors.SUCCESS, "✅ ")
-            except Exception as checkbox_error:
-                self.log(f"No 'I agree to all' checkbox found (optional): {checkbox_error}", Colors.INFO, "ℹ️ ")
+                messages = self.mail_api.fetch_messages()
+                if messages:
+                    code = self.mail_api.extract_code_from_messages(messages)
+                    if code and code != last_code:
+                        self.log(f"OTP from OAuth2: {code}", Colors.SUCCESS, "✅ ")
+                        return code
+                    last_code = code
+            except Exception as e:
+                self.log(f"OAuth2 poll error: {e}", Colors.WARNING)
             
-            return True
-            
-        except Exception as e:
-            self.log(f"Error entering name/DOB: {e}", Colors.ERROR, "❌ ")
-            return False
-    
+            remaining = int(timeout - (time.time() - start_time))
+            if remaining > 0 and remaining % 10 == 0:
+                self.log(f"Waiting for OTP... ({remaining}s remaining)", Colors.INFO, "⏳ ")
+            time.sleep(2)
+        
+        self.log(f"OTP timeout after {timeout}s", Colors.ERROR, "❌ ")
+        return None
 
-    time.sleep(2)
-    def get_cookies_json(self):
-        """Get cookies in JSON format"""
-        try:
-            self.log("Getting cookies...", Colors.INFO, "🍪 ")
-            time.sleep(6)
-            
-            all_cookies = self.driver.get_cookies()
-            cookies_for_export = []
-            
-            for cookie in all_cookies:
-                same_site = cookie.get("sameSite", "no_restriction")
-                if same_site:
-                    same_site = same_site.lower()
-                    if same_site == "none":
-                        same_site = "no_restriction"
-                    elif same_site not in ["lax", "strict", "no_restriction", "unspecified"]:
-                        same_site = "no_restriction"
-                else:
-                    same_site = "no_restriction"
-                
-                domain = cookie.get("domain", "")
-                host_only = not domain.startswith(".")
-                
-                cookie_item = {
-                    "domain": domain,
-                    "expirationDate": cookie.get("expiry"),
-                    "hostOnly": host_only,
-                    "httpOnly": cookie.get("httpOnly", False),
-                    "name": cookie.get("name", ""),
-                    "path": cookie.get("path", "/"),
-                    "sameSite": same_site,
-                    "secure": cookie.get("secure", False),
-                    "session": False if cookie.get("expiry") else True,
-                    "storeId": None,
-                    "value": cookie.get("value", "")
-                }
-                cookies_for_export.append(cookie_item)
-            
-            has_session = any(c["name"] == "__Secure-next-auth.session-token" for c in cookies_for_export)
-            if has_session:
-                self.log("Found session token", Colors.SUCCESS, "✅ ")
-            else:
-                self.log("No session token found", Colors.WARNING, "⚠️ ")
-            
-            return cookies_for_export
-            
-        except Exception as e:
-            self.log(f"Error getting cookies: {e}", Colors.ERROR, "❌ ")
-            return []
-    
-    def ensure_personal_tab_active(self):
-        """Ensure Personal tab is active, not Business tab (for Plus checkout)"""
-        try:
-            # Check if Personal tab is active (data-state="on" means active)
-            personal_active_xpath = "//button[@role='radio' and contains(., 'Personal') and @data-state='on']"
-            personal_inactive_xpath = "//button[@role='radio' and contains(., 'Personal') and @data-state='off']"
-            
-            # Check if Personal is already active
-            active_tabs = self.driver.find_elements(By.XPATH, personal_active_xpath)
-            if active_tabs:
-                return True  # Already on Personal tab
-            
-            # Personal is not active, try to click it
-            inactive_tabs = self.driver.find_elements(By.XPATH, personal_inactive_xpath)
-            if inactive_tabs:
-                self.log("Switching to Personal tab...", Colors.INFO, "🔄 ")
-                inactive_tabs[0].click()
-                time.sleep(1)
-                return True
-            
-            return False
-        except Exception:
-            return False
-    
-    def detect_and_close_popups(self):
-        """Detect and close any popups/overlays that may block automation.
-        Each popup type is handled independently so new handlers can be added easily.
-        """
-        if not self.driver:
-            return
+    def _setup_2fa_api(self, access_token):
+        """API-based 2FA setup using page.evaluate(fetch())"""
+        page = self.page
+        self.log("[2FA] Starting 2FA setup via API...", Colors.INFO, "🔐 ")
         
-        # --- Handler 1: Study Mode popup ("Try it now" / "Learn anything, step by step") ---
-        try:
-            try_it_now_elements = self.driver.find_elements(
-                By.XPATH,
-                "//div[contains(@class, 'flex') and contains(@class, 'items-center') and contains(@class, 'justify-center') and normalize-space(text())='Try it now']"
-                " | //button[.//div[normalize-space(text())='Try it now']]"
-            )
-            if try_it_now_elements and any(el.is_displayed() for el in try_it_now_elements):
-                self.log("Detected Study Mode popup ('Try it now')", Colors.WARNING, "🔔 ")
-                # Find and click the close button (data-testid="close-button")
-                close_btn = None
-                close_selectors = [
-                    (By.CSS_SELECTOR, "button[data-testid='close-button']"),
-                    (By.XPATH, "//button[@aria-label='Close']"),
-                    (By.CSS_SELECTOR, "button[aria-label='Close']"),
-                ]
-                for by, sel in close_selectors:
-                    try:
-                        candidates = self.driver.find_elements(by, sel)
-                        for btn in candidates:
-                            if btn.is_displayed():
-                                close_btn = btn
-                                break
-                        if close_btn:
-                            break
-                    except Exception:
-                        continue
-                
-                if close_btn:
-                    try:
-                        self.driver.execute_script("arguments[0].click();", close_btn)
-                        self.log("Closed Study Mode popup", Colors.SUCCESS, "✅ ")
-                    except Exception:
-                        try:
-                            close_btn.click()
-                            self.log("Closed Study Mode popup (fallback click)", Colors.SUCCESS, "✅ ")
-                        except Exception as e:
-                            self.log(f"Failed to click close button: {e}", Colors.WARNING, "⚠️ ")
-                    time.sleep(0.5)
-                else:
-                    self.log("Study Mode popup detected but close button not found", Colors.WARNING, "⚠️ ")
-        except Exception:
-            pass  # Silently skip if detection fails
+        # Step 1: Check current MFA status
+        mfa_info = page.evaluate("""
+            async (token) => {
+                const r = await fetch('/backend-api/accounts/mfa_info', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                return { status: r.status, body: await r.text() };
+            }
+        """, access_token)
         
-        # --- (Add more popup handlers below as needed) ---
-    
-    def detect_get_plus_button(self):
-        """Detect 'Get Plus' button in header (button-glimmer-cta).
-        If present, it means the account has NO free offer.
-        Returns True if 'Get Plus' button found (no offer), False otherwise.
-        """
-        if not self.driver:
-            return False
         try:
-            get_plus_selectors = [
-                "//button[contains(@class, 'button-glimmer-cta') and contains(., 'Get Plus')]",
-                "//button[contains(@class, 'button-glimmer') and contains(., 'Get Plus')]",
-                "//div[contains(@class, 'inline-flex')]//button[contains(., 'Get Plus')]",
-            ]
-            for xpath in get_plus_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, xpath)
-                    if any(el.is_displayed() for el in elements):
-                        self.log("Detected 'Get Plus' button in header - NO free offer!", Colors.WARNING, "🚫 ")
-                        return True
-                except Exception:
-                    continue
-            return False
+            info_data = json.loads(mfa_info.get("body", "{}"))
+            if info_data.get("totp", {}).get("is_enabled"):
+                self.log("[2FA] Already enabled!", Colors.WARNING, "⚠️ ")
+                return None
         except Exception:
-            return False
-    
-    # ==================== API-BASED CHECKOUT ====================
-    
+            pass
+        
+        # Step 2: Enroll TOTP
+        self.log("[2FA] Enrolling TOTP...", Colors.INFO)
+        enroll_resp = page.evaluate("""
+            async (token) => {
+                const r = await fetch('/backend-api/accounts/mfa/enroll', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    },
+                    body: '{"factor_type":"totp"}'
+                });
+                return { status: r.status, body: await r.text() };
+            }
+        """, access_token)
+        
+        if enroll_resp.get("status") != 200:
+            self.log(f"[2FA] Enroll failed ({enroll_resp.get('status')})", Colors.ERROR, "❌ ")
+            return None
+        
+        try:
+            enroll_data = json.loads(enroll_resp.get("body", "{}"))
+        except Exception:
+            self.log("[2FA] Failed to parse enroll response", Colors.ERROR, "❌ ")
+            return None
+        
+        # Extract secret
+        secret = enroll_data.get("secret") or enroll_data.get("totp_secret") or ""
+        totp_url = enroll_data.get("barcode_uri") or enroll_data.get("totp_url") or ""
+        recovery_codes = enroll_data.get("recovery_codes") or []
+        
+        if not secret and totp_url and "secret=" in totp_url:
+            secret = totp_url.split("secret=")[1].split("&")[0]
+        
+        if not secret:
+            self.log(f"[2FA] No secret found. Keys: {list(enroll_data.keys())}", Colors.ERROR, "❌ ")
+            return None
+        
+        self.log(f"[2FA] Secret: {secret}", Colors.INFO)
+        
+        # Step 3: Generate TOTP code
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+        self.log(f"[2FA] TOTP code: {code}", Colors.INFO)
+        
+        # Step 4: Activate enrollment
+        session_id = enroll_data.get("session_id", "")
+        factor_type = enroll_data.get("factor", {}).get("factor_type", "totp")
+        activate_payload = json.dumps({
+            "code": code,
+            "session_id": session_id,
+            "factor_type": factor_type,
+        })
+        
+        activate_resp = page.evaluate("""
+            async ([token, payload]) => {
+                const r = await fetch('/backend-api/accounts/mfa/user/activate_enrollment', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    },
+                    body: payload
+                });
+                return { status: r.status, body: await r.text() };
+            }
+        """, [access_token, activate_payload])
+        
+        if activate_resp.get("status") != 200:
+            self.log(f"[2FA] Activation failed ({activate_resp.get('status')})", Colors.ERROR, "❌ ")
+            return None
+        
+        self.log(f"[2FA] ✅ 2FA enabled! Secret: {secret}", Colors.SUCCESS, "🔐 ")
+        return {
+            "secret": secret,
+            "totp_url": totp_url,
+            "recovery_codes": recovery_codes,
+        }
+
     def get_random_fingerprint(self):
         """Tạo ngẫu nhiên tổ hợp TLS Fingerprint và User-Agent khớp nhau"""
-        os_windows = ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64"]
-        os_mac = ["Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3", "Macintosh; Intel Mac OS X 14_0"]
-        
-        fingerprints = []
-        chrome_versions = [110, 112, 114, 116, 118, 119, 120]
-        for ver in chrome_versions:
-            for os_val in os_windows + os_mac:
-                fingerprints.append({"id": f"chrome_{ver}", "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"})
-        
-        firefox_versions = [108, 110, 117, 120]
-        for ver in firefox_versions:
-            for os_val in os_windows + os_mac:
-                fingerprints.append({"id": f"firefox_{ver}", "ua": f"Mozilla/5.0 ({os_val}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"})
-        
-        safari_ids = [("safari_15_6_1", "15.6.1"), ("safari_16_0", "16.0")]
-        for s_id, ver in safari_ids:
-            for os_val in os_mac:
-                fingerprints.append({"id": s_id, "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Safari/605.1.15"})
-        
+        fingerprints = [
+            {"id": "chrome_120", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            {"id": "chrome_119", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"},
+            {"id": "chrome_116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"},
+            {"id": "chrome_117", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"},
+        ]
         return random.choice(fingerprints)
-    
-    def _cookies_to_header_string(self, cookies_list):
-        """Convert cookies list [{name, value}...] to 'name=value; name2=value2'"""
-        parts = []
-        for c in cookies_list:
-            name = c.get("name", "")
-            value = c.get("value", "")
-            if name:
-                parts.append(f"{name}={value}")
-        return "; ".join(parts)
-    
-    def _fetch_access_token_from_cookies(self, cookie_header):
-        """Gọi GET /api/auth/session với cookie → trả về accessToken"""
-        fp = self.get_random_fingerprint()
-        session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
-        lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
-        
-        headers = {
-            "User-Agent": fp["ua"],
-            "Accept": "*/*",
-            "Accept-Language": lang,
-            "Referer": "https://chatgpt.com/",
-            "Origin": "https://chatgpt.com",
-            "Cookie": cookie_header,
-        }
-        
-        time.sleep(random.uniform(0.3, 0.8))
-        resp = session.get("https://chatgpt.com/api/auth/session", headers=headers)
-        
-        if resp.status_code != 200:
-            self.log(f"Session API error: {resp.status_code}", Colors.ERROR, "❌ ")
-            return None
-        
-        try:
-            data = resp.json()
-        except Exception:
-            self.log("Session API response not JSON", Colors.ERROR, "❌ ")
-            return None
-        
-        token = data.get("accessToken")
-        if not token:
-            self.log("No accessToken in session response", Colors.ERROR, "❌ ")
-            return None
-        
-        email = data.get("user", {}).get("email", "?")
-        self.log(f"Got accessToken for {email}", Colors.SUCCESS, "🔑 ")
-        return token
-    
+
+
     def _call_checkout_api(self, access_token, payload):
         """Gọi POST /backend-api/payments/checkout → trả về checkout URL"""
         fp = self.get_random_fingerprint()
@@ -2092,13 +1055,10 @@ class ChatGPTAutoRegisterWorker:
         
         return final_link
     
-    def get_checkout_link_via_api(self, cookies_list):
-        """Lấy Plus checkout link qua API (thay vì browser)"""
+    def get_checkout_link_via_api(self, access_token):
+        """Lấy Plus checkout link qua API"""
         try:
-            self.log("Lấy Plus checkout link qua API...", Colors.INFO, "🔗 ")
-            
-            cookie_header = self._cookies_to_header_string(cookies_list)
-            access_token = self._fetch_access_token_from_cookies(cookie_header)
+            self.log("Lấy Plus checkout link...", Colors.INFO, "🔗 ")
             if not access_token:
                 return None
             
@@ -2121,13 +1081,10 @@ class ChatGPTAutoRegisterWorker:
             self.log(f"API checkout error: {e}", Colors.ERROR, "❌ ")
             return None
     
-    def get_business_checkout_link_via_api(self, cookies_list):
-        """Lấy Business/Team checkout link qua API (thay vì browser)"""
+    def get_business_checkout_link_via_api(self, access_token):
+        """Lấy Business/Team checkout link qua API"""
         try:
-            self.log("Lấy Business checkout link qua API...", Colors.INFO, "💼 ")
-            
-            cookie_header = self._cookies_to_header_string(cookies_list)
-            access_token = self._fetch_access_token_from_cookies(cookie_header)
+            self.log("Lấy Business checkout link...", Colors.INFO, "💼 ")
             if not access_token:
                 return None
             
@@ -2157,67 +1114,48 @@ class ChatGPTAutoRegisterWorker:
         except Exception as e:
             self.log(f"API business checkout error: {e}", Colors.ERROR, "❌ ")
             return None
-    
-    def save_account_info(self, cookies, checkout_url=None, business_checkout_url=None):
-        """Save account info to Excel (thread-safe) - only if valid session cookie"""
+
+    def save_account_info(self, access_token, checkout_url=None, business_checkout_url=None, mfa_secret=None):
+        """Save account info to Excel (thread-safe)"""
         try:
             if not self.email_info:
                 return False
             
-            if not cookies:
-                self.log("No cookies to save", Colors.WARNING, "⚠️ ")
+            if not access_token:
+                self.log("No access token to save", Colors.WARNING, "⚠️ ")
                 return False
             
-            # Check if cookies start with valid .chatgpt.com domain
-            cookies_json = json.dumps(cookies, separators=(',', ':'), ensure_ascii=False)
-            
-            if cookies_json.startswith('[{"domain":".chatgpt.com"'):
-                self.log("Valid session cookie (.chatgpt.com)", Colors.SUCCESS, "✅ ")
-            elif cookies_json.startswith('[{"domain":".auth.openai'):
-                self.log("Invalid session cookie (.auth.openai) - NOT saving", Colors.ERROR, "❌ ")
-                return False
-            else:
-                # Check if any cookie has .chatgpt.com domain
-                has_chatgpt_cookie = any(c.get('domain') == '.chatgpt.com' for c in cookies)
-                if not has_chatgpt_cookie:
-                    self.log("No .chatgpt.com cookie found - NOT saving", Colors.ERROR, "❌ ")
-                    return False
+
             
             filename = "chatgpt.xlsx"
             account = f"{self.email_info['email']}:{self.password}"
             
             with file_lock:
                 if os.path.exists(filename):
-                    # Load existing workbook
                     wb = load_workbook(filename)
                     ws = wb.active
                 else:
-                    # Create new workbook with headers
                     wb = Workbook()
                     ws = wb.active
                     ws.title = "Accounts"
                     ws['A1'] = "Account"
-                    ws['B1'] = "Cookie"
+                    ws['B1'] = "Access Token"
                     ws['C1'] = "Plus Checkout URL"
                     ws['D1'] = "Business Checkout URL"
                     ws['E1'] = "2FA Secret"
                 
-                # Ensure headers exist for older files
                 if ws['D1'].value is None:
                     ws['D1'] = "Business Checkout URL"
                 if ws['E1'].value is None:
                     ws['E1'] = "2FA Secret"
                 
-                # Find next row
                 next_row = ws.max_row + 1
-                
-                # Write data
                 ws[f'A{next_row}'] = account
-                ws[f'B{next_row}'] = cookies_json
+                ws[f'B{next_row}'] = access_token
                 ws[f'C{next_row}'] = checkout_url if checkout_url else ""
                 ws[f'D{next_row}'] = business_checkout_url if business_checkout_url else ""
+                ws[f'E{next_row}'] = mfa_secret if mfa_secret else ""
                 
-                # Save workbook
                 wb.save(filename)
                 wb.close()
             
@@ -2226,229 +1164,300 @@ class ChatGPTAutoRegisterWorker:
                 self.log("Plus Checkout URL saved!", Colors.SUCCESS, "✅ ")
             if business_checkout_url:
                 self.log("Business Checkout URL saved!", Colors.SUCCESS, "💼 ")
+            if mfa_secret:
+                self.log("2FA Secret saved!", Colors.SUCCESS, "🔐 ")
             return True
             
         except Exception as e:
             self.log(f"Error saving info: {e}", Colors.ERROR, "❌ ")
             return False
-    
+
     def run(self):
-        """Run the entire registration flow with timeout retry support"""
-        # Retry loop for operation timeout errors
-        while self.current_retry <= self.max_timeout_retries:
+        """Run the entire registration flow (API-First)"""
+        while self.current_retry <= self.max_retries:
             try:
                 if self.current_retry > 0:
-                    self.log(f"Retry attempt {self.current_retry}/{self.max_timeout_retries} after timeout...", Colors.WARNING, "🔄 ")
+                    self.log(f"Retry attempt {self.current_retry}/{self.max_retries}...", Colors.WARNING, "🔄 ")
                     time.sleep(3)
                 
-                self.operation_timeout_detected = False
+                self.log("─" * 40, Colors.HEADER)
+                self.log("STARTING REGISTRATION (API-First)", Colors.HEADER, "🚀 ")
+                self.log("─" * 40, Colors.HEADER)
                 
-                self.log("=" * 60, Colors.HEADER)
-                self.log("STARTING CHATGPT REGISTRATION", Colors.HEADER, "🚀 ")
-                self.log("=" * 60, Colors.HEADER)
+                # === Step 0: Generate email if TinyHost ===
+                if self.email_mode != "OAuth2":
+                    email_data = self.mail_api.generate_email()
+                    if not email_data:
+                        self.log("Failed to generate email", Colors.ERROR, "❌ ")
+                        return (False, None)
+                    self.email_info = email_data
                 
-                if not self.setup_driver(max_retries=3):
+                email = self.email_info['email']
+                password = self.password
+                
+                first_name, last_name = self._random_name()
+                full_name = f"{first_name} {last_name}"
+                birthdate = self._random_birthdate()
+                device_id = str(uuid.uuid4())
+                
+                self.log(f"Email: {email} | Pass: {password}", Colors.INFO, "📧 ")
+                self.log(f"Name: {full_name} | DOB: {birthdate}", Colors.INFO, "👤 ")
+                
+                # === Step 1: Setup browser ===
+                if not self.setup_browser():
                     return (False, None)
                 
-                if not self.navigate_to_chatgpt():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
+                page = self.page
+                
+                # === Step 2: Navigate + CSRF ===
+                self.log("Navigating to chatgpt.com...", Colors.INFO, "🌐 ")
+                page.goto("https://chatgpt.com/", wait_until="networkidle", timeout=60000)
+                page.wait_for_timeout(2000)
+                
+                # === Step 3: Get CSRF token ===
+                self.log("Getting CSRF token...", Colors.INFO, "🔑 ")
+                csrf_resp = page.evaluate("""
+                    async () => {
+                        const r = await fetch('/api/auth/csrf', { headers: { 'Content-Type': 'application/json' } });
+                        return await r.json();
+                    }
+                """)
+                csrf_token = csrf_resp.get("csrfToken", "")
+                if not csrf_token:
+                    self.log("Failed to get CSRF token", Colors.ERROR, "❌ ")
                     self.cleanup_browser()
-                    return (False, None)
+                    self.current_retry += 1
+                    continue
+                self.log(f"CSRF: {csrf_token[:20]}...", Colors.SUCCESS)
                 
-                if not self.click_login_button():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
+                # === Step 4: POST signin → auth URL ===
+                self.log("Redirecting to auth.openai.com...", Colors.INFO, "🔄 ")
+                auth_session_id = str(uuid.uuid4())
+                signin_js = f"""
+                    async () => {{
+                        const params = new URLSearchParams({{
+                            'prompt': 'login',
+                            'ext-oai-did': '{device_id}',
+                            'auth_session_logging_id': '{auth_session_id}',
+                            'screen_hint': 'login_or_signup',
+                            'login_hint': '{email}'
+                        }});
+                        const r = await fetch('/api/auth/signin/openai?' + params.toString(), {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                            body: new URLSearchParams({{
+                                'callbackUrl': 'https://chatgpt.com/',
+                                'csrfToken': '{csrf_token}',
+                                'json': 'true'
+                            }}).toString()
+                        }});
+                        return await r.json();
+                    }}
+                """
+                signin_resp = page.evaluate(signin_js)
+                auth_url = signin_resp.get("url", "")
+                if not auth_url:
+                    self.log("No auth URL returned", Colors.ERROR, "❌ ")
                     self.cleanup_browser()
-                    return (False, None)
+                    self.current_retry += 1
+                    continue
+                self.log("Auth URL OK", Colors.SUCCESS)
+            
+                # Navigate to auth page (CF challenge)
+                page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+                self.log("Waiting for CF challenge...", Colors.INFO, "⏳ ")
+                page.wait_for_timeout(8000)
                 
-                if not self.enter_email_address():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
+                # === Step 5: Register via API ===
+                self.log("Registering account...", Colors.INFO, "📝 ")
+                register_js = f"""
+                    async () => {{
+                        const r = await fetch('/api/accounts/user/register', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
+                            body: JSON.stringify({{ 'username': '{email}', 'password': '{password}' }})
+                        }});
+                        return {{ status: r.status, body: await r.text() }};
+                    }}
+                """
+                register_resp = page.evaluate(register_js)
+                reg_status = register_resp.get('status', 0)
+                reg_body = register_resp.get('body', '')
+                self.log(f"Register: {reg_status}", Colors.SUCCESS if reg_status == 200 else Colors.ERROR)
                 
-                if not self.click_continue_button():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
-                
-                if not self.enter_password():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
-                
-                if not self.click_continue_button():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
-                
-                # Check for timeout after password submit (common failure point)
-                time.sleep(1)
-                if self.check_and_handle_timeout():
-                    self.log("Timeout detected after password. Restarting...", Colors.WARNING, "🔁 ")
+                if reg_status != 200:
+                    self.log(f"Register failed ({reg_status})", Colors.ERROR, "❌ ")
                     self.cleanup_browser()
                     self.current_retry += 1
                     continue
                 
-                # Faster OTP polling: subject-first extraction reduces API load per poll.
-                if NETWORK_MODE == "Fast":
-                    # Faster OTP polling (subject-first extraction is cheap).
-                    if NETWORK_MODE == "Fast":
-                        otp = self.wait_and_get_otp(max_attempts=60, wait_seconds=1)
-                    else:
-                        otp = self.wait_and_get_otp(max_attempts=45, wait_seconds=2)
+                # Follow continue_url to trigger OTP email
+                try:
+                    reg_data = json.loads(reg_body)
+                    continue_url = reg_data.get('continue_url', '')
+                    if continue_url:
+                        self.log("Following continue_url...", Colors.INFO)
+                        otp_trigger_js = f"""
+                            async () => {{
+                                const r = await fetch('{continue_url}', {{ headers: {{ 'Accept': 'application/json' }} }});
+                                return {{ status: r.status, body: await r.text() }};
+                            }}
+                        """
+                        page.evaluate(otp_trigger_js)
+                except Exception as e:
+                    self.log(f"OTP trigger error: {e}", Colors.WARNING)
+                
+                page.wait_for_timeout(2000)
+                
+                # === Step 6: Wait for OTP ===
+                self.log("Waiting for OTP email...", Colors.INFO, "📬 ")
+                if self.email_mode == "OAuth2":
+                    otp_code = self._wait_for_otp_oauth2(timeout=120)
                 else:
-                    otp = self.wait_and_get_otp(max_attempts=45, wait_seconds=2)
-                if not otp:
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
+                    otp_code = self._wait_for_otp_tinyhost(email, timeout=120)
+                
+                if not otp_code:
                     self.cleanup_browser()
                     return (False, None)
                 
-                if not self.enter_otp_code(otp):
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
+                self.log(f"OTP: {otp_code}", Colors.SUCCESS, "✅ ")
                 
-                if not self.click_continue_button():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
+                # Validate OTP via API
+                validate_js = f"""
+                    async () => {{
+                        const r = await fetch('/api/accounts/email-otp/validate', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
+                            body: JSON.stringify({{ 'code': '{otp_code}' }})
+                        }});
+                        return {{ status: r.status, body: await r.text() }};
+                    }}
+                """
+                validate_resp = page.evaluate(validate_js)
+                status = validate_resp.get('status')
+                body = validate_resp.get('body', '')
+                self.log(f"OTP Validate: {status}", Colors.SUCCESS if status == 200 else Colors.ERROR)
+                page.wait_for_timeout(2000)
                 
-                # Check for timeout after OTP submit
-                time.sleep(1)
-                if self.check_and_handle_timeout():
-                    self.log("Timeout detected after OTP. Restarting...", Colors.WARNING, "🔁 ")
+                # === Step 7: Create account (name + DOB) ===
+                self.log("Creating account...", Colors.INFO, "🏗️ ")
+                create_js = f"""
+                    async () => {{
+                        const r = await fetch('/api/accounts/create_account', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
+                            body: JSON.stringify({{ 'name': '{full_name}', 'birthdate': '{birthdate}' }})
+                        }});
+                        return {{ status: r.status, body: await r.text() }};
+                    }}
+                """
+                create_resp = page.evaluate(create_js)
+                self.log(f"Account created: {create_resp.get('status')}", Colors.SUCCESS if create_resp.get('status') == 200 else Colors.ERROR)
+                page.wait_for_timeout(2000)
+                
+                # Follow callback URL to complete login
+                try:
+                    create_data = json.loads(create_resp.get("body", "{}"))
+                    continue_url = create_data.get("continue_url", "")
+                    if continue_url and "callback" in continue_url:
+                        self.log("Following auth callback...", Colors.INFO)
+                        page.goto(continue_url, wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(3000)
+                except Exception as e:
+                    self.log(f"Callback error: {e}", Colors.WARNING)
+                
+                # === Verify registration ===
+                self.log("Verifying registration...", Colors.INFO, "🔍 ")
+                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)
+                
+                check_resp = page.evaluate("""
+                    async () => {
+                        const r = await fetch('/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-420');
+                        return { status: r.status };
+                    }
+                """)
+                
+                if check_resp.get("status") != 200:
+                    self.log("Registration verification failed", Colors.ERROR, "❌ ")
                     self.cleanup_browser()
                     self.current_retry += 1
                     continue
                 
-                if not self.enter_name_and_dob():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
+                self.log("Registration verified!", Colors.SUCCESS, "✅ ")
                 
-                if not self.click_continue_button():
-                    if self.check_and_handle_timeout():
-                        self.cleanup_browser()
-                        self.current_retry += 1
-                        continue
-                    self.cleanup_browser()
-                    return (False, None)
+                # === Get access token ===
+                session_resp = page.evaluate("""
+                    async () => {
+                        const r = await fetch('/api/auth/session');
+                        return await r.json();
+                    }
+                """)
+                access_token = session_resp.get("accessToken", "")
+                if access_token:
+                    self.log(f"Access Token: {access_token[:30]}...", Colors.SUCCESS)
                 
-                # Final timeout check
-                time.sleep(1)
-                if self.check_and_handle_timeout():
-                    self.log("Timeout detected after DOB. Restarting...", Colors.WARNING, "🔁 ")
-                    self.cleanup_browser()
-                    self.current_retry += 1
-                    continue
+                # === 2FA setup if enabled ===
+                mfa_secret = None
+                if ENABLE_2FA and access_token:
+                    mfa_result = self._setup_2fa_api(access_token)
+                    if mfa_result:
+                        mfa_secret = mfa_result.get("secret", "")
                 
-                # Get cookies directly after DOB (skip Skip and final Continue buttons)
-                self.log("Registration complete! Getting cookies...", Colors.SUCCESS, "✅ ")
-                
-                # Detect and close any popups before proceeding
-                self.detect_and_close_popups()
-                
-                cookies = self.get_cookies_json()
-                
-                # Get checkout link if mode is enabled and cookies are valid
+                # === Checkout if enabled ===
                 checkout_url = None
                 business_checkout_url = None
-                if GET_CHECKOUT_LINK:
-                    cookies_json = json.dumps(cookies, separators=(',', ':'), ensure_ascii=False)
-                    if cookies_json.startswith('[{"domain":".chatgpt.com"') or any(c.get('domain') == '.chatgpt.com' for c in cookies):
-                        checkout_type = GET_CHECKOUT_TYPE
-                        
-                        if checkout_type == "Plus":
-                            checkout_url = self.get_checkout_link_via_api(cookies)
-                        elif checkout_type == "Business":
-                            business_checkout_url = self.get_business_checkout_link_via_api(cookies)
-                        elif checkout_type == "Both":
-                            checkout_url = self.get_checkout_link_via_api(cookies)
-                            business_checkout_url = self.get_business_checkout_link_via_api(cookies)
-                    else:
-                        self.log("Skipping checkout link - invalid session cookie", Colors.WARNING, "⚠️ ")
+                if GET_CHECKOUT_LINK and access_token:
+                    checkout_type = GET_CHECKOUT_TYPE
+                    if checkout_type == "Plus":
+                        checkout_url = self.get_checkout_link_via_api(access_token)
+                    elif checkout_type == "Business":
+                        business_checkout_url = self.get_business_checkout_link_via_api(access_token)
+                    elif checkout_type == "Both":
+                        checkout_url = self.get_checkout_link_via_api(access_token)
+                        business_checkout_url = self.get_business_checkout_link_via_api(access_token)
                 
-                saved = self.save_account_info(cookies, checkout_url, business_checkout_url)
+                # === Save to Excel ===
+                saved = self.save_account_info(access_token, checkout_url, business_checkout_url, mfa_secret)
                 
                 if not saved:
-                    self.log("Account not saved due to invalid cookies", Colors.ERROR, "❌ ")
+                    self.log("Account not saved", Colors.ERROR, "❌ ")
                     self.cleanup_browser()
                     return (False, None)
                 
-                self.log("=" * 60, Colors.SUCCESS)
+                # Mark OAuth2 as registered if applicable
+                if self.email_mode == "OAuth2" and self.oauth2_row_num:
+                    mark_oauth2_registered(self.oauth2_row_num)
+                
+                self.log("─" * 40, Colors.SUCCESS)
                 self.log("COMPLETED!", Colors.SUCCESS, "🎉 ")
-                self.log(f"Account: {self.email_info['email']}:{self.password}", Colors.INFO)
-                self.log("=" * 60, Colors.SUCCESS)
+                self.log(f"{email}:{password}", Colors.INFO)
+                if mfa_secret:
+                    self.log(f"2FA: {mfa_secret}", Colors.INFO, "🔐 ")
+                self.log("─" * 40, Colors.SUCCESS)
                 
-                time.sleep(3)
-                
-                result = {
-                    'email': self.email_info['email'],
-                    'password': self.password
-                }
-                
-                # Cleanup browser after success
+                time.sleep(2)
                 self.cleanup_browser()
-                
-                return (True, result)
+                return (True, {'email': email, 'password': password})
                 
             except Exception as e:
                 self.log(f"Error: {e}", Colors.ERROR, "❌ ")
                 traceback.print_exc()
-                
-                # Check if it's a timeout error that warrants retry
-                if self.check_and_handle_timeout() and self.current_retry < self.max_timeout_retries:
-                    self.cleanup_browser()
-                    self.current_retry += 1
-                    continue
-                
                 self.cleanup_browser()
-                return (False, None)
+                self.current_retry += 1
+                continue
         
-        # Exhausted all retries
-        self.log(f"Failed after {self.max_timeout_retries} timeout retries", Colors.ERROR, "❌ ")
+        self.log(f"Failed after {self.max_retries} retries", Colors.ERROR, "❌ ")
         self.cleanup_browser()
         return (False, None)
 
 
-
 def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_mode="TinyHost", oauth2_account=None):
     """Worker function for registration with staggered start and retry logic"""
-    # Apply delay based on position within current batch (reset for each batch)
     position_in_batch = (thread_id - 1) % num_threads if num_threads > 1 else 0
     delay = position_in_batch * thread_delay
     if delay > 0:
         safe_print(thread_id, f"Waiting {delay}s before starting...", Colors.INFO, "⏳ ")
-        # Sleep in intervals to check stop_event
         for _ in range(int(delay * 2)):
             if stop_event and stop_event.is_set():
                 return (False, None)
@@ -2466,1214 +1475,16 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_
 
 
 # ============================================================================
-# MODULE 3: MFA AUTOMATION
-# ============================================================================
-
-class MFAWorker:
-    """Worker for MFA enrollment"""
-    
-    def __init__(self, thread_id, row_index, email, password, cookie_json, excel_file, oauth2_account=None, recheck_mode=False):
-        self.thread_id = thread_id
-        self.row_index = row_index
-        self.email = email
-        self.password = password
-        self.cookie_json = cookie_json
-        self.excel_file = excel_file
-        self.oauth2_account = oauth2_account
-        self.recheck_mode = recheck_mode
-        self.driver = None
-        self.user_data_dir = None
-        self.proxy_bridge = None
-        self.stop_event = None
-        
-        # Popup polling
-        self._popup_polling_active = False
-        self._popup_polling_thread = None
-        self._popup_dismissed = False
-
-        # Parse email info for TempMailAPI
-        parts = self.email.split('@')
-        if len(parts) == 2:
-            self.email_info = {
-                'username': parts[0],
-                'domain': parts[1],
-                'email': self.email
-            }
-        else:
-            self.email_info = None
-            
-        if self.oauth2_account:
-            self.mail_api = DongVanOAuth2API(
-                email=self.oauth2_account.get("email", ""),
-                password=self.oauth2_account.get("password", ""),
-                refresh_token=self.oauth2_account.get("refresh_token", ""),
-                client_id=self.oauth2_account.get("client_id", "")
-            )
-        else:
-            self.mail_api = TempMailAPI()
-
-        
-    def log(self, message, color=Colors.INFO, emoji=""):
-        safe_print(self.thread_id, message, color, emoji)
-    
-    def setup_driver(self):
-        """Initialize Chrome driver"""
-        try:
-            self.log("Initializing ChromeDriver...", Colors.INFO, "🔄 ")
-            
-            options = uc.ChromeOptions()
-            
-            timestamp = int(time.time() * 1000)
-            random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-            self.user_data_dir = tempfile.mkdtemp(prefix=f"chrome_mfa_T{self.thread_id}_{timestamp}_{random_suffix}_")
-            options.add_argument(f'--user-data-dir={self.user_data_dir}')
-            
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--window-size=900,700')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('--lang=en-US')
-
-            # Improve stability when Chrome window is background/occluded
-            options.add_argument('--disable-background-timer-throttling')
-            options.add_argument('--disable-backgrounding-occluded-windows')
-            options.add_argument('--disable-renderer-backgrounding')
-            options.add_argument('--disable-features=CalculateNativeWinOcclusion')
-            
-            prefs = {
-                "credentials_enable_service": False,
-                "profile.password_manager_enabled": False,
-                "profile.default_content_setting_values.notifications": 2
-            }
-            options.add_experimental_option("prefs", prefs)
-            
-            # Apply proxy if enabled
-            self.proxy_bridge, proxy_label = apply_proxy_to_chrome_options(options)
-            if proxy_label:
-                self.log(f"Proxy enabled: {proxy_label}", Colors.INFO, "🌐 ")
-            
-            with driver_init_lock:
-                try:
-                    self.driver = uc.Chrome(options=options, version_main=CHROME_VERSION_MAIN)
-                except Exception:
-                    self.driver = uc.Chrome(options=options, version_main=None)
-            
-            window_width = 900
-            window_height = 700
-            x_offset = (self.thread_id - 1) * 80
-            y_offset = (self.thread_id - 1) * 40
-            
-            self.driver.set_window_size(window_width, window_height)
-            self.driver.set_window_position(x_offset, y_offset)
-            
-            self.log("ChromeDriver initialized!", Colors.SUCCESS, "✅ ")
-            return True
-            
-        except Exception as e:
-            self.log(f"Error initializing driver: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def import_cookies(self):
-        """Import cookies into browser"""
-        try:
-            self.log("Importing cookies...", Colors.INFO, "🍪 ")
-            
-            self.driver.get("https://chatgpt.com/")
-            time.sleep(2)
-            
-            cookies = json.loads(self.cookie_json) if isinstance(self.cookie_json, str) else self.cookie_json
-            
-            for cookie in cookies:
-                try:
-                    cookie_dict = {
-                        "name": cookie.get("name"),
-                        "value": cookie.get("value"),
-                        "domain": cookie.get("domain", ".chatgpt.com"),
-                        "path": cookie.get("path", "/"),
-                        "secure": cookie.get("secure", True),
-                        "httpOnly": cookie.get("httpOnly", False)
-                    }
-                    
-                    if cookie.get("expirationDate"):
-                        cookie_dict["expiry"] = int(cookie.get("expirationDate"))
-                    
-                    self.driver.add_cookie(cookie_dict)
-                except Exception:
-                    continue
-            
-            self.log("Cookies imported!", Colors.SUCCESS, "✅ ")
-            self.driver.refresh()
-            time.sleep(3)
-            
-            # Dismiss onboarding popup if appears
-            self.start_popup_polling()
-
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"Error importing cookies: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def start_popup_polling(self):
-        """Start background thread to continuously check and dismiss onboarding popup"""
-        if self._popup_polling_active or self._popup_dismissed:
-            return
-        
-        self._popup_polling_active = True
-        self._popup_polling_thread = threading.Thread(target=self._popup_polling_loop, daemon=True)
-        self._popup_polling_thread.start()
-    
-    def stop_popup_polling(self):
-        """Stop the popup polling thread"""
-        self._popup_polling_active = False
-        if self._popup_polling_thread and self._popup_polling_thread.is_alive():
-            self._popup_polling_thread.join(timeout=2)
-        self._popup_polling_thread = None
-    
-    def _popup_polling_loop(self):
-        """Background loop to check for onboarding popup every 2 seconds"""
-        while self._popup_polling_active and not self._popup_dismissed:
-            try:
-                if not self.driver:
-                    break
-                
-                button_selectors = [
-                    "//button[.//div[contains(text(), \"Okay, let's go\")]]",
-                    "//button[contains(., \"Okay, let's go\")]",
-                    "//div[@role='dialog']//button[contains(., 'Okay')]",
-                    "//button[.//div[contains(text(), 'Not now')]]",
-                    "//button[contains(., 'Not now')]",
-                ]
-                
-                for selector in button_selectors:
-                    try:
-                        buttons = self.driver.find_elements(By.XPATH, selector)
-                        for btn in buttons:
-                            if btn.is_displayed():
-                                self.driver.execute_script("arguments[0].click();", btn)
-                                self.log("Dismissed onboarding popup", Colors.SUCCESS, "✅ ")
-                                self._popup_dismissed = True
-                                self._popup_polling_active = False
-                                return
-                    except:
-                        continue
-            except:
-                pass
-            
-            # Poll every 2 seconds
-            time.sleep(2)
-
-    
-    def navigate_to_security_settings(self):
-        """Navigate to Settings > Security"""
-        try:
-            self.log("Navigating to Security settings...", Colors.INFO, "⚙️ ")
-            self.driver.get("https://chatgpt.com/#settings/Security")
-            time.sleep(3)
-            return True
-        except Exception as e:
-            self.log(f"Error navigating to settings: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def click_mfa_toggle(self):
-        """
-        Click the MFA toggle button with STRICT verification.
-        1. Must find text "Authenticator app" first.
-        2. Find toggle specifically associated with that text.
-        3. Check state (checked/unchecked).
-        """
-        try:
-            self.log("Searching for 'Authenticator app' toggle...", Colors.INFO, "🔍 ")
-            
-            # 1. Wait/Retry for the specific label "Authenticator app"
-            label_found = False
-            for _ in range(5): # Retry for ~10 seconds
-                if "Authenticator app" in self.driver.page_source:
-                    label_found = True
-                    break
-                time.sleep(2)
-                
-            if not label_found:
-                self.log("'Authenticator app' section NOT found. Skipping to avoid false positives.", Colors.WARNING, "⚠️ ")
-                return False
-
-            time.sleep(1) # Small settle time
-            
-            # 2. Strict Selectors anchoring to the text
-            # We want the button that is a sibling or descendant of the row containing "Authenticator app"
-            strict_selectors = [
-                 # Case A: Label is in a div, button is following sibling in same container or row
-                "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                # Case B: Label is a span
-                "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                # Case C: Container approach (ancestor row) - safer
-                "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
-            ]
-            
-            toggle = None
-            for selector in strict_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, selector)
-                    for elem in elements:
-                        if elem.is_displayed():
-                            toggle = elem
-                            break
-                    if toggle:
-                        break
-                except:
-                    continue
-            
-            if toggle:
-                state = toggle.get_attribute("data-state")
-                
-                # Double check to ensure we didn't pick up a stray button
-                # (Logic: if we used strict XPath, it should be correct, but let's be sure)
-                
-                if state == "checked":
-                    self.log("MFA is already enabled (checked)", Colors.SUCCESS, "✅ ")
-                    return "ALREADY_ENABLED"
-                
-                self.log("MFA is disabled (unchecked). Clicking to enable...", Colors.INFO, "👆 ")
-                self.driver.execute_script("arguments[0].click();", toggle)
-                self.log("Clicked MFA toggle", Colors.SUCCESS, "✅ ")
-                time.sleep(3)
-                return True
-            else:
-                self.log("Found label but could not locate strict Toggle button!", Colors.ERROR, "❌ ")
-                return False
-                
-        except Exception as e:
-            self.log(f"Error clicking toggle: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def extract_otp_from_email(self, email_text):
-        patterns = [r'\b(\d{6})\b', r'code[:\s]+(\d{6})', r'verification[:\s]+(\d{6})']
-        for pattern in patterns:
-            match = re.search(pattern, email_text, re.IGNORECASE)
-            if match: return match.group(1)
-        return None
-
-    def wait_and_get_otp(self, max_attempts=30, wait_seconds=5):
-        self.log("Waiting for OTP from email...", Colors.INFO, "📧 ")
-        
-        # Check if email is Outlook/Hotmail
-        is_outlook = self.email.lower().endswith(('@outlook.com', '@hotmail.com'))
-        
-        # HANDLE OAUTH2 MODE (Using DongVanOAuth2API)
-        if self.oauth2_account:
-            refresh_token = self.oauth2_account.get("refresh_token")
-            client_id = self.oauth2_account.get("client_id")
-            
-            if not refresh_token or not client_id:
-                self.log("Missing refresh_token or client_id for OAuth2", Colors.ERROR, "❌ ")
-                return None
-                
-            for _ in range(max_attempts):
-                if self.stop_event and self.stop_event.is_set():
-                    self.log("Process stopped by user", Colors.WARNING, "🛑 ")
-                    return None
-                
-                try:
-                    # DongVanOAuth2API uses instance vars for auth, no params needed
-                    messages = self.mail_api.fetch_messages()
-                    if messages:
-                        code = self.mail_api.extract_code_from_messages(messages)
-                        if code:
-                            self.log(f"Got OTP (OAuth2): {code}", Colors.SUCCESS, "✅ ")
-                            return code
-                except Exception as e:
-                    pass  # Ignore errors during polling
-                
-                # Sleep in intervals
-                for _ in range(wait_seconds * 2):
-                    if self.stop_event and self.stop_event.is_set():
-                        return None
-                    time.sleep(0.5)
-            return None
-            
-        # HANDLE OUTLOOK/HOTMAIL WITHOUT OAUTH2 - SKIP
-        elif is_outlook:
-            self.log("Outlook/Hotmail email requires OAuth2 credentials in oauth2.xlsx", Colors.ERROR, "❌ ")
-            return None
-            
-        # HANDLE TINYHOST MODE (Using TempMailAPI)
-        else:
-            if not self.email_info: return None
-            user, domain = self.email_info['username'], self.email_info['domain']
-            
-            for _ in range(max_attempts):
-                if self.stop_event and self.stop_event.is_set():
-                    self.log("Process stopped by user", Colors.WARNING, "🛑 ")
-                    return None
-                    
-                data = self.mail_api.get_emails(domain, user, limit=5)
-                if data and data.get('emails'):
-                    for item in data['emails']:
-                        if 'openai' in item.get('sender', '').lower() or 'code' in item.get('subject', '').lower():
-                            detail = self.mail_api.get_email_detail(domain, user, item['id'])
-                            if detail:
-                                full = f"{detail.get('body','')} {detail.get('html_body','')}"
-                                otp = self.extract_otp_from_email(full)
-                                if otp:
-                                    self.log(f"Got OTP: {otp}", Colors.SUCCESS, "✅ ")
-                                    return otp
-                
-                # Sleep in intervals to check stop_event
-                for _ in range(wait_seconds * 2):
-                    if self.stop_event and self.stop_event.is_set():
-                        return None
-                    time.sleep(0.5)
-                    
-            return None
-
-    def enter_otp_code(self, otp):
-        """Enter OTP - handles both new (6 separate digit inputs) and old (single field) formats"""
-        try:
-            wait = WebDriverWait(self.driver, 3)
-            time.sleep(0.5)
-            
-            # NEW FORMAT: Try 6 separate digit inputs first (aria-label="Digit 1" through "Digit 6")
-            try:
-                digit_inputs = []
-                for i in range(1, 7):
-                    inp = self.driver.find_element(By.XPATH, f"//input[@aria-label='Digit {i}']")
-                    if inp and inp.is_displayed():
-                        digit_inputs.append(inp)
-                
-                if len(digit_inputs) == 6 and len(otp) == 6:
-                    self.log("Detected new 6-digit separate input format", Colors.INFO, "ℹ️ ")
-                    for i, digit in enumerate(otp):
-                        try:
-                            digit_inputs[i].click()
-                            time.sleep(0.05)
-                            digit_inputs[i].send_keys(digit)
-                            time.sleep(0.05)
-                        except Exception:
-                            digit_inputs[i].send_keys(digit)
-                    self.log("Entered email OTP (6-digit format)", Colors.SUCCESS, "✅ ")
-                    
-                    # Check if Continue button exists (sometimes present, sometimes auto-redirects)
-                    time.sleep(1)
-                    try:
-                        continue_btn = WebDriverWait(self.driver, 3).until(
-                            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]"))
-                        )
-                        if continue_btn and continue_btn.is_displayed():
-                            self.driver.execute_script("arguments[0].click();", continue_btn)
-                            self.log("Clicked Continue (6-digit OTP)", Colors.SUCCESS, "✅ ")
-                            time.sleep(3)
-                    except Exception:
-                        # No Continue button = auto-redirect mode, just wait
-                        self.log("No Continue button, waiting for auto-redirect...", Colors.INFO, "ℹ️ ")
-                        time.sleep(2)
-                    return True
-            except Exception:
-                pass
-            
-            # OLD FORMAT: Single input field
-            inp = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Code' or @name='code' or @id='code']")))
-            if not inp.is_displayed():
-                raise Exception("Code input not visible")
-            
-            self.log("Detected old single-field OTP format", Colors.INFO, "ℹ️ ")
-            inp.clear()
-            for c in otp:
-                inp.send_keys(c)
-                time.sleep(0.05)
-            self.log("Entered email OTP (single-field format)", Colors.SUCCESS, "✅ ")
-            
-            btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]")))
-            btn.click()
-            self.log("Clicked Continue (OTP)", Colors.SUCCESS, "✅ ")
-            time.sleep(3)
-            return True
-        except Exception as e:
-            self.log(f"Error entering OTP: {e}", Colors.ERROR, "❌ ")
-            return False
-
-    def handle_password_verification(self):
-        """Handle password OR email verification, or password -> OTP flow"""
-        try:
-            self.log("Waiting for verification...", Colors.INFO, "🔑 ")
-            time.sleep(3)
-            
-            url = self.driver.current_url
-            page_source = self.driver.page_source.lower()
-            
-            # Case 1: Email OTP first
-            if "check your inbox" in page_source or "enter the verification code" in page_source or "email-verification" in url:
-                self.log("Detected 'Check your inbox' screen", Colors.WARNING, "📧 ")
-                if not self._handle_email_otp_verification():
-                    return False
-
-            # Case 2: Password page
-            elif "auth.openai.com" in url or "log-in/password" in url or "enter your password" in page_source:
-                self.log("On password verification page", Colors.INFO, "ℹ️ ")
-                if not self._enter_password_and_click_continue():
-                    return False
-                
-                # After entering password, check if OTP page appears
-                time.sleep(3)
-                new_url = self.driver.current_url
-                new_page_source = self.driver.page_source.lower()
-                if "check your inbox" in new_page_source or "enter the verification code" in new_page_source or "email-verification" in new_url:
-                    self.log("OTP page appeared after password", Colors.INFO, "📧 ")
-                    if not self._handle_email_otp_verification():
-                        return False
-            
-            else:
-                self.log("Not on known verification page, continuing...", Colors.INFO, "ℹ️ ")
-
-            # Check redirect and return to settings if needed
-            if "chatgpt.com" in self.driver.current_url:
-                self.log("Redirecting back to Security settings...", Colors.INFO, "⚙️ ")
-                self.driver.get("https://chatgpt.com/#settings/Security")
-                time.sleep(3)
-                try:
-                    toggle = self.driver.find_element(By.XPATH, "//button[@data-state='unchecked']")
-                    if toggle.is_displayed():
-                        self.driver.execute_script("arguments[0].click();", toggle)
-                        self.log("Clicked MFA toggle again", Colors.SUCCESS, "✅ ")
-                        time.sleep(3)
-                except: pass
-            
-            return True
-                
-        except Exception as e:
-            self.log(f"Error with verification: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def _enter_password_and_click_continue(self):
-        """Enter password and click Continue button"""
-        try:
-            wait = WebDriverWait(self.driver, 5)
-            password_input = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='password']")))
-            password_input.clear()
-            for char in self.password:
-                password_input.send_keys(char)
-                time.sleep(random.uniform(0.05, 0.1))
-            self.log("Entered password", Colors.SUCCESS, "✅ ")
-            time.sleep(1)
-            wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]"))).click()
-            self.log("Clicked Continue", Colors.SUCCESS, "✅ ")
-            time.sleep(5)
-            return True
-        except Exception as e:
-            self.log(f"Error entering password: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def _handle_email_otp_verification(self):
-        """Handle email OTP verification"""
-        try:
-            otp = self.wait_and_get_otp()
-            if otp:
-                if self.enter_otp_code(otp):
-                    time.sleep(5)  # Wait for redirect
-                    return True
-            self.log("Failed to get OTP from email", Colors.ERROR, "❌ ")
-            return False
-        except Exception as e:
-            self.log(f"Error handling email OTP: {e}", Colors.ERROR, "❌ ")
-            return False
-                
-
-                
-
-    def fix_base32_padding(self, secret):
-        """Fix base32 padding for pyotp"""
-        secret = secret.rstrip("=")
-        padding_needed = (8 - len(secret) % 8) % 8
-        return secret + "=" * padding_needed
-    
-    def extract_totp_secret(self):
-        """Extract TOTP secret from the QR code dialog"""
-        try:
-            self.log("Extracting TOTP secret...", Colors.INFO, "🔍 ")
-            
-            wait = WebDriverWait(self.driver, 2)
-            
-            trouble_link_selectors = [
-                "//a[contains(text(), 'Trouble scanning')]",
-                "//button[contains(text(), 'Trouble scanning')]",
-                "//*[contains(text(), 'Trouble') and contains(text(), 'scanning')]",
-            ]
-            
-            for selector in trouble_link_selectors:
-                try:
-                    link = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
-                    self.driver.execute_script("arguments[0].click();", link)
-                    self.log("Clicked 'Trouble scanning?' link", Colors.SUCCESS, "✅ ")
-                    time.sleep(1)
-                    break
-                except:
-                    continue
-            
-            secret = None
-            secret_selectors = [
-                "//code", "//pre", "//input[@readonly]", "//input[@value]",
-                "//*[contains(@class, 'font-mono')]",
-                "//p[string-length(normalize-space(text())) >= 16]",
-                "//span[string-length(normalize-space(text())) >= 16]",
-            ]
-            
-            for selector in secret_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, selector)
-                    for elem in elements:
-                        text = elem.text.strip().replace(" ", "").replace("-", "")
-                        if not text:
-                            text = elem.get_attribute("value") or ""
-                            text = text.strip().replace(" ", "").replace("-", "")
-                        
-                        if text and len(text) >= 16 and len(text) <= 64:
-                            clean_text = text.upper()
-                            valid_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
-                            if all(c in valid_chars for c in clean_text):
-                                secret = clean_text
-                                break
-                except:
-                    continue
-                if secret:
-                    break
-            
-            if not secret:
-                try:
-                    page_source = self.driver.page_source
-                    match = re.search(r'secret=([A-Z2-7]+)', page_source, re.IGNORECASE)
-                    if match:
-                        secret = match.group(1).upper()
-                except:
-                    pass
-            
-            if secret:
-                secret = self.fix_base32_padding(secret)
-                self.log(f"Got TOTP secret: {secret[:8]}...", Colors.SUCCESS, "✅ ")
-                return secret
-            else:
-                self.log("Could not extract TOTP secret", Colors.ERROR, "❌ ")
-                return None
-                
-        except Exception as e:
-            self.log(f"Error extracting secret: {e}", Colors.ERROR, "❌ ")
-            return None
-    
-    def enter_otp_and_verify(self, secret):
-        """Generate OTP and enter it to verify"""
-        try:
-            self.log("Generating and entering OTP...", Colors.INFO, "🔢 ")
-            
-            totp = pyotp.TOTP(secret)
-            code = totp.now()
-            self.log(f"Generated OTP: {code}", Colors.INFO, "🔢 ")
-            
-            wait = WebDriverWait(self.driver, 5)
-            
-            otp_input = wait.until(EC.presence_of_element_located((
-                By.XPATH, 
-                "//input[contains(@placeholder, '6-digit') or contains(@placeholder, 'code') or @type='text']"
-            )))
-            
-            otp_input.clear()
-            for char in code:
-                otp_input.send_keys(char)
-                time.sleep(0.1)
-            
-            self.log("Entered OTP code", Colors.SUCCESS, "✅ ")
-            time.sleep(1)
-            
-            verify_selectors = [
-                "//button[contains(@class, 'btn-primary') and .//div[contains(text(), 'Verify')]]",
-                "//button[contains(@class, 'btn-primary') and contains(., 'Verify')]",
-                "//button[.//div[text()='Verify']]",
-                "//button[contains(@class, 'btn-primary')]",
-            ]
-            
-            verify_btn = None
-            for selector in verify_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, selector)
-                    for elem in elements:
-                        if elem.is_displayed() and 'Verify' in elem.text:
-                            verify_btn = elem
-                            break
-                    if verify_btn:
-                        break
-                except:
-                    continue
-            
-            if verify_btn:
-                self.driver.execute_script("arguments[0].click();", verify_btn)
-                self.log("Clicked Verify", Colors.SUCCESS, "✅ ")
-            else:
-                self.log("Could not find Verify button", Colors.ERROR, "❌ ")
-                return False
-            
-            time.sleep(2)
-            
-            success_selectors = [
-                "//*[@data-testid='totp-mfa-activation-success']",
-                "//*[@role='alert' and contains(., 'Authenticator app enabled')]",
-                "//*[contains(text(), 'Authenticator app enabled')]"
-            ]
-            
-            success_found = False
-            for selector in success_selectors:
-                try:
-                    elements = self.driver.find_elements(By.XPATH, selector)
-                    if elements:
-                        for elem in elements:
-                            if elem.is_displayed():
-                                success_found = True
-                                break
-                except:
-                    continue
-                if success_found:
-                    break
-            
-            if success_found:
-                self.log("MFA activated successfully!", Colors.SUCCESS, "🎉 ")
-                return True
-            else:
-                self.log("Could not confirm MFA activation - Success message not found", Colors.WARNING, "⚠️ ")
-                return False
-                
-        except Exception as e:
-            self.log(f"Error verifying OTP: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def enroll_mfa(self):
-        """Main MFA enrollment flow"""
-        try:
-            if not self.navigate_to_security_settings():
-                return None
-            
-            toggle_result = self.click_mfa_toggle()
-            if toggle_result == "ALREADY_ENABLED":
-                return {"status": "already_enabled"}
-            elif not toggle_result:
-                return None
-            
-            if not self.handle_password_verification():
-                return None
-            secret = self.extract_totp_secret()
-            if not secret:
-                return None
-            return {"secret": secret}
-        except Exception as e:
-            self.log(f"Error in MFA enrollment: {e}", Colors.ERROR, "❌ ")
-            return None
-        except Exception as e:
-            self.log(f"Error in MFA enrollment: {e}", Colors.ERROR, "❌ ")
-            return None
-    
-    def disable_mfa(self):
-        """Disable orphaned MFA (enabled on web but no key in Excel).
-        Flow: toggle off → password → Try another method → Email → OTP → Remove → confirm"""
-        try:
-            self.log("Disabling orphaned MFA...", Colors.WARNING, "🔄 ")
-            
-            # Step 1: Click the toggle to start disabling (it's currently checked/enabled)
-            try:
-                strict_selectors = [
-                    "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                    "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                    "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
-                ]
-                
-                toggle = None
-                for selector in strict_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, selector)
-                        for elem in elements:
-                            if elem.is_displayed():
-                                toggle = elem
-                                break
-                        if toggle:
-                            break
-                    except:
-                        continue
-                
-                if not toggle:
-                    self.log("Could not find MFA toggle to disable", Colors.ERROR, "❌ ")
-                    return False
-                
-                self.driver.execute_script("arguments[0].click();", toggle)
-                self.log("Clicked MFA toggle to disable", Colors.SUCCESS, "✅ ")
-                time.sleep(2)
-            except Exception as e:
-                self.log(f"Error clicking toggle to disable: {e}", Colors.ERROR, "❌ ")
-                return False
-            
-            # Step 2: Handle password verification → Continue
-            try:
-                url = self.driver.current_url
-                page_source = self.driver.page_source.lower()
-                
-                if "auth.openai.com" in url or "log-in/password" in url or "enter your password" in page_source:
-                    self.log("Entering password for MFA disable...", Colors.INFO, "🔑 ")
-                    if not self._enter_password_and_click_continue():
-                        return False
-                    time.sleep(1)
-            except Exception as e:
-                self.log(f"Error during password step: {e}", Colors.ERROR, "❌ ")
-                return False
-            
-            # Step 3: Check for "Try another method" and click it
-            try:
-                page_source = self.driver.page_source.lower()
-                url = self.driver.current_url
-                
-                # Check if we're on a verification page that has "Try another method"
-                try_another_selectors = [
-                    "//a[contains(text(), 'Try another method')]",
-                    "//a[@href='/mfa-challenge']",
-                    "//a[contains(@href, 'mfa-challenge') and contains(text(), 'Try another')]",
-                ]
-                
-                try_another_link = None
-                for selector in try_another_selectors:
-                    try:
-                        elem = WebDriverWait(self.driver, 5).until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                        if elem and elem.is_displayed():
-                            try_another_link = elem
-                            break
-                    except:
-                        continue
-                
-                if try_another_link:
-                    self.log("Clicking 'Try another method'...", Colors.INFO, "🔄 ")
-                    self.driver.execute_script("arguments[0].click();", try_another_link)
-                    time.sleep(1)
-                else:
-                    # Maybe already on email verification or method selection page
-                    self.log("'Try another method' not found, checking current page...", Colors.INFO, "ℹ️ ")
-            except Exception as e:
-                self.log(f"Error finding 'Try another method': {e}", Colors.WARNING, "⚠️ ")
-            
-            # Step 4: Select "Email" method
-            try:
-                email_selectors = [
-                    "//a[@href='/mfa-challenge/email-otp']",
-                    "//a[contains(@href, 'email-otp')]",
-                    "//a[.//div[contains(text(), 'Email')]]",
-                    "//a[contains(text(), 'Email')]",
-                ]
-                
-                email_link = None
-                for selector in email_selectors:
-                    try:
-                        elem = WebDriverWait(self.driver, 5).until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                        if elem and elem.is_displayed():
-                            email_link = elem
-                            break
-                    except:
-                        continue
-                
-                if email_link:
-                    self.log("Selecting 'Email' verification method...", Colors.INFO, "📧 ")
-                    self.driver.execute_script("arguments[0].click();", email_link)
-                    time.sleep(1)
-                else:
-                    # Maybe page went directly to email OTP
-                    self.log("Email method link not found, checking if already on OTP page...", Colors.INFO, "ℹ️ ")
-            except Exception as e:
-                self.log(f"Error selecting Email method: {e}", Colors.WARNING, "⚠️ ")
-            
-            # Step 5: Handle email OTP verification
-            self.log("Waiting for email OTP...", Colors.INFO, "📧 ")
-            if not self._handle_email_otp_verification():
-                return False
-            
-            # Step 6: Navigate back to Security settings and click toggle again
-            try:
-                self.log("Navigating back to Security settings...", Colors.INFO, "🔄 ")
-                self.driver.get("https://chatgpt.com/#settings/Security")
-                time.sleep(3)
-                
-                # Wait for "Authenticator app" text to appear
-                for _ in range(5):
-                    if "Authenticator app" in self.driver.page_source:
-                        break
-                    time.sleep(2)
-                
-                time.sleep(1)
-                
-                # Find and click the toggle (still checked)
-                strict_selectors = [
-                    "//div[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                    "//span[contains(text(), 'Authenticator app')]/following::button[@role='switch'][1]",
-                    "//div[contains(text(), 'Authenticator app')]/ancestor::div[contains(@class, 'flex')]/descendant::button[@role='switch'][1]"
-                ]
-                
-                toggle = None
-                for selector in strict_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, selector)
-                        for elem in elements:
-                            if elem.is_displayed():
-                                toggle = elem
-                                break
-                        if toggle:
-                            break
-                    except:
-                        continue
-                
-                if toggle:
-                    state = toggle.get_attribute("data-state")
-                    self.log(f"Toggle state: {state}", Colors.INFO, "🔍 ")
-                    self.driver.execute_script("arguments[0].click();", toggle)
-                    self.log("Clicked MFA toggle again to trigger Remove dialog", Colors.SUCCESS, "✅ ")
-                    time.sleep(2)
-                else:
-                    self.log("Could not find MFA toggle after returning to Security", Colors.ERROR, "❌ ")
-                    return False
-            except Exception as e:
-                self.log(f"Error navigating back to toggle: {e}", Colors.ERROR, "❌ ")
-                return False
-            
-            # Step 7: Wait for "Remove Authenticator App" dialog and click Remove
-            try:
-                self.log("Waiting for Remove dialog...", Colors.INFO, "🗑️ ")
-                
-                remove_selectors = [
-                    "//button[contains(@class, 'btn-danger') and .//div[contains(text(), 'Remove')]]",
-                    "//button[contains(@class, 'btn-danger')]",
-                    "//button[.//div[contains(text(), 'Remove')]]",
-                    "//button[contains(., 'Remove')]",
-                ]
-                
-                remove_btn = None
-                for selector in remove_selectors:
-                    try:
-                        remove_btn = WebDriverWait(self.driver, 10).until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                        if remove_btn and remove_btn.is_displayed():
-                            break
-                        else:
-                            remove_btn = None
-                    except:
-                        continue
-                
-                if not remove_btn:
-                    self.log("Remove button not found in dialog", Colors.ERROR, "❌ ")
-                    return False
-                
-                self.driver.execute_script("arguments[0].click();", remove_btn)
-                self.log("Clicked Remove button", Colors.SUCCESS, "✅ ")
-                time.sleep(3)
-            except Exception as e:
-                self.log(f"Error clicking Remove: {e}", Colors.ERROR, "❌ ")
-                return False
-            
-            # Step 7: Wait for "Authenticator app disabled" success alert
-            try:
-                disabled_selectors = [
-                    "//*[@role='alert' and contains(., 'Authenticator app disabled')]",
-                    "//*[contains(text(), 'Authenticator app disabled')]",
-                    "//*[@data-testid='mfa-disable-success']",
-                ]
-                
-                success_found = False
-                for selector in disabled_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, selector)
-                        if elements:
-                            for elem in elements:
-                                if elem.is_displayed():
-                                    success_found = True
-                                    break
-                    except:
-                        continue
-                    if success_found:
-                        break
-                
-                if success_found:
-                    self.log("MFA disabled successfully!", Colors.SUCCESS, "🎉 ")
-                else:
-                    self.log("Disable confirmation not found, but Remove was clicked", Colors.WARNING, "⚠️ ")
-                
-                return True
-                
-            except Exception as e:
-                self.log(f"Error checking disable confirmation: {e}", Colors.WARNING, "⚠️ ")
-                return True  # Remove was clicked, likely succeeded
-                
-        except Exception as e:
-            self.log(f"Error disabling MFA: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def activate_mfa(self, enroll_data):
-        """Activate MFA by entering OTP"""
-        try:
-            secret = enroll_data.get("secret")
-            if not secret:
-                return None
-            if self.enter_otp_and_verify(secret):
-                return secret
-            else:
-                return None
-        except Exception as e:
-            self.log(f"Error activating MFA: {e}", Colors.ERROR, "❌ ")
-            return None
-    
-    def save_to_excel(self, totp_secret):
-        """Save TOTP secret to Excel"""
-        try:
-            with file_lock:
-                wb = load_workbook(self.excel_file)
-                ws = wb.active
-                ws.cell(row=self.row_index, column=5, value=totp_secret)  # Column E = 2FA Secret
-                wb.save(self.excel_file)
-                self.log(f"Saved TOTP secret to Excel row {self.row_index}", Colors.SUCCESS, "💾 ")
-                return True
-        except Exception as e:
-            self.log(f"Error saving to Excel: {e}", Colors.ERROR, "❌ ")
-            return False
-    
-    def cleanup(self):
-        """Cleanup driver and temp files"""
-        # Stop popup polling thread first
-        self.stop_popup_polling()
-        
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
-            self.driver = None
-
-        if self.proxy_bridge:
-            try:
-                self.proxy_bridge.stop()
-            except Exception:
-                pass
-            self.proxy_bridge = None
-
-        
-        if self.user_data_dir and os.path.exists(self.user_data_dir):
-            try:
-                shutil.rmtree(self.user_data_dir, ignore_errors=True)
-            except:
-                pass
-            self.user_data_dir = None
-    
-    def run(self):
-        """Main worker flow"""
-        try:
-            self.log(f"Processing: {self.email}", Colors.HEADER, "🚀 ")
-            
-            if not self.setup_driver():
-                return False
-            if not self.import_cookies():
-                return False
-            
-            enroll_data = self.enroll_mfa()
-            if not enroll_data:
-                return False
-            
-            if enroll_data.get("status") == "already_enabled":
-                self.log(f"MFA enabled but no 2FA key in Excel. Disabling to re-enroll...", Colors.WARNING, "⚠️ ")
-                if self.disable_mfa():
-                    self.log(f"MFA disabled for {self.email}. Will re-enroll on retry.", Colors.SUCCESS, "✅ ")
-                else:
-                    self.log(f"Failed to disable MFA for {self.email}", Colors.ERROR, "❌ ")
-                return False  # Return False to trigger retry → re-enroll with new key
-
-            totp_secret = self.activate_mfa(enroll_data)
-            if not totp_secret:
-                return False
-            
-            self.save_to_excel(totp_secret)
-            
-            self.log(f"✅ MFA enabled for {self.email}", Colors.SUCCESS, "🎉 ")
-            return True
-            
-        except Exception as e:
-            self.log(f"Error in worker: {e}", Colors.ERROR, "❌ ")
-            return False
-        finally:
-            self.cleanup()
-
-
-def load_mfa_accounts(excel_file):
-    """Load accounts for MFA from Excel"""
-    wb = load_workbook(excel_file)
-    ws = wb.active
-    
-    accounts = []
-    skipped_count = 0
-    
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if len(row) < 2:
-            continue
-        
-        account = row[0] if row[0] else ""
-        cookie = row[1] if len(row) > 1 and row[1] else ""
-        two_fa = row[4] if len(row) > 4 and row[4] else ""  # Column E = 2FA Secret
-        
-        if not account or not cookie:
-            continue
-        
-        if two_fa:
-            skipped_count += 1
-            continue
-        
-        if ":" in str(account):
-            parts = str(account).split(":", 1)
-            email = parts[0]
-            password = parts[1] if len(parts) > 1 else ""
-        else:
-            email = str(account)
-            password = ""
-        
-        accounts.append({
-            "row_index": row_idx,
-            "email": email,
-            "password": password,
-            "cookie": cookie
-        })
-    
-    if skipped_count > 0:
-        print(f"{Colors.WARNING}Skipped {skipped_count} accounts (already have 2fa){Colors.RESET}")
-    
-    return accounts
-
-
-def load_mfa_accounts_recheck(excel_file, reverse_order=False):
-    """Load accounts that already have MFA for rechecking"""
-    wb = load_workbook(excel_file)
-    ws = wb.active
-    
-    accounts = []
-    
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if len(row) < 2:
-            continue
-        
-        account = row[0] if row[0] else ""
-        cookie = row[1] if len(row) > 1 and row[1] else ""
-        two_fa = row[4] if len(row) > 4 and row[4] else ""  # Column E = 2FA Secret
-        
-        if not account or not cookie:
-            continue
-        
-        # For recheck, we ONLY want accounts that HAVE 2FA secret
-        if not two_fa:
-            continue
-        
-        if ":" in str(account):
-            parts = str(account).split(":", 1)
-            email = parts[0]
-            password = parts[1] if len(parts) > 1 else ""
-        else:
-            email = str(account)
-            password = ""
-        
-        accounts.append({
-            "row_index": row_idx,
-            "email": email,
-            "password": password,
-            "cookie": cookie
-        })
-    
-    if reverse_order:
-        accounts.reverse()
-        
-    return accounts
-
-
-def run_mfa_worker(
-    thread_id,
-    account,
-    excel_file,
-    stop_event=None,
-    thread_delay=2,
-    slot_index=0,
-    is_first_batch=True,
-    oauth2_account=None,
-    recheck_mode=False,
-    register_worker=None,
-    unregister_worker=None,
-):
-    """Run MFA worker thread with retries and staggered start
-    
-    Delay logic:
-    - First batch: Thread 1 = 0s, Thread 2 = delay, Thread 3 = delay × 2
-    - Subsequent batches: Thread 1 = 5s, Thread 2 = 5s + delay, Thread 3 = 5s + delay × 2
-    """
-    base_delay = 0 if is_first_batch else 5  # 5s base delay after first batch
-    slot_delay = slot_index * thread_delay    # slot_index: 0, 1, 2 for 3 threads
-    total_delay = base_delay + slot_delay
-    
-    if total_delay > 0:
-        safe_print(thread_id, f"Waiting {total_delay:.1f}s before starting...", Colors.INFO, "⏳ ")
-        # Sleep in intervals to check stop_event
-        for _ in range(int(total_delay * 2)):
-            if stop_event and stop_event.is_set():
-                return False, account["email"]
-            time.sleep(0.5)
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        if stop_event and stop_event.is_set():
-            return False, account["email"]
-            
-        worker = MFAWorker(
-            thread_id=thread_id,
-            row_index=account["row_index"],
-            email=account["email"],
-            password=account["password"],
-            cookie_json=account["cookie"],
-            excel_file=excel_file,
-            oauth2_account=oauth2_account,
-            recheck_mode=recheck_mode
-        )
-        worker.stop_event = stop_event
-
-        if callable(register_worker):
-            try:
-                register_worker(worker)
-            except Exception:
-                pass
-
-        try:
-            result = worker.run()
-        finally:
-            if callable(unregister_worker):
-                try:
-                    unregister_worker(worker)
-                except Exception:
-                    pass
-
-        if result:
-            return True, account["email"]
-            
-        if attempt < max_retries - 1:
-            if stop_event and stop_event.is_set():
-                return False, account["email"]
-            print(f"Retry {attempt+1}/{max_retries} for {account['email']}...")
-            time.sleep(3)
-            
-    return False, account["email"]
-
-
-# ============================================================================
 # MODULE 4: CHECKOUT CAPTURE
 # ============================================================================
 
 class CheckoutCaptureWorker:
     """Worker for capturing checkout links from existing accounts"""
     
-    def __init__(self, thread_id, email, cookie_json, excel_file, row_index, checkout_type="Plus"):
+    def __init__(self, thread_id, email, access_token, excel_file, row_index, checkout_type="Plus"):
         self.thread_id = thread_id
         self.email = email
-        self.cookie_json = cookie_json
+        self.access_token = access_token
         self.excel_file = excel_file
         self.row_index = row_index
         self.checkout_type = checkout_type  # "Plus", "Business", or "Both"
@@ -3720,34 +1531,18 @@ class CheckoutCaptureWorker:
             return False
     
     def run(self):
-        """Run the checkout capture flow via API (no browser needed)"""
+        """Run the checkout capture flow via API"""
         try:
-            self.log(f"Starting checkout capture for {self.email}", Colors.HEADER, "🚀 ")
+            self.log(f"Checkout capture for {self.email}", Colors.HEADER, "🚀 ")
 
-            
-            # Parse cookies from JSON string
-            try:
-                cookies_list = json.loads(self.cookie_json)
-            except json.JSONDecodeError:
-                self.log("Invalid cookie JSON", Colors.ERROR, "❌ ")
+            access_token = self.access_token
+            if not access_token:
+                self.log("No access token", Colors.ERROR, "❌ ")
                 return False
             
-            # Convert cookies to header string
-            parts = []
-            for c in cookies_list:
-                name = c.get("name", "")
-                value = c.get("value", "")
-                if name:
-                    parts.append(f"{name}={value}")
-            cookie_header = "; ".join(parts)
+            self.log(f"Using access token: {access_token[:30]}...", Colors.SUCCESS, "🔑 ")
             
-            if not cookie_header:
-                self.log("No cookies to send", Colors.ERROR, "❌ ")
-                return False
-            
-            # Step 1: Get accessToken from cookies via API
-            self.log("Fetching accessToken from cookies...", Colors.INFO, "🔑 ")
-            
+            # Fingerprint for TLS
             os_windows = ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64"]
             os_mac = ["Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]
             
@@ -3758,40 +1553,6 @@ class CheckoutCaptureWorker:
             for ver in [108, 110, 117, 120]:
                 for os_val in os_windows + os_mac:
                     fp_list.append({"id": f"firefox_{ver}", "ua": f"Mozilla/5.0 ({os_val}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"})
-            
-            fp = random.choice(fp_list)
-            session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
-            lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
-            
-            headers = {
-                "User-Agent": fp["ua"],
-                "Accept": "*/*",
-                "Accept-Language": lang,
-                "Referer": "https://chatgpt.com/",
-                "Origin": "https://chatgpt.com",
-                "Cookie": cookie_header,
-            }
-            
-            time.sleep(random.uniform(0.3, 0.8))
-            resp = session.get("https://chatgpt.com/api/auth/session", headers=headers)
-            
-            if resp.status_code != 200:
-                self.log(f"Session API error: {resp.status_code}", Colors.ERROR, "❌ ")
-                return False
-            
-            try:
-                data = resp.json()
-            except Exception:
-                self.log("Session response not JSON", Colors.ERROR, "❌ ")
-                return False
-            
-            access_token = data.get("accessToken")
-            if not access_token:
-                self.log("No accessToken - cookie may be expired", Colors.ERROR, "❌ ")
-                return False
-            
-            user_email = data.get("user", {}).get("email", self.email)
-            self.log(f"Got accessToken for {user_email}", Colors.SUCCESS, "🔑 ")
             
             # Step 2: Call checkout API
             plus_url = None
@@ -3891,12 +1652,12 @@ def load_checkout_accounts(excel_file):
                 continue
             
             account = row[0] if row[0] else ""
-            cookie = row[1] if len(row) > 1 and row[1] else ""
+            access_token = row[1] if len(row) > 1 and row[1] else ""
             plus_url = row[2] if len(row) > 2 and row[2] else ""
             business_url = row[3] if len(row) > 3 and row[3] else ""
-            sold_status = row[5] if len(row) > 5 and row[5] else ""  # Column F (index 5)
+            sold_status = row[5] if len(row) > 5 and row[5] else ""
             
-            if not account or not cookie:
+            if not account or not access_token:
                 continue
             
             # Parse email from account
@@ -3912,7 +1673,7 @@ def load_checkout_accounts(excel_file):
                 "row_index": row_idx,
                 "email": email,
                 "account": account,
-                "cookie": cookie,
+                "access_token": access_token,
                 "plus_url": plus_url,
                 "business_url": business_url,
                 "sold_status": sold_status,
@@ -4504,7 +2265,6 @@ class App(ctk.CTk):
         )
         self.tabview.pack(fill="both", expand=True, padx=16, pady=16)
         self.tabview.add("🚀 Registration")
-        self.tabview.add("🔐 MFA Automation")
         self.tabview.add("💳 Checkout Capture")
         
         # Enhanced tab font
@@ -4514,7 +2274,6 @@ class App(ctk.CTk):
         )
 
         self.setup_registration_tab()
-        self.setup_mfa_tab()
         self.setup_checkout_tab()
         
         # --- RIGHT COLUMN: STATUS PANEL (GLASSMORPHISM STYLE) ---
@@ -4989,46 +2748,20 @@ class App(ctk.CTk):
         
         ctk.CTkFrame(adv_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
         
-        # Network + Email Mode (same row)
-        self.reg_network_email_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_network_email_frame.pack(fill="x", padx=16, pady=(6, 4))
+        # ═══ ROW 1: Email Mode + Password (same row) ═══
+        self.reg_email_pass_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        self.reg_email_pass_frame.pack(fill="x", padx=16, pady=(6, 4))
         
         ctk.CTkLabel(
-            self.reg_network_email_frame, 
-            text="🌐  Network:", 
+            self.reg_email_pass_frame, 
+            text="📧  Email:", 
             font=self.font_label,
             text_color=self.colors["text_secondary"]
         ).pack(side="left", padx=(0, 6))
         
-        self.reg_network_var = ctk.StringVar(value="Fast")
-        self.reg_network_menu = ctk.CTkOptionMenu(
-            self.reg_network_email_frame, 
-            values=["Fast", "VPN/Slow"], 
-            variable=self.reg_network_var, 
-            font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            button_color=self.colors["accent_tertiary"],
-            button_hover_color=self.colors["accent_primary"],
-            dropdown_fg_color=self.colors["bg_elevated"],
-            dropdown_hover_color=self.colors["bg_card_hover"],
-            dropdown_text_color=self.colors["text_primary"],
-            text_color=self.colors["text_primary"],
-            width=110,
-            height=32,
-            corner_radius=8
-        )
-        self.reg_network_menu.pack(side="left")
-        
-        ctk.CTkLabel(
-            self.reg_network_email_frame, 
-            text="📧  Email:", 
-            font=self.font_label,
-            text_color=self.colors["text_secondary"]
-        ).pack(side="left", padx=(20, 6))
-        
         self.reg_email_mode_var = ctk.StringVar(value="TinyHost")
         self.reg_email_mode_menu = ctk.CTkOptionMenu(
-            self.reg_network_email_frame, 
+            self.reg_email_pass_frame, 
             values=["TinyHost", "OAuth2"], 
             variable=self.reg_email_mode_var,
             command=self.on_email_mode_change,
@@ -5040,67 +2773,69 @@ class App(ctk.CTk):
             dropdown_hover_color=self.colors["bg_card_hover"],
             dropdown_text_color=self.colors["text_primary"],
             text_color=self.colors["text_primary"],
-            width=110,
+            width=100,
             height=32,
             corner_radius=8
         )
         self.reg_email_mode_menu.pack(side="left")
         
-        # OAuth2 status label (shows loaded accounts count)
+        # OAuth2 status label
         self.reg_oauth2_status = ctk.CTkLabel(
-            self.reg_network_email_frame,
+            self.reg_email_pass_frame,
             text="",
             font=ctk.CTkFont(size=11),
             text_color=self.colors["text_muted"]
         )
-        self.reg_oauth2_status.pack(side="left", padx=(12, 0))
+        self.reg_oauth2_status.pack(side="left", padx=(8, 0))
         
         # OAuth2 Refresh button
         self.reg_oauth2_refresh = ctk.CTkButton(
-            self.reg_network_email_frame,
+            self.reg_email_pass_frame,
             text="🔄",
-            width=36,
+            width=32,
             height=32,
-            font=ctk.CTkFont(size=18),
+            font=ctk.CTkFont(size=16),
             fg_color=self.colors["bg_elevated"],
             hover_color=self.colors["bg_card_hover"],
             corner_radius=6,
             command=self.refresh_oauth2_accounts
         )
-        self.reg_oauth2_refresh.pack(side="left", padx=(8, 0))
+        self.reg_oauth2_refresh.pack(side="left", padx=(4, 0))
         self.reg_oauth2_refresh.pack_forget()  # Hidden by default
         
-        # Password Config
-
-        self.reg_password_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_password_frame.pack(fill="x", padx=16, pady=(4, 6))
+        # Separator
+        ctk.CTkLabel(
+            self.reg_email_pass_frame,
+            text="│",
+            font=ctk.CTkFont(size=14),
+            text_color=self.colors["border_subtle"]
+        ).pack(side="left", padx=(12, 12))
         
         ctk.CTkLabel(
-            self.reg_password_frame, 
-            text="🔑  Password:", 
+            self.reg_email_pass_frame, 
+            text="🔑", 
             font=self.font_label,
             text_color=self.colors["text_secondary"]
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 6))
         
         self.reg_password_var = ctk.StringVar(value=DEFAULT_PASSWORD)
         self.reg_password_entry = ctk.CTkEntry(
-            self.reg_password_frame,
+            self.reg_email_pass_frame,
             textvariable=self.reg_password_var,
             font=self.font_label,
             fg_color=self.colors["bg_elevated"],
             border_color=self.colors["border_subtle"],
             text_color=self.colors["text_primary"],
-            width=180,
+            width=140,
             height=32,
             corner_radius=8,
-            show="•"  # Hide password by default
+            show="•"
         )
         self.reg_password_entry.pack(side="left")
         
-        # Show/Hide password button
         self.password_visible = False
         self.reg_password_toggle = ctk.CTkButton(
-            self.reg_password_frame,
+            self.reg_email_pass_frame,
             text="👁",
             width=32,
             height=32,
@@ -5111,32 +2846,22 @@ class App(ctk.CTk):
         )
         self.reg_password_toggle.pack(side="left", padx=(4, 0))
         
-        # Save password button
         self.reg_password_save = ctk.CTkButton(
-            self.reg_password_frame,
-            text="💾 Save",
-            width=60,
+            self.reg_email_pass_frame,
+            text="💾",
+            width=32,
             height=32,
             fg_color=self.colors["accent_tertiary"],
             hover_color=self.colors["accent_primary"],
             corner_radius=8,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=14),
             command=self.save_password_to_file
         )
-        self.reg_password_save.pack(side="left", padx=(8, 0))
+        self.reg_password_save.pack(side="left", padx=(4, 0))
         
-        # Password info
-        self.reg_password_info = ctk.CTkLabel(
-            self.reg_password_frame,
-            text="Auto-saved to code",
-            font=ctk.CTkFont(size=10),
-            text_color=self.colors["text_muted"]
-        )
-        self.reg_password_info.pack(side="right")
-        
-        # ═══ PROXY CONFIGURATION (single compact row) ═══
+        # ═══ ROW 2: Proxy (compact) ═══
         self.reg_proxy_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_proxy_frame.pack(fill="x", padx=16, pady=(4, 6))
+        self.reg_proxy_frame.pack(fill="x", padx=16, pady=(4, 4))
         
         self.reg_proxy_var = ctk.BooleanVar(value=PROXY_ENABLED)
         self.reg_proxy_switch = ctk.CTkSwitch(
@@ -5176,7 +2901,6 @@ class App(ctk.CTk):
         )
         self.reg_proxy_entry.pack(side="left", padx=(8, 0))
         
-        # Save proxy button
         self.reg_proxy_save = ctk.CTkButton(
             self.reg_proxy_frame,
             text="💾",
@@ -5190,7 +2914,6 @@ class App(ctk.CTk):
         )
         self.reg_proxy_save.pack(side="left", padx=(6, 0))
         
-        # Proxy status info (tiny, right-aligned)
         self.reg_proxy_info = ctk.CTkLabel(
             self.reg_proxy_frame,
             text="✓" if PROXY_ENABLED and PROXY_STRING else "",
@@ -5199,19 +2922,18 @@ class App(ctk.CTk):
         )
         self.reg_proxy_info.pack(side="left", padx=(4, 0))
         
-        # Set initial proxy input state based on switch
         proxy_state = "normal" if PROXY_ENABLED else "disabled"
         self.reg_proxy_entry.configure(state=proxy_state)
         self.reg_proxy_save.configure(state=proxy_state)
         
-        # Checkout Switch
-        self.reg_adv_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
-        self.reg_adv_frame.pack(fill="x", padx=16, pady=(6, 10))
+        # ═══ ROW 3: Checkout + 2FA (same row) ═══
+        self.reg_toggles_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+        self.reg_toggles_frame.pack(fill="x", padx=16, pady=(4, 10))
         
         self.reg_checkout_var = ctk.BooleanVar(value=False)
         self.reg_checkout_switch = ctk.CTkSwitch(
-            self.reg_adv_frame, 
-            text="  Capture Checkout Link",
+            self.reg_toggles_frame, 
+            text="  Checkout",
             variable=self.reg_checkout_var,
             font=self.font_label,
             text_color=self.colors["text_secondary"],
@@ -5223,16 +2945,9 @@ class App(ctk.CTk):
         )
         self.reg_checkout_switch.pack(side="left")
         
-        # Checkout Type dropdown frame
-        self.reg_checkout_type_frame = ctk.CTkFrame(self.reg_adv_frame, fg_color="transparent")
-        self.reg_checkout_type_frame.pack(side="left", padx=(20, 0))
-        
-        ctk.CTkLabel(
-            self.reg_checkout_type_frame,
-            text="Type:",
-            font=self.font_label,
-            text_color=self.colors["text_muted"]
-        ).pack(side="left", padx=(0, 8))
+        # Checkout Type dropdown (inline)
+        self.reg_checkout_type_frame = ctk.CTkFrame(self.reg_toggles_frame, fg_color="transparent")
+        self.reg_checkout_type_frame.pack(side="left", padx=(8, 0))
         
         self.reg_checkout_type_var = ctk.StringVar(value="Plus")
         self.reg_checkout_type_dropdown = ctk.CTkOptionMenu(
@@ -5247,20 +2962,34 @@ class App(ctk.CTk):
             dropdown_hover_color=self.colors["bg_card_hover"],
             dropdown_text_color=self.colors["text_primary"],
             text_color=self.colors["text_primary"],
-            width=100,
+            width=90,
             height=32,
             corner_radius=8
         )
         self.reg_checkout_type_dropdown.pack(side="left")
-        self.reg_checkout_type_frame.pack_forget()  # Hide initially
+        self.reg_checkout_type_frame.pack_forget()  # Hidden initially
         
-        # Info tooltip
+        # Separator
         ctk.CTkLabel(
-            self.reg_adv_frame,
-            text="💳",
-            font=ctk.CTkFont(size=16),
-            text_color=self.colors["text_muted"]
-        ).pack(side="right")
+            self.reg_toggles_frame,
+            text="│",
+            font=ctk.CTkFont(size=14),
+            text_color=self.colors["border_subtle"]
+        ).pack(side="left", padx=(16, 16))
+        
+        self.reg_2fa_var = ctk.BooleanVar(value=False)
+        self.reg_2fa_switch = ctk.CTkSwitch(
+            self.reg_toggles_frame,
+            text="  2FA (TOTP)",
+            variable=self.reg_2fa_var,
+            font=self.font_label,
+            text_color=self.colors["text_secondary"],
+            fg_color=self.colors["bg_elevated"],
+            progress_color=self.colors["accent_purple"],
+            button_color=self.colors["text_primary"],
+            button_hover_color=self.colors["accent_purple"],
+        )
+        self.reg_2fa_switch.pack(side="left")
         
         # ═══ ACTION BUTTONS ═══
         self.reg_btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -5306,306 +3035,6 @@ class App(ctk.CTk):
             leave={"fg_color": self.colors["accent_green"]}, 
             duration_ms=150
         )
-
-    def setup_mfa_tab(self):
-        tab = self.tabview.tab("🔐 MFA Automation")
-        tab.grid_columnconfigure(0, weight=1)
-        
-        # ═══ MFA SETTINGS CARD ═══
-        mfa_settings_card = ctk.CTkFrame(
-            tab, 
-            fg_color=self.colors["bg_card"],
-            corner_radius=16,
-            border_width=1,
-            border_color=self.colors["border_subtle"]
-        )
-        mfa_settings_card.pack(fill="x", padx=8, pady=(4, 8))
-        
-        # Card Header
-        mfa_header = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
-        mfa_header.pack(fill="x", padx=16, pady=(10, 8))
-        
-        ctk.CTkLabel(
-            mfa_header, 
-            text="🛡️  MFA Configuration", 
-            font=ctk.CTkFont(family="Segoe UI Semibold", size=14, weight="bold"),
-            text_color=self.colors["text_primary"]
-        ).pack(side="left")
-        
-        # Badge
-        ctk.CTkLabel(
-            mfa_header,
-            text="2FA",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=self.colors["accent_secondary"],
-            corner_radius=6,
-            text_color="white",
-            width=36, height=20
-        ).pack(side="right")
-        
-        # Divider
-        ctk.CTkFrame(mfa_settings_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
-        
-        # Mode Selection (Grid Layout for better organization)
-        self.mfa_mode_frame = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
-        self.mfa_mode_frame.pack(fill="x", padx=16, pady=10)
-        
-        # Operation Mode (Enroll vs Recheck)
-        ctk.CTkLabel(
-            self.mfa_mode_frame, 
-            text="Operation Mode", 
-            font=self.font_label,
-            text_color=self.colors["text_secondary"]
-        ).grid(row=0, column=0, padx=(0, 16), pady=4, sticky="w")
-        
-        self.mfa_op_mode_var = ctk.StringVar(value="Enroll New")
-        self.mfa_op_mode_menu = ctk.CTkOptionMenu(
-            self.mfa_mode_frame, 
-            values=["Enroll New", "Recheck Status"], 
-            variable=self.mfa_op_mode_var, 
-            command=self.update_mfa_ui_state,
-            width=180,
-            height=36,
-            font=self.font_label,
-            dropdown_font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            button_color=self.colors["accent_tertiary"],
-            button_hover_color=self.colors["accent_secondary"],
-            dropdown_fg_color=self.colors["bg_card"],
-            dropdown_hover_color=self.colors["bg_card_hover"],
-            corner_radius=10
-        )
-        self.mfa_op_mode_menu.grid(row=0, column=1, pady=4, sticky="e")
-        
-        # Execution Mode (Sequential vs Multithread)
-        ctk.CTkLabel(
-            self.mfa_mode_frame, 
-            text="Execution Mode", 
-            font=self.font_label,
-            text_color=self.colors["text_secondary"]
-        ).grid(row=1, column=0, padx=(0, 16), pady=4, sticky="w")
-        
-        self.mfa_mode_var = ctk.StringVar(value="Sequential")
-        self.mfa_mode_menu = ctk.CTkOptionMenu(
-            self.mfa_mode_frame, 
-            values=["Sequential", "Multithread"], 
-            variable=self.mfa_mode_var, 
-            command=self.toggle_mfa_inputs, 
-            width=180,
-            height=36,
-            font=self.font_label,
-            dropdown_font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            button_color=self.colors["accent_tertiary"],
-            button_hover_color=self.colors["accent_secondary"],
-            dropdown_fg_color=self.colors["bg_card"],
-            dropdown_hover_color=self.colors["bg_card_hover"],
-            corner_radius=10
-        )
-        self.mfa_mode_menu.grid(row=1, column=1, pady=4, sticky="e")
-        
-        self.mfa_mode_frame.grid_columnconfigure(0, weight=1)
-        
-        # Threads Input
-        self.mfa_threads_frame = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
-        self.mfa_threads_frame.pack(fill="x", padx=16, pady=(0, 10))
-        
-        self.mfa_threads_label = ctk.CTkLabel(
-            self.mfa_threads_frame, 
-            text="Thread Count", 
-            font=self.font_label,
-            text_color=self.colors["text_secondary"]
-        )
-        self.mfa_threads_label.pack(side="left", padx=(0, 16))
-        
-        # Thread limit badge
-        self.thread_limit_badge = ctk.CTkLabel(
-            self.mfa_threads_frame,
-            text="max 5",
-            font=ctk.CTkFont(size=9),
-            text_color=self.colors["text_muted"]
-        )
-        self.thread_limit_badge.pack(side="left")
-        
-        self.mfa_threads_entry = ctk.CTkEntry(
-            self.mfa_threads_frame, 
-            placeholder_text="1", 
-            width=180,
-            height=36,
-            font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            border_color=self.colors["border_subtle"],
-            corner_radius=10
-        )
-        self.mfa_threads_entry.insert(0, "1")
-        self.mfa_threads_entry.pack(side="right")
-        
-        # Thread Delay Input (only visible in Multithread mode)
-        self.mfa_delay_frame = ctk.CTkFrame(mfa_settings_card, fg_color="transparent")
-        self.mfa_delay_frame.pack(fill="x", padx=16, pady=(0, 10))
-        self.mfa_delay_frame.pack_forget()  # Hidden by default (Sequential mode)
-        
-        self.mfa_delay_label = ctk.CTkLabel(
-            self.mfa_delay_frame, 
-            text="Delay Between Browsers", 
-            font=self.font_label,
-            text_color=self.colors["text_secondary"]
-        )
-        self.mfa_delay_label.pack(side="left", padx=(0, 8))
-        
-        # Delay unit badge
-        self.mfa_delay_unit_badge = ctk.CTkLabel(
-            self.mfa_delay_frame,
-            text="seconds",
-            font=ctk.CTkFont(size=10),
-            text_color=self.colors["text_muted"]
-        )
-        self.mfa_delay_unit_badge.pack(side="left")
-        
-        self.mfa_delay_entry = ctk.CTkEntry(
-            self.mfa_delay_frame, 
-            placeholder_text="2", 
-            width=80,
-            height=36,
-            font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            border_color=self.colors["border_subtle"],
-            corner_radius=10
-        )
-        self.mfa_delay_entry.insert(0, "3")
-        self.mfa_delay_entry.pack(side="right")
-        
-        # Reverse Order Checkbox (Integrated)
-        self.mfa_recheck_reverse_var = ctk.BooleanVar(value=False)
-        self.mfa_recheck_reverse_cb = ctk.CTkCheckBox(
-            mfa_settings_card,
-            text="Process Bottom-up (Newest First)",
-            variable=self.mfa_recheck_reverse_var,
-            font=self.font_label,
-            fg_color=self.colors["accent_tertiary"],
-            hover_color=self.colors["accent_primary"],
-            text_color=self.colors["text_secondary"]
-        )
-        self.mfa_recheck_reverse_cb.pack(fill="x", padx=16, pady=(0, 16))
-        
-        
-        # Info tooltip for delay
-        self.mfa_delay_info = ctk.CTkLabel(
-            self.mfa_delay_frame,
-            text="ℹ️",
-            font=ctk.CTkFont(size=14),
-            text_color=self.colors["text_muted"]
-        )
-        self.mfa_delay_info.pack(side="right", padx=(0, 8))
-        
-        # ═══ INFO CARD ═══
-        info_card = ctk.CTkFrame(
-            tab, 
-            fg_color=self.colors["bg_card"],
-            corner_radius=16,
-            border_width=1,
-            border_color="#3b82f6"  # Blue tint
-        )
-        info_card.pack(fill="x", padx=8, pady=(0, 8))
-        
-        info_content = ctk.CTkFrame(info_card, fg_color="transparent")
-        info_content.pack(fill="x", padx=16, pady=10)
-        
-        ctk.CTkLabel(
-            info_content,
-            text="ℹ️",
-            font=ctk.CTkFont(size=18),
-            text_color=self.colors["info"]
-        ).pack(side="left", padx=(0, 12))
-        
-        ctk.CTkLabel(
-            info_content,
-            text="MFA will be enabled for accounts in chatgpt.xlsx\nwithout existing 2FA configuration.",
-            font=ctk.CTkFont(size=12),
-            text_color=self.colors["text_secondary"],
-            justify="left"
-        ).pack(side="left")
-        
-        # ═══ ACTION BUTTONS ═══
-        self.mfa_btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        self.mfa_btn_frame.pack(fill="x", padx=8, pady=(8, 4))
-        
-        # Start Button
-        # Start Button
-        self.mfa_start_btn = GlowButton(
-            self.mfa_btn_frame, 
-            text="🔐  START MFA AUTOMATION", 
-            command=self.start_mfa_wrapper, 
-            fg_color=self.colors["accent_primary"], 
-            hover_color="#33ddff",
-            text_color="#0a0a0a",
-            height=52, 
-            corner_radius=14,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-            glow_color=self.colors["accent_primary"]
-        )
-        self.mfa_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        
-        # Stop Button
-        self.mfa_stop_btn = ctk.CTkButton(
-            self.mfa_btn_frame, 
-            text="⏹", 
-            command=self.stop_process, 
-            fg_color=self.colors["bg_card"], 
-            border_width=2, 
-            border_color=self.colors["error"], 
-            text_color=self.colors["error"], 
-            hover_color="#2a1515", 
-            width=52,
-            height=52, 
-            corner_radius=14,
-            font=ctk.CTkFont(size=18), 
-            state="disabled"
-        )
-        self.mfa_stop_btn.pack(side="right")
-
-        # Enhanced Hovers
-        self.motion.hover(
-            self.mfa_start_btn, 
-            enter={"fg_color": "#66f0ff"}, 
-            leave={"fg_color": self.colors["accent_primary"]}, 
-            duration_ms=150
-        )
-        
-        # Initial State
-        # Initial State
-        self.toggle_mfa_inputs("Sequential")
-        self.update_mfa_ui_state("Enroll New")
-
-    def update_mfa_ui_state(self, choice):
-        """Update UI based on MFA Operation Mode"""
-        mode = self.mfa_op_mode_var.get()
-        if mode == "Recheck Status":
-            self.mfa_start_btn.configure(
-                text="🔄  START RECHECK_PROCESS",
-                fg_color=self.colors["accent_purple"],
-                glow_color=self.colors["accent_purple"],
-                hover_color="#9933ff"
-            )
-            # Show reverse checkbox (append to bottom of card)
-            self.mfa_recheck_reverse_cb.pack(fill="x", padx=16, pady=(0, 16))
-        else:
-            self.mfa_start_btn.configure(
-                text="🔐  START MFA AUTOMATION",
-                fg_color=self.colors["accent_primary"],
-                glow_color=self.colors["accent_primary"],
-                hover_color="#33ddff"
-            )
-            # Hide reverse checkbox
-            self.mfa_recheck_reverse_cb.pack_forget()
-            
-    def start_mfa_wrapper(self):
-        """Wrapper to route start button to correct function"""
-        mode = self.mfa_op_mode_var.get()
-        if mode == "Recheck Status":
-            self.start_mfa_recheck_thread()
-        else:
-            self.start_mfa_thread()
 
     def setup_checkout_tab(self):
         """Setup the Checkout Capture tab with account selection table"""
@@ -6117,132 +3546,6 @@ class App(ctk.CTk):
             item["var"].set(False)
         self.update_checkout_selection_count()
     
-    def start_mfa_recheck_thread(self):
-        """Start MFA recheck in thread"""
-        threading.Thread(target=self.run_mfa_recheck).start()
-        
-    def run_mfa_recheck(self):
-        """Run MFA recheck process"""
-        if self.process_running:
-            _toast(self, "⚠️ Another process is already running!", toast_type="warning")
-            return
-            
-        excel_file = "chatgpt.xlsx"
-        if not os.path.exists(excel_file):
-            _toast(self, "⚠️ chatgpt.xlsx not found!", toast_type="error")
-            return
-            
-        reverse_order = self.mfa_recheck_reverse_var.get()
-        accounts = load_mfa_accounts_recheck(excel_file, reverse_order=reverse_order)
-        
-        if not accounts:
-            _toast(self, "⚠️ No accounts with MFA found to recheck!", toast_type="warning")
-            return
-            
-        self.lock_ui(True)
-        self.stop_event.clear()
-        
-        # Reuse existing MFA settings for threading
-        try:
-            threads = int(self.mfa_threads_entry.get())
-            threads = max(1, min(threads, 5))
-        except:
-            threads = 1
-            
-        try:
-            thread_delay = int(self.mfa_delay_entry.get())
-        except:
-            thread_delay = 2
-        
-        mode_text = "Bottom-up" if reverse_order else "Top-down"
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting MFA Recheck | Mode: {mode_text} | Accounts: {len(accounts)} | Threads: {threads}")
-        self.update_status("RUNNING", self.colors["accent_purple"], f"Rechecking {len(accounts)} accounts ({mode_text})...")
-        
-        self.update_stats(0, 0)
-        success_count = 0
-        fail_count = 0
-        count_lock = threading.Lock()
-        
-        # Setup OAuth2 if needed
-        oauth2_system_acc = None
-        if self.reg_email_mode_var.get() == "OAuth2":
-            oauth2_system_acc = self.oauth2_accounts[0] if self.oauth2_accounts else None
-        
-        def run_worker_wrapper(thread_id, account, idx, start_delay):
-            nonlocal success_count, fail_count
-            
-            if start_delay > 0:
-                # Sleep in intervals
-                for _ in range(int(start_delay * 2)):
-                    if self.stop_event.is_set():
-                        return False, account["email"]
-                    time.sleep(0.5)
-            
-            # Pass recheck_mode=True
-            result, email = run_mfa_worker(
-                thread_id, 
-                account, 
-                excel_file, 
-                self.stop_event, 
-                0, 
-                0, 
-                True, 
-                oauth2_system_acc,
-                recheck_mode=True,
-                register_worker=self._register_worker,
-                unregister_worker=self._unregister_worker,
-            )
-            
-            with count_lock:
-                if result:
-                    nonlocal success_count
-                    success_count += 1
-                else:
-                    nonlocal fail_count
-                    fail_count += 1
-                self.update_stats(success_count, fail_count)
-            
-            return result, email
-            
-        # Run logic (similar to regular MFA but calling wrapper)
-        if len(accounts) >= 2 and threads > 1:
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
-            self._register_executor(executor)
-            try:
-                futures = []
-                for idx, account in enumerate(accounts):
-                    if self.stop_event.is_set():
-                        break
-                    
-                    slot_idx = idx % threads
-                    start_delay = slot_idx * thread_delay if idx < threads else 0 # Simple delay for start
-                    
-                    thread_id = slot_idx + 1
-                    future = executor.submit(run_worker_wrapper, thread_id, account, idx, start_delay)
-                    futures.append(future)
-                
-                for future in concurrent.futures.as_completed(futures):
-                    if self.stop_event.is_set(): break
-                    try: future.result()
-                    except: pass
-            finally:
-                try:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
-                self._unregister_executor(executor)
-        else:
-            # Sequential
-            for idx, account in enumerate(accounts):
-                if self.stop_event.is_set(): break
-                self.update_status("RUNNING", self.colors["accent_purple"], f"Rechecking {idx+1}/{len(accounts)}: {account['email']}")
-                run_worker_wrapper(1, account, idx, 0)
-
-        # Finish
-        self.lock_ui(False)
-        self.update_status("COMPLETED", None, f"Recheck: {success_count} Success | {fail_count} Failed")
-        _toast(self, f"Recheck Complete: {success_count} passed", toast_type="success")
-
     def start_checkout_capture_thread(self):
         """Start checkout capture in thread"""
         threading.Thread(target=self.run_checkout_capture).start()
@@ -6307,7 +3610,7 @@ class App(ctk.CTk):
                 worker = CheckoutCaptureWorker(
                     thread_id=thread_id,
                     email=account["email"],
-                    cookie_json=account["cookie"],
+                    access_token=account["access_token"],
                     excel_file=excel_file,
                     row_index=account["row_index"],
                     checkout_type=checkout_type
@@ -6389,7 +3692,7 @@ class App(ctk.CTk):
                 worker = CheckoutCaptureWorker(
                     thread_id=1,
                     email=account["email"],
-                    cookie_json=account["cookie"],
+                    access_token=account["access_token"],
                     excel_file=excel_file,
                     row_index=account["row_index"],
                     checkout_type=checkout_type
@@ -6556,18 +3859,6 @@ class App(ctk.CTk):
             self.reg_threads_frame.pack(side="right", padx=(20, 0))
             self.reg_delay_frame.pack(fill="x", padx=16, pady=(0, 10), after=self.reg_count_frame)
 
-    def toggle_mfa_inputs(self, choice):
-        if choice == "Sequential":
-            self.mfa_threads_label.configure(text="Threads (Disabled):")
-            self.mfa_threads_entry.configure(state="disabled")
-            # Hide delay input for Sequential mode
-            self.mfa_delay_frame.pack_forget()
-        else:
-            self.mfa_threads_label.configure(text="Threads (Max 5):")
-            self.mfa_threads_entry.configure(state="normal")
-            # Show delay input for Multithread mode
-            self.mfa_delay_frame.pack(fill="x", padx=16, pady=(0, 10), after=self.mfa_threads_frame)
-    
     def toggle_checkout_type(self):
         """Show/hide checkout type dropdown based on switch state"""
         if self.reg_checkout_var.get():
@@ -6688,13 +3979,6 @@ class App(ctk.CTk):
             DEFAULT_PASSWORD = new_password
             
             _toast(self, f"✅ Password saved: {new_password}", toast_type="success")
-            self.reg_password_info.configure(text="✓ Saved!", text_color=self.colors["accent_green"])
-            
-            # Reset info text after 2 seconds
-            self.after(2000, lambda: self.reg_password_info.configure(
-                text="Auto-saved to code", 
-                text_color=self.colors["text_muted"]
-            ))
             
         except Exception as e:
             _toast(self, f"❌ Failed to save: {str(e)}", toast_type="error")
@@ -6853,11 +4137,6 @@ class App(ctk.CTk):
                 text="⏳  PROCESSING...",
                 fg_color=self.colors["bg_elevated"]
             )
-            self.mfa_start_btn.configure(
-                state=state, 
-                text="⏳  PROCESSING...",
-                fg_color=self.colors["bg_elevated"]
-            )
             self.checkout_start_btn.configure(
                 state=state, 
                 text="⏳  PROCESSING...",
@@ -6869,11 +4148,6 @@ class App(ctk.CTk):
                 text="▶  START REGISTRATION",
                 fg_color=self.colors["accent_green"]
             )
-            self.mfa_start_btn.configure(
-                state=state, 
-                text="🔐  START MFA AUTOMATION",
-                fg_color=self.colors["accent_primary"]
-            )
             self.checkout_start_btn.configure(
                 state=state, 
                 text="💳  START CAPTURE",
@@ -6882,17 +4156,14 @@ class App(ctk.CTk):
         
         # Stop buttons
         self.reg_stop_btn.configure(state=stop_state)
-        self.mfa_stop_btn.configure(state=stop_state)
         self.checkout_stop_btn.configure(state=stop_state)
         
         # Animate stop button visibility
         if is_running:
             self.motion.color(self.reg_stop_btn, "border_color", self.colors["error"], duration_ms=200)
-            self.motion.color(self.mfa_stop_btn, "border_color", self.colors["error"], duration_ms=200)
             self.motion.color(self.checkout_stop_btn, "border_color", self.colors["error"], duration_ms=200)
         else:
             self.motion.color(self.reg_stop_btn, "border_color", self.colors["border_subtle"], duration_ms=200)
-            self.motion.color(self.mfa_stop_btn, "border_color", self.colors["border_subtle"], duration_ms=200)
             self.motion.color(self.checkout_stop_btn, "border_color", self.colors["border_subtle"], duration_ms=200)
         
         # Progress Bar (custom 60fps animation)
@@ -6904,13 +4175,13 @@ class App(ctk.CTk):
             
         # Lock inputs
         self.reg_mode_menu.configure(state=state)
-        self.mfa_mode_menu.configure(state=state)
+
         self.reg_count_entry.configure(state=state)
         self.reg_threads_entry.configure(state=state)
         self.reg_delay_entry.configure(state=state)
         self.reg_checkout_switch.configure(state=state)
         self.reg_checkout_type_dropdown.configure(state=state)
-        self.reg_network_menu.configure(state=state)
+        self.reg_2fa_switch.configure(state=state)
         self.checkout_type_menu.configure(state=state)
         self.checkout_refresh_btn.configure(state=state)
         self.checkout_select_all_btn.configure(state=state)
@@ -6936,15 +4207,36 @@ class App(ctk.CTk):
             self.reg_proxy_entry.configure(state=proxy_state)
             self.reg_proxy_save.configure(state=proxy_state)
         
-        if self.mfa_mode_var.get() == "Multithread":
-            self.mfa_threads_entry.configure(state=state)
-            self.mfa_delay_entry.configure(state=state)
+        
 
     def stop_process(self):
         self.stop_event.set()
         self.update_status("STOPPING", self.colors["warning"], "Force stopping now...")
         self._force_stop_all_runtime()
+        self._kill_chromium_processes()
         _toast(self, "⏹ Force stop sent (closing browsers now)", toast_type="warning")
+    
+    def _kill_chromium_processes(self):
+        """Kill any orphaned chromium processes spawned by patchright"""
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/IM', 'chromium.exe', '/T'],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+    
+    def on_closing(self):
+        """Clean shutdown: kill all browsers, release files, then destroy window"""
+        try:
+            self.stop_event.set()
+            self._force_stop_all_runtime()
+            self._kill_chromium_processes()
+        except Exception:
+            pass
+        finally:
+            self.destroy()
+            os._exit(0)  # Force exit to kill any remaining threads
 
     def _register_worker(self, worker):
         if not worker:
@@ -7048,10 +4340,10 @@ class App(ctk.CTk):
         self.update_stats(0, 0)
         
         # settings
-        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, NETWORK_MODE, oauth2_accounts, PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, ENABLE_2FA, oauth2_accounts, PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
         GET_CHECKOUT_LINK = self.reg_checkout_var.get()
         GET_CHECKOUT_TYPE = self.reg_checkout_type_var.get()
-        NETWORK_MODE = self.reg_network_var.get()
+        ENABLE_2FA = self.reg_2fa_var.get()
         
         # Apply proxy settings from GUI
         PROXY_ENABLED = self.reg_proxy_var.get()
@@ -7295,174 +4587,18 @@ class App(ctk.CTk):
             border_color=self.colors["border_subtle"]
         ))
 
-    def start_mfa_thread(self):
-        threading.Thread(target=self.run_mfa).start()
-    
-    def run_mfa(self):
-        self.lock_ui(True)
-        self.stop_event.clear()
-        self.update_stats(0, 0)
-        
-        mode = self.mfa_mode_var.get()
-        try:
-            threads = int(self.mfa_threads_entry.get())
-            threads = max(1, min(5, threads))
-        except:
-            threads = 1
-            
-        # Get thread delay (only for multithread mode)
-        try:
-            mfa_thread_delay = float(self.mfa_delay_entry.get())
-            if mfa_thread_delay < 0:
-                mfa_thread_delay = 2
-        except:
-            mfa_thread_delay = 2
-            
-        if mode == "Multithread":
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting MFA | Mode: {mode} | Threads: {threads} | Delay: {mfa_thread_delay}s")
-        else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting MFA | Mode: {mode}")
-        self.update_status("LOADING", self.colors["info"], "Loading accounts from Excel...")
-        
-        excel_file = "chatgpt.xlsx"
-        accounts = load_mfa_accounts(excel_file)
-        
-        if not accounts:
-            print("No suitable accounts found.")
-            self.lock_ui(False)
-            self.update_status("IDLE", self.colors["text_muted"], "No accounts found in Excel.")
-            _toast(self, "⚠️ No accounts found!", toast_type="warning")
-            return
-            
-        print(f"Found {len(accounts)} accounts.")
-        
-        # Load OAuth2 accounts for lookup (to enable code reading for OAuth2 emails)
-        oauth2_map = {}
-        if os.path.exists("oauth2.xlsx"):
-            try:
-                raw_oauth2 = load_oauth2_accounts_from_excel("oauth2.xlsx", skip_registered=False)
-                for acc in raw_oauth2:
-                    if acc.get('email'):
-                        oauth2_map[acc['email'].lower()] = acc
-                if len(oauth2_map) > 0:
-                    print(f"Loaded {len(oauth2_map)} OAuth2 accounts for reference.")
-            except Exception as e:
-                print(f"Error loading oauth2.xlsx: {e}")
-        
-        success_count = 0
-        fail_count = 0
-        
-        if mode == "Sequential":
-            for idx, account in enumerate(accounts):
-                if self.stop_event.is_set():
-                    break
-                    
-                self.update_status("RUNNING", self.colors["info"], f"🔐 {account['email'][:20]}... ({idx+1}/{len(accounts)})")
-                print(f"Processing {account['email']}...")
-                
-                # Get OAuth2 info if available
-                oauth2_acc = oauth2_map.get(account['email'].lower())
-                
-                try:
-                    result, email = run_mfa_worker(
-                        1,
-                        account,
-                        excel_file,
-                        self.stop_event,
-                        oauth2_account=oauth2_acc,
-                        register_worker=self._register_worker,
-                        unregister_worker=self._unregister_worker,
-                    )
-                    if result:
-                        success_count += 1
-                        print(f"✅ MFA Enabled: {email}")
-                    else:
-                        fail_count += 1
-                        print(f"❌ Failed: {email}")
-                except Exception as e:
-                    fail_count += 1
-                    print(f"Error: {e}")
-                
-                self.update_stats(success_count, fail_count)
-                
-                if idx < len(accounts) - 1:
-                    time.sleep(3)
-        else:
-            self.update_status("RUNNING", self.colors["info"], f"🔐 Running with {threads} threads (delay: {mfa_thread_delay}s)...")
-            executor = ThreadPoolExecutor(max_workers=threads)
-            self._register_executor(executor)
-            try:
-                futures = {}
-                for idx, account in enumerate(accounts):
-                    if self.stop_event.is_set():
-                        break
-                    
-                    # Get OAuth2 info if available
-                    oauth2_acc = oauth2_map.get(account['email'].lower())
-                    
-                    thread_id = (idx % threads) + 1
-                    slot_index = idx % threads           # 0, 1, 2 for 3 threads
-                    batch_number = idx // threads        # Which batch this account belongs to
-                    is_first_batch = (batch_number == 0) # First batch has no base delay
-                    # Pass slot-based delay parameters
-                    future = executor.submit(
-                        run_mfa_worker,
-                        thread_id,
-                        account,
-                        excel_file,
-                        self.stop_event,
-                        mfa_thread_delay,
-                        slot_index,
-                        is_first_batch,
-                        oauth2_acc,
-                        False,
-                        self._register_worker,
-                        self._unregister_worker,
-                    )
-                    futures[future] = account
-                
-                for future in as_completed(futures):
-                    if self.stop_event.is_set():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    try:
-                        result, email = future.result()
-                        if result:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                    except Exception as e:
-                        print(f"Error: {e}")
-                    
-                    self.update_stats(success_count, fail_count)
-            finally:
-                try:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
-                self._unregister_executor(executor)
 
-        final_msg = "COMPLETED" if not self.stop_event.is_set() else "STOPPED"
-        color = self.colors["success"] if not self.stop_event.is_set() else self.colors["warning"]
-        self.update_status(final_msg, color, f"🔐 MFA Success: {success_count} | Failed: {fail_count}")
-        print(f"\n{'🎉' if not self.stop_event.is_set() else '🛑'} MFA {final_msg}! Success: {success_count} | Failed: {fail_count}")
-        
-        # Show completion toast (schedule on main thread)
-        if not self.stop_event.is_set():
-            self.after(0, lambda: _toast(self, f"🔐 MFA enabled for {success_count} accounts!", toast_type="success"))
-        else:
-            self.after(0, lambda: _toast(self, f"⏹ MFA stopped. {success_count} completed", toast_type="warning"))
-        
-        self.lock_ui(False)
-        # Restore status with neutral color (like IDLE) - schedule on main thread
-        stopped = self.stop_event.is_set()
-        self.after(0, lambda: self.status_indicator.configure(
-            text=f"{'✓' if not stopped else '◼'} {final_msg}",
-            fg_color=self.colors["bg_elevated"],
-            border_color=self.colors["border_subtle"]
-        ))
+def _atexit_cleanup():
+    """Safety net: kill chromium on process exit"""
+    try:
+        subprocess.run(['taskkill', '/F', '/IM', 'chromium.exe', '/T'],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+atexit.register(_atexit_cleanup)
 
 if __name__ == "__main__":
     app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
-
