@@ -668,6 +668,7 @@ class ChatGPTAutoRegisterWorker:
         self.page = None
         self.proxy_bridge = None
         self.stop_event = None
+        self._pw_server_pid = None  # Playwright server PID for force kill
         self.max_retries = 2
         self.current_retry = 0
         
@@ -677,6 +678,36 @@ class ChatGPTAutoRegisterWorker:
 
     def cleanup_browser(self):
         """Close patchright browser and cleanup"""
+        # If stop was requested, kill by PID (fast) instead of Playwright close (hangs)
+        is_stopping = self.stop_event and self.stop_event.is_set()
+        
+        if is_stopping:
+            # Kill Playwright server PID + all children (browsers)
+            for pid in [self._pw_server_pid]:
+                if pid:
+                    try:
+                        subprocess.Popen(
+                            ['taskkill', '/F', '/PID', str(pid), '/T'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                    except Exception:
+                        pass
+            # Just nullify everything
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            self._pw_server_pid = None
+            if self.proxy_bridge:
+                try:
+                    self.proxy_bridge.stop()
+                except Exception:
+                    pass
+                self.proxy_bridge = None
+            return
+        
+        # Normal cleanup (not stopping) — use Playwright close methods
         if self.page:
             try:
                 self.page.close()
@@ -691,14 +722,12 @@ class ChatGPTAutoRegisterWorker:
             self.context = None
         if self.browser:
             try:
-                # Try to get browser PID before closing
                 browser_pid = None
                 try:
                     browser_pid = self.browser.process.pid if hasattr(self.browser, 'process') and self.browser.process else None
                 except Exception:
                     pass
                 self.browser.close()
-                # Force kill if still alive
                 if browser_pid:
                     try:
                         import signal
@@ -731,6 +760,12 @@ class ChatGPTAutoRegisterWorker:
                 self.log(f"Initializing browser (attempt {attempt + 1}/{max_retries})...", Colors.INFO, "🔄 ")
                 
                 self.playwright = sync_playwright().start()
+                
+                # Capture Playwright server PID for reliable force kill
+                try:
+                    self._pw_server_pid = self.playwright._impl_obj._connection._transport._proc.pid
+                except Exception:
+                    self._pw_server_pid = None
                 
                 # Build launch args
                 launch_args = [
@@ -1176,6 +1211,11 @@ class ChatGPTAutoRegisterWorker:
         """Run the entire registration flow (API-First)"""
         while self.current_retry <= self.max_retries:
             try:
+                # Check stop at start of each retry
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
+                
                 if self.current_retry > 0:
                     self.log(f"Retry attempt {self.current_retry}/{self.max_retries}...", Colors.WARNING, "🔄 ")
                     time.sleep(3)
@@ -1212,6 +1252,9 @@ class ChatGPTAutoRegisterWorker:
                 # === Step 2: Navigate + CSRF ===
                 self.log("Navigating to chatgpt.com...", Colors.INFO, "🌐 ")
                 page.goto("https://chatgpt.com/", wait_until="networkidle", timeout=60000)
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.wait_for_timeout(2000)
                 
                 # === Step 3: Get CSRF token ===
@@ -1264,8 +1307,14 @@ class ChatGPTAutoRegisterWorker:
                 self.log("Auth URL OK", Colors.SUCCESS)
             
                 # Navigate to auth page (CF challenge)
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
                 self.log("Waiting for CF challenge...", Colors.INFO, "⏳ ")
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.wait_for_timeout(8000)
                 
                 # === Step 5: Register via API ===
@@ -1307,6 +1356,9 @@ class ChatGPTAutoRegisterWorker:
                 except Exception as e:
                     self.log(f"OTP trigger error: {e}", Colors.WARNING)
                 
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.wait_for_timeout(2000)
                 
                 # === Step 6: Wait for OTP ===
@@ -1337,6 +1389,9 @@ class ChatGPTAutoRegisterWorker:
                 status = validate_resp.get('status')
                 body = validate_resp.get('body', '')
                 self.log(f"OTP Validate: {status}", Colors.SUCCESS if status == 200 else Colors.ERROR)
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.wait_for_timeout(2000)
                 
                 # === Step 7: Create account (name + DOB) ===
@@ -1353,6 +1408,9 @@ class ChatGPTAutoRegisterWorker:
                 """
                 create_resp = page.evaluate(create_js)
                 self.log(f"Account created: {create_resp.get('status')}", Colors.SUCCESS if create_resp.get('status') == 200 else Colors.ERROR)
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 page.wait_for_timeout(2000)
                 
                 # Follow callback URL to complete login
@@ -1365,6 +1423,10 @@ class ChatGPTAutoRegisterWorker:
                         page.wait_for_timeout(3000)
                 except Exception as e:
                     self.log(f"Callback error: {e}", Colors.WARNING)
+                
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 
                 # === Verify registration ===
                 self.log("Verifying registration...", Colors.INFO, "🔍 ")
@@ -1396,6 +1458,13 @@ class ChatGPTAutoRegisterWorker:
                 access_token = session_resp.get("accessToken", "")
                 if access_token:
                     self.log(f"Access Token: {access_token[:30]}...", Colors.SUCCESS)
+                
+                if self.stop_event and self.stop_event.is_set():
+                    # Save what we have so far before stopping
+                    if access_token:
+                        self.save_account_info(access_token)
+                    self.cleanup_browser()
+                    return (True if access_token else False, {'email': email, 'password': password} if access_token else None)
                 
                 # === 2FA setup if enabled ===
                 mfa_secret = None
@@ -1441,6 +1510,10 @@ class ChatGPTAutoRegisterWorker:
                 return (True, {'email': email, 'password': password})
                 
             except Exception as e:
+                # If stopping, exit immediately without retry/traceback
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
                 self.log(f"Error: {e}", Colors.ERROR, "❌ ")
                 traceback.print_exc()
                 self.cleanup_browser()
@@ -1805,11 +1878,17 @@ class TextRedirector(object):
         }
         self.ansi_re = re.compile(r'(\x1B\[[0-9;]*m)')
 
+    # Class-level flag to suppress output during stop (bulletproof, no widget traversal)
+    _suppress_output = False
+
     def write(self, str_data):
-        if str_data:
+        if str_data and not TextRedirector._suppress_output:
             self.widget.after(0, self._append_text, str_data)
 
     def _append_text(self, text):
+        # Also check here to discard callbacks that were already queued before suppress
+        if TextRedirector._suppress_output:
+            return
         try:
             self.widget.configure(state="normal")
             parts = self.ansi_re.split(text)
@@ -2064,7 +2143,7 @@ def _toast(app, message, duration_ms=2500, toast_type="info"):
         ctk.CTkLabel(
             frame, 
             text=message, 
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            font=app._font("Segoe UI", 13, "bold"),
             text_color="#f8fafc"
         ).pack(expand=True, padx=(28, 16))
         
@@ -2098,6 +2177,7 @@ class App(ctk.CTk):
         
         # State tracking
         self.process_running = False
+        self._is_stopping = False  # Suppress logs during stop to prevent GUI flood
 
         # Window setup
         self.title("⚡ ChatGPT Auto Tools")
@@ -2108,13 +2188,14 @@ class App(ctk.CTk):
         self.configure(fg_color="#080b12")
         
         # Premium Fonts - More distinctive choices
-        self.font_title = ctk.CTkFont(family="Segoe UI", size=36, weight="bold")
-        self.font_subtitle = ctk.CTkFont(family="Segoe UI Light", size=15, weight="normal")
-        self.font_label = ctk.CTkFont(family="Segoe UI", size=13, weight="normal")
-        self.font_button = ctk.CTkFont(family="Segoe UI Semibold", size=14, weight="bold")
-        self.font_mono = ctk.CTkFont(family="Cascadia Code", size=11)
-        self.font_stats = ctk.CTkFont(family="Segoe UI", size=28, weight="bold")
-        self.font_stats_label = ctk.CTkFont(family="Segoe UI", size=11, weight="normal")
+        self._font_cache = {}  # Memoize CTkFont to avoid creating duplicate objects
+        self.font_title = self._font("Segoe UI", 36, "bold")
+        self.font_subtitle = self._font("Segoe UI Light", 15)
+        self.font_label = self._font("Segoe UI", 13)
+        self.font_button = self._font("Segoe UI Semibold", 14, "bold")
+        self.font_mono = self._font("Cascadia Code", 11)
+        self.font_stats = self._font("Segoe UI", 28, "bold")
+        self.font_stats_label = self._font("Segoe UI", 11)
         
         # 🎨 VIBRANT Cyberpunk Color Palette
         self.colors = {
@@ -2190,7 +2271,7 @@ class App(ctk.CTk):
         self.logo_icon = ctk.CTkLabel(
             self.logo_frame, 
             text="⚡", 
-            font=ctk.CTkFont(size=28),
+            font=self._font("Segoe UI", 28),
             text_color=self.colors["accent_primary"]
         )
         self.logo_icon.place(relx=0.5, rely=0.5, anchor="center")
@@ -2217,7 +2298,7 @@ class App(ctk.CTk):
         self.version_badge = ctk.CTkLabel(
             self.header_frame,
             text="v2.0",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+            font=self._font("Segoe UI", 10, "bold"),
             fg_color=self.colors["accent_tertiary"],
             corner_radius=6,
             text_color="white",
@@ -2236,10 +2317,9 @@ class App(ctk.CTk):
         # Animate header title through vibrant colors
         self._header_colors = ["#00f0ff", "#00ff9f", "#ff00aa", "#a855f7", "#ffd600", "#ff6b35"]
         self._header_idx = 0
-        self._animate_header()
-
-        # Animate logo glow
-        self._animate_logo_glow()
+        # Defer animations until window is fully rendered
+        self.after(1000, self._animate_header)
+        self.after(1500, self._animate_logo_glow)
 
         # --- LEFT COLUMN: CONTROLS (ENHANCED TABVIEW) ---
         self.controls_container = ctk.CTkFrame(
@@ -2269,7 +2349,7 @@ class App(ctk.CTk):
         
         # Enhanced tab font
         self.tabview._segmented_button.configure(
-            font=ctk.CTkFont(family="Segoe UI Semibold", size=13, weight="bold"),
+            font=self._font("Segoe UI Semibold", 13, "bold"),
             corner_radius=12
         )
 
@@ -2299,7 +2379,7 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(
             self.status_header, 
             text="SYSTEM STATUS", 
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold", slant="roman"),
+            font=self._font("Segoe UI", 10, "bold"),
             text_color=self.colors["text_muted"]
         )
         self.status_label.grid(row=0, column=1, sticky="w")
@@ -2311,7 +2391,7 @@ class App(ctk.CTk):
             fg_color=self.colors["bg_elevated"], 
             state="disabled", 
             width=140, height=36, 
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), 
+            font=self._font("Segoe UI", 12, "bold"), 
             corner_radius=18,
             border_width=1,
             border_color=self.colors["border_subtle"]
@@ -2337,7 +2417,7 @@ class App(ctk.CTk):
         self.success_icon = ctk.CTkLabel(
             self.success_card,
             text="✓",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self._font("Segoe UI", 18, "bold"),
             text_color=self.colors["success"]
         )
         self.success_icon.pack(pady=(12, 4))
@@ -2371,7 +2451,7 @@ class App(ctk.CTk):
         self.fail_icon = ctk.CTkLabel(
             self.fail_card,
             text="✗",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self._font("Segoe UI", 18, "bold"),
             text_color=self.colors["error"]
         )
         self.fail_icon.pack(pady=(12, 4))
@@ -2396,7 +2476,7 @@ class App(ctk.CTk):
         self.progress_label = ctk.CTkLabel(
             self.status_frame, 
             text="PROGRESS",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+            font=self._font("Segoe UI", 10, "bold"),
             text_color=self.colors["text_muted"]
         )
         self.progress_label.grid(row=3, column=0, padx=20, pady=(20, 8), sticky="w")
@@ -2430,7 +2510,7 @@ class App(ctk.CTk):
         self.progress_percent = ctk.CTkLabel(
             self.status_frame,
             text="0%",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            font=self._font("Segoe UI", 11, "bold"),
             text_color=self.colors["accent_primary"]
         )
         self.progress_percent.grid(row=5, column=0, padx=20, pady=(0, 12), sticky="e")
@@ -2439,7 +2519,7 @@ class App(ctk.CTk):
         self.activity_label = ctk.CTkLabel(
             self.status_frame,
             text="ACTIVITY",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+            font=self._font("Segoe UI", 10, "bold"),
             text_color=self.colors["text_muted"]
         )
         self.activity_label.grid(row=6, column=0, padx=20, pady=(8, 8), sticky="w")
@@ -2485,7 +2565,7 @@ class App(ctk.CTk):
         self.log_title = ctk.CTkLabel(
             self.log_toolbar, 
             text="SYSTEM CONSOLE", 
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            font=self._font("Segoe UI", 11, "bold"),
             text_color=self.colors["text_muted"]
         )
         self.log_title.pack(side="left", padx=8)
@@ -2494,11 +2574,11 @@ class App(ctk.CTk):
         self.cursor_indicator = ctk.CTkLabel(
             self.log_toolbar,
             text="▊",
-            font=ctk.CTkFont(size=12),
+            font=self._font("Segoe UI", 12),
             text_color=self.colors["accent_primary"]
         )
         self.cursor_indicator.pack(side="left", padx=4)
-        self._blink_cursor()
+        self.after(2000, self._blink_cursor)  # Defer until window is rendered
         
         # Toolbar buttons with modern styling
         btn_style = {
@@ -2506,7 +2586,7 @@ class App(ctk.CTk):
             "fg_color": self.colors["bg_card"],
             "hover_color": self.colors["bg_card_hover"],
             "corner_radius": 8,
-            "font": ctk.CTkFont(size=14),
+            "font": self._font("Segoe UI", 14),
             "text_color": self.colors["text_secondary"],
             "border_width": 1,
             "border_color": self.colors["border_subtle"]
@@ -2565,7 +2645,15 @@ class App(ctk.CTk):
         self._active_runtime_lock = threading.Lock()
         
         # ═══ ENTRANCE ANIMATIONS ═══
-        self.after(100, self._play_entrance_animations)
+        self.after(500, self._play_entrance_animations)
+
+    # --- FONT CACHE ---
+    def _font(self, family="Segoe UI", size=13, weight="normal", slant="roman"):
+        """Memoized CTkFont — avoids creating duplicate font objects (53→~15 unique)"""
+        key = (family, size, weight, slant)
+        if key not in self._font_cache:
+            self._font_cache[key] = ctk.CTkFont(family=family, size=size, weight=weight, slant=slant)
+        return self._font_cache[key]
 
     # --- SETUP TABS ---
     def setup_registration_tab(self):
@@ -2589,7 +2677,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             card_header, 
             text="⚙️  Configuration", 
-            font=ctk.CTkFont(family="Segoe UI Semibold", size=14, weight="bold"),
+            font=self._font("Segoe UI Semibold", 14, "bold"),
             text_color=self.colors["text_primary"]
         ).pack(side="left")
         
@@ -2698,7 +2786,7 @@ class App(ctk.CTk):
         self.delay_unit_badge = ctk.CTkLabel(
             self.reg_delay_frame,
             text="seconds",
-            font=ctk.CTkFont(size=10),
+            font=self._font("Segoe UI", 10),
             text_color=self.colors["text_muted"]
         )
         self.delay_unit_badge.pack(side="left")
@@ -2720,7 +2808,7 @@ class App(ctk.CTk):
         self.delay_info = ctk.CTkLabel(
             self.reg_delay_frame,
             text="ℹ️",
-            font=ctk.CTkFont(size=14),
+            font=self._font("Segoe UI", 14),
             text_color=self.colors["text_muted"]
         )
         self.delay_info.pack(side="right", padx=(0, 8))
@@ -2742,7 +2830,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             adv_header, 
             text="🎯  Advanced Options", 
-            font=ctk.CTkFont(family="Segoe UI Semibold", size=14, weight="bold"),
+            font=self._font("Segoe UI Semibold", 14, "bold"),
             text_color=self.colors["text_primary"]
         ).pack(side="left")
         
@@ -2783,7 +2871,7 @@ class App(ctk.CTk):
         self.reg_oauth2_status = ctk.CTkLabel(
             self.reg_email_pass_frame,
             text="",
-            font=ctk.CTkFont(size=11),
+            font=self._font("Segoe UI", 11),
             text_color=self.colors["text_muted"]
         )
         self.reg_oauth2_status.pack(side="left", padx=(8, 0))
@@ -2794,7 +2882,7 @@ class App(ctk.CTk):
             text="🔄",
             width=32,
             height=32,
-            font=ctk.CTkFont(size=16),
+            font=self._font("Segoe UI", 16),
             fg_color=self.colors["bg_elevated"],
             hover_color=self.colors["bg_card_hover"],
             corner_radius=6,
@@ -2807,7 +2895,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             self.reg_email_pass_frame,
             text="│",
-            font=ctk.CTkFont(size=14),
+            font=self._font("Segoe UI", 14),
             text_color=self.colors["border_subtle"]
         ).pack(side="left", padx=(12, 12))
         
@@ -2854,7 +2942,7 @@ class App(ctk.CTk):
             fg_color=self.colors["accent_tertiary"],
             hover_color=self.colors["accent_primary"],
             corner_radius=8,
-            font=ctk.CTkFont(size=14),
+            font=self._font("Segoe UI", 14),
             command=self.save_password_to_file
         )
         self.reg_password_save.pack(side="left", padx=(4, 0))
@@ -2890,7 +2978,7 @@ class App(ctk.CTk):
         self.reg_proxy_entry = ctk.CTkEntry(
             self.reg_proxy_frame,
             textvariable=self.reg_proxy_string_var,
-            font=ctk.CTkFont(family="Consolas", size=11),
+            font=self._font("Consolas", 11),
             fg_color=self.colors["bg_elevated"],
             border_color=self.colors["border_subtle"],
             text_color=self.colors["text_primary"],
@@ -2909,7 +2997,7 @@ class App(ctk.CTk):
             fg_color=self.colors["accent_tertiary"],
             hover_color=self.colors["accent_primary"],
             corner_radius=8,
-            font=ctk.CTkFont(size=14),
+            font=self._font("Segoe UI", 14),
             command=self.save_proxy_to_file
         )
         self.reg_proxy_save.pack(side="left", padx=(6, 0))
@@ -2917,7 +3005,7 @@ class App(ctk.CTk):
         self.reg_proxy_info = ctk.CTkLabel(
             self.reg_proxy_frame,
             text="✓" if PROXY_ENABLED and PROXY_STRING else "",
-            font=ctk.CTkFont(size=10),
+            font=self._font("Segoe UI", 10),
             text_color=self.colors["accent_green"] if PROXY_ENABLED else self.colors["text_muted"]
         )
         self.reg_proxy_info.pack(side="left", padx=(4, 0))
@@ -2973,7 +3061,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             self.reg_toggles_frame,
             text="│",
-            font=ctk.CTkFont(size=14),
+            font=self._font("Segoe UI", 14),
             text_color=self.colors["border_subtle"]
         ).pack(side="left", padx=(16, 16))
         
@@ -3005,7 +3093,7 @@ class App(ctk.CTk):
             text_color="#0a0a0a",
             height=52, 
             corner_radius=14,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            font=self._font("Segoe UI", 14, "bold"),
             glow_color=self.colors["accent_green"]
         )
         self.reg_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -3023,7 +3111,7 @@ class App(ctk.CTk):
             width=52,
             height=52, 
             corner_radius=14,
-            font=ctk.CTkFont(size=18), 
+            font=self._font("Segoe UI", 18), 
             state="disabled"
         )
         self.reg_stop_btn.pack(side="right")
@@ -3059,7 +3147,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             header_frame, 
             text="💳  Checkout Link Capture", 
-            font=ctk.CTkFont(family="Segoe UI Semibold", size=14, weight="bold"),
+            font=self._font("Segoe UI Semibold", 14, "bold"),
             text_color=self.colors["text_primary"]
         ).pack(side="left")
         
@@ -3072,7 +3160,7 @@ class App(ctk.CTk):
             fg_color=self.colors["bg_elevated"],
             hover_color=self.colors["bg_card_hover"],
             corner_radius=8,
-            font=ctk.CTkFont(size=11),
+            font=self._font("Segoe UI", 11),
             command=self.load_checkout_accounts
         )
         self.checkout_refresh_btn.pack(side="right")
@@ -3115,7 +3203,7 @@ class App(ctk.CTk):
             fg_color=self.colors["bg_elevated"],
             hover_color=self.colors["accent_primary"],
             corner_radius=8,
-            font=ctk.CTkFont(size=11),
+            font=self._font("Segoe UI", 11),
             command=self.checkout_select_all
         )
         self.checkout_select_all_btn.pack(side="left", padx=(0, 4))
@@ -3128,7 +3216,7 @@ class App(ctk.CTk):
             fg_color=self.colors["bg_elevated"],
             hover_color=self.colors["error"],
             corner_radius=8,
-            font=ctk.CTkFont(size=11),
+            font=self._font("Segoe UI", 11),
             command=self.checkout_deselect_all
         )
         self.checkout_deselect_all_btn.pack(side="left")
@@ -3137,7 +3225,7 @@ class App(ctk.CTk):
         self.checkout_count_label = ctk.CTkLabel(
             options_frame,
             text="0 accounts | 0 selected",
-            font=ctk.CTkFont(size=11),
+            font=self._font("Segoe UI", 11),
             text_color=self.colors["text_muted"]
         )
         self.checkout_count_label.pack(side="right")
@@ -3222,7 +3310,7 @@ class App(ctk.CTk):
         self.checkout_mt_info = ctk.CTkLabel(
             self.checkout_mt_frame,
             text="(select 2+)",
-            font=ctk.CTkFont(size=10),
+            font=self._font("Segoe UI", 10),
             text_color=self.colors["text_muted"]
         )
         self.checkout_mt_info.pack(side="left", padx=(8, 0), pady=4)
@@ -3231,7 +3319,7 @@ class App(ctk.CTk):
         self.checkout_mt_badge = ctk.CTkLabel(
             self.checkout_mt_frame,
             text="💡 Rec: 2 threads, 3s delay",
-            font=ctk.CTkFont(size=10),
+            font=self._font("Segoe UI", 10),
             text_color=self.colors["accent_yellow"]
         )
         self.checkout_mt_badge.pack(side="right")
@@ -3272,11 +3360,11 @@ class App(ctk.CTk):
         header_row.grid_columnconfigure(3, weight=0, minsize=70)
         header_row.grid_columnconfigure(4, weight=0, minsize=60)
         
-        ctk.CTkLabel(header_row, text="✓", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=0, padx=8, sticky="w")
-        ctk.CTkLabel(header_row, text="Email", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.colors["text_secondary"], anchor="w").grid(row=0, column=1, padx=8, sticky="w")
-        ctk.CTkLabel(header_row, text="Plus", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=2, padx=4, sticky="w")
-        ctk.CTkLabel(header_row, text="Business", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=3, padx=4, sticky="w")
-        ctk.CTkLabel(header_row, text="Sold", font=ctk.CTkFont(size=11, weight="bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=4, padx=4, sticky="w")
+        ctk.CTkLabel(header_row, text="✓", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=0, padx=8, sticky="w")
+        ctk.CTkLabel(header_row, text="Email", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"], anchor="w").grid(row=0, column=1, padx=8, sticky="w")
+        ctk.CTkLabel(header_row, text="Plus", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=2, padx=4, sticky="w")
+        ctk.CTkLabel(header_row, text="Business", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=3, padx=4, sticky="w")
+        ctk.CTkLabel(header_row, text="Sold", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=4, padx=4, sticky="w")
         
         # Store for account checkboxes
         self.checkout_account_vars = []
@@ -3295,7 +3383,7 @@ class App(ctk.CTk):
             text_color="#0a0a0a",
             height=48, 
             corner_radius=14,
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            font=self._font("Segoe UI", 13, "bold"),
             glow_color=self.colors["accent_orange"]
         )
         self.checkout_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -3309,7 +3397,7 @@ class App(ctk.CTk):
             text_color=self.colors["text_secondary"],
             width=52, height=48,
             corner_radius=14,
-            font=ctk.CTkFont(size=18),
+            font=self._font("Segoe UI", 18),
             border_width=2,
             border_color=self.colors["border_subtle"],
             state="disabled"
@@ -3430,7 +3518,7 @@ class App(ctk.CTk):
                 email_label = ctk.CTkLabel(
                     row_frame, 
                     text=email_text,
-                    font=ctk.CTkFont(size=11),
+                    font=self._font("Segoe UI", 11),
                     text_color=text_color,
                     anchor="w"
                 )
@@ -3451,7 +3539,7 @@ class App(ctk.CTk):
                 plus_label = ctk.CTkLabel(
                     row_frame, 
                     text=plus_status,
-                    font=ctk.CTkFont(size=12),
+                    font=self._font("Segoe UI", 12),
                     text_color=plus_color
                 )
                 plus_label.grid(row=0, column=2, padx=4, pady=2, sticky="w")
@@ -3463,7 +3551,7 @@ class App(ctk.CTk):
                 business_label = ctk.CTkLabel(
                     row_frame, 
                     text=business_status,
-                    font=ctk.CTkFont(size=12),
+                    font=self._font("Segoe UI", 12),
                     text_color=business_color
                 )
                 business_label.grid(row=0, column=3, padx=4, pady=2, sticky="w")
@@ -3475,7 +3563,7 @@ class App(ctk.CTk):
                 sold_label = ctk.CTkLabel(
                     row_frame, 
                     text=sold_status,
-                    font=ctk.CTkFont(size=12),
+                    font=self._font("Segoe UI", 12),
                     text_color=sold_color
                 )
                 sold_label.grid(row=0, column=4, padx=4, pady=2, sticky="w")
@@ -3562,6 +3650,7 @@ class App(ctk.CTk):
         
         self.lock_ui(True)
         self.stop_event.clear()
+        TextRedirector._suppress_output = False  # Re-enable logging for new run
         self.update_stats(0, 0)
         
         checkout_type = self.checkout_type_var.get()
@@ -3719,10 +3808,7 @@ class App(ctk.CTk):
         final_fail = fail_count
         
         def finish_capture():
-            # Refresh table safely
-            self.load_checkout_accounts()
-            
-            # Final status
+            # Stage 1: Lightweight UI updates (immediate, keeps GUI responsive)
             self.lock_ui(False)
             if self.stop_event.is_set():
                 self.update_status("STOPPED", self.colors["warning"], f"Stopped. Success: {final_success} | Failed: {final_fail}")
@@ -3731,6 +3817,9 @@ class App(ctk.CTk):
                 self.update_status("COMPLETED", None, f"Success: {final_success} | Failed: {final_fail}")
             
             _toast(self, f"💳 Captured {final_success} checkout links!", toast_type="success" if final_success > 0 else "warning")
+
+            # Stage 2: Schedule heavy table rebuild with delay so GUI stays responsive
+            self.after(300, self.load_checkout_accounts)
         
         self.after(100, finish_capture)
 
@@ -3740,7 +3829,7 @@ class App(ctk.CTk):
         try:
             self._header_idx = (self._header_idx + 1) % len(self._header_colors)
             next_color = self._header_colors[self._header_idx]
-            self.motion.color(self.header_label, "text_color", next_color, duration_ms=1200, steps=50)
+            self.motion.color(self.header_label, "text_color", next_color, duration_ms=1200, steps=15)
             self.after(4000, self._animate_header)
         except:
             pass
@@ -3752,7 +3841,7 @@ class App(ctk.CTk):
             if not hasattr(self, '_logo_color_idx'):
                 self._logo_color_idx = 0
             self._logo_color_idx = (self._logo_color_idx + 1) % len(colors)
-            self.motion.color(self.logo_frame, "border_color", colors[self._logo_color_idx], duration_ms=1500, steps=40)
+            self.motion.color(self.logo_frame, "border_color", colors[self._logo_color_idx], duration_ms=1500, steps=12)
             self.after(3000, self._animate_logo_glow)
         except:
             pass
@@ -4143,6 +4232,10 @@ class App(ctk.CTk):
                 fg_color=self.colors["bg_elevated"]
             )
         else:
+            # Only re-enable logging if not forcefully stopped
+            # (workers may still be dying and would flood output)
+            if not self.stop_event.is_set():
+                TextRedirector._suppress_output = False
             self.reg_start_btn.configure(
                 state=state, 
                 text="▶  START REGISTRATION",
@@ -4210,21 +4303,29 @@ class App(ctk.CTk):
         
 
     def stop_process(self):
+        TextRedirector._suppress_output = True  # Suppress ALL log output immediately
         self.stop_event.set()
         self.update_status("STOPPING", self.colors["warning"], "Force stopping now...")
+        # Run heavy cleanup in background thread to avoid freezing GUI
+        threading.Thread(target=self._background_force_stop, daemon=True).start()
+        _toast(self, "⏹ Force stop sent (closing browsers now)", toast_type="warning")
+
+    def _background_force_stop(self):
+        """Run heavy cleanup off the main thread to keep GUI responsive"""
         self._force_stop_all_runtime()
         self._kill_chromium_processes()
-        _toast(self, "⏹ Force stop sent (closing browsers now)", toast_type="warning")
     
     def _kill_chromium_processes(self):
-        """Kill any orphaned chromium processes spawned by patchright"""
-        try:
-            result = subprocess.run(
-                ['taskkill', '/F', '/IM', 'chromium.exe', '/T'],
-                capture_output=True, timeout=5
-            )
-        except Exception:
-            pass
+        """Kill any orphaned browser processes spawned by patchright"""
+        for proc_name in ['chrome.exe', 'chromium.exe']:
+            try:
+                subprocess.Popen(
+                    ['taskkill', '/F', '/IM', proc_name, '/T'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except Exception:
+                pass
     
     def on_closing(self):
         """Clean shutdown: kill all browsers, release files, then destroy window"""
@@ -4263,6 +4364,7 @@ class App(ctk.CTk):
             self._active_executors.discard(executor)
 
     def _force_stop_worker(self, worker):
+        """Force stop a worker by killing browser PID directly (fast, non-blocking)"""
         if not worker:
             return
         try:
@@ -4271,21 +4373,43 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+        # Kill browser via Playwright server PID (kills server + all child browsers)
+        pw_server_pid = getattr(worker, '_pw_server_pid', None)
+        if pw_server_pid:
+            try:
+                subprocess.Popen(
+                    ['taskkill', '/F', '/PID', str(pw_server_pid), '/T'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except Exception:
+                pass
+
+        # Nullify references (don't call .close() — it hangs)
         try:
-            drv = getattr(worker, 'driver', None)
-            if drv:
-                drv.quit()
+            worker.page = None
+            worker.context = None
+            worker.browser = None
+            worker.playwright = None
+            worker._pw_server_pid = None
         except Exception:
             pass
 
-        for cleanup_method in ('cleanup_browser', 'cleanup'):
-            try:
-                method = getattr(worker, cleanup_method, None)
-                if callable(method):
-                    method()
-                    break
-            except Exception:
-                continue
+        # Skip playwright.stop() during force stop — it hangs when browser is dead.
+        # taskkill /IM chromium.exe handles all cleanup.
+        try:
+            worker.playwright = None
+        except Exception:
+            pass
+
+        # Stop proxy bridge if any
+        try:
+            bridge = getattr(worker, 'proxy_bridge', None)
+            if bridge:
+                bridge.stop()
+                worker.proxy_bridge = None
+        except Exception:
+            pass
 
     def _force_stop_all_runtime(self):
         with self._active_runtime_lock:
@@ -4298,8 +4422,15 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+        # Kill all workers in parallel (don't let one hanging worker delay others)
+        kill_threads = []
         for worker in workers:
-            self._force_stop_worker(worker)
+            t = threading.Thread(target=self._force_stop_worker, args=(worker,), daemon=True)
+            t.start()
+            kill_threads.append(t)
+        # Wait max 3 seconds for all kills to complete
+        for t in kill_threads:
+            t.join(timeout=3)
 
     # --- LOG UTILS ---
     def clear_logs(self):
@@ -4334,6 +4465,10 @@ class App(ctk.CTk):
 
     def run_registration(self):
         global GET_CHECKOUT_LINK
+        
+        # Reset stop state and re-enable logging for new run
+        self.stop_event.clear()
+        TextRedirector._suppress_output = False
         
         self.lock_ui(True)
         self.stop_event.clear()
@@ -4589,12 +4724,16 @@ class App(ctk.CTk):
 
 
 def _atexit_cleanup():
-    """Safety net: kill chromium on process exit"""
-    try:
-        subprocess.run(['taskkill', '/F', '/IM', 'chromium.exe', '/T'],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+    """Safety net: kill browser processes on exit"""
+    for proc_name in ['chrome.exe', 'chromium.exe']:
+        try:
+            subprocess.Popen(
+                ['taskkill', '/F', '/IM', proc_name, '/T'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
 
 atexit.register(_atexit_cleanup)
 
