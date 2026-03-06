@@ -1151,14 +1151,14 @@ class ChatGPTAutoRegisterWorker:
             self.log(f"API business checkout error: {e}", Colors.ERROR, "❌ ")
             return None
 
-    def save_account_info(self, access_token, checkout_url=None, business_checkout_url=None, mfa_secret=None):
+    def save_account_info(self, session_data, checkout_url=None, business_checkout_url=None, mfa_secret=None):
         """Save account info to Excel (thread-safe)"""
         try:
             if not self.email_info:
                 return False
             
-            if not access_token:
-                self.log("No access token to save", Colors.WARNING, "⚠️ ")
+            if not session_data:
+                self.log("No session data to save", Colors.WARNING, "⚠️ ")
                 return False
             
 
@@ -1175,7 +1175,7 @@ class ChatGPTAutoRegisterWorker:
                     ws = wb.active
                     ws.title = "Accounts"
                     ws['A1'] = "Account"
-                    ws['B1'] = "Access Token"
+                    ws['B1'] = "Session JSON"
                     ws['C1'] = "Plus Checkout URL"
                     ws['D1'] = "Business Checkout URL"
                     ws['E1'] = "2FA Secret"
@@ -1187,7 +1187,7 @@ class ChatGPTAutoRegisterWorker:
                 
                 next_row = ws.max_row + 1
                 ws[f'A{next_row}'] = account
-                ws[f'B{next_row}'] = access_token
+                ws[f'B{next_row}'] = session_data
                 ws[f'C{next_row}'] = checkout_url if checkout_url else ""
                 ws[f'D{next_row}'] = business_checkout_url if business_checkout_url else ""
                 ws[f'E{next_row}'] = mfa_secret if mfa_secret else ""
@@ -1307,16 +1307,15 @@ class ChatGPTAutoRegisterWorker:
                     continue
                 self.log("Auth URL OK", Colors.SUCCESS)
             
-                # Navigate to auth page (CF challenge)
+                # Navigate to auth page
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
                     return (False, None)
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
-                self.log("Waiting for CF challenge...", Colors.INFO, "⏳ ")
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
                     return (False, None)
-                page.wait_for_timeout(8000)
+                page.wait_for_timeout(2000)
                 
                 # === Step 5: Register via API ===
                 self.log("Registering account...", Colors.INFO, "📝 ")
@@ -1432,7 +1431,7 @@ class ChatGPTAutoRegisterWorker:
                 # === Verify registration ===
                 self.log("Verifying registration...", Colors.INFO, "🔍 ")
                 page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(5000)
+                page.wait_for_timeout(2000)
                 
                 check_resp = page.evaluate("""
                     async () => {
@@ -1457,13 +1456,15 @@ class ChatGPTAutoRegisterWorker:
                     }
                 """)
                 access_token = session_resp.get("accessToken", "")
+                session_json_str = json.dumps(session_resp) if isinstance(session_resp, dict) else ""
+                
                 if access_token:
                     self.log(f"Access Token: {access_token[:30]}...", Colors.SUCCESS)
                 
                 if self.stop_event and self.stop_event.is_set():
                     # Save what we have so far before stopping
                     if access_token:
-                        self.save_account_info(access_token)
+                        self.save_account_info(session_json_str)
                     self.cleanup_browser()
                     return (True if access_token else False, {'email': email, 'password': password} if access_token else None)
                 
@@ -1488,7 +1489,7 @@ class ChatGPTAutoRegisterWorker:
                         business_checkout_url = self.get_business_checkout_link_via_api(access_token)
                 
                 # === Save to Excel ===
-                saved = self.save_account_info(access_token, checkout_url, business_checkout_url, mfa_secret)
+                saved = self.save_account_info(session_json_str, checkout_url, business_checkout_url, mfa_secret)
                 
                 if not saved:
                     self.log("Account not saved", Colors.ERROR, "❌ ")
@@ -1726,7 +1727,20 @@ def load_checkout_accounts(excel_file):
                 continue
             
             account = row[0] if row[0] else ""
-            access_token = row[1] if len(row) > 1 and row[1] else ""
+            
+            # Smart detect: JSON format (new) vs plain accessToken (legacy)
+            raw_col_b = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            access_token = ""
+            if raw_col_b:
+                if raw_col_b.startswith("{"):
+                    try:
+                        parsed = json.loads(raw_col_b)
+                        access_token = parsed.get("accessToken", "")
+                    except Exception:
+                        access_token = raw_col_b
+                else:
+                    access_token = raw_col_b  # Legacy plain token format
+            
             plus_url = row[2] if len(row) > 2 and row[2] else ""
             business_url = row[3] if len(row) > 3 and row[3] else ""
             sold_status = row[5] if len(row) > 5 and row[5] else ""
