@@ -36,6 +36,7 @@ except ImportError:
     import tls_client
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
+import tkinter.ttk as ttk
 
 # Initialize colorama
 init(autoreset=True)
@@ -2251,75 +2252,13 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=0)     # Main Content
         self.grid_rowconfigure(2, weight=1)     # Logs
         
-        # --- ANIMATED HEADER WITH GRADIENT EFFECT ---
-        self.header_frame = ctk.CTkFrame(self, fg_color="transparent", height=100)
-        self.header_frame.grid(row=0, column=0, columnspan=2, padx=32, pady=(28, 16), sticky="ew")
-        self.header_frame.grid_columnconfigure(1, weight=1)
-        
-        # Logo/Icon container with glow
-        self.logo_frame = ctk.CTkFrame(
-            self.header_frame, 
-            width=56, height=56, 
-            corner_radius=14,
-            fg_color=self.colors["bg_card"],
-            border_width=1,
-            border_color=self.colors["accent_primary"]
-        )
-        self.logo_frame.grid(row=0, column=0, rowspan=2, padx=(0, 16), sticky="w")
-        self.logo_frame.grid_propagate(False)
-        
-        self.logo_icon = ctk.CTkLabel(
-            self.logo_frame, 
-            text="⚡", 
-            font=self._font("Segoe UI", 28),
-            text_color=self.colors["accent_primary"]
-        )
-        self.logo_icon.place(relx=0.5, rely=0.5, anchor="center")
-        
-        # Title with gradient-like effect (we'll animate colors)
+        # --- SIMPLE HEADER ---
         self.header_label = ctk.CTkLabel(
-            self.header_frame, 
-            text="ChatGPT Auto Tools", 
-            font=self.font_title, 
+            self, text="⚡ ChatGPT Auto Tools",
+            font=self._font("Segoe UI", 22, "bold"),
             text_color=self.colors["accent_primary"]
         )
-        self.header_label.grid(row=0, column=1, sticky="sw", pady=(0, 0))
-        
-        # Subtitle with typing effect
-        self.subtitle_label = ctk.CTkLabel(
-            self.header_frame, 
-            text="✨ Premium Automation Dashboard", 
-            font=self.font_subtitle, 
-            text_color=self.colors["text_secondary"]
-        )
-        self.subtitle_label.grid(row=1, column=1, sticky="nw", pady=(2, 0))
-        
-        # Version badge
-        self.version_badge = ctk.CTkLabel(
-            self.header_frame,
-            text="v2.0",
-            font=self._font("Segoe UI", 10, "bold"),
-            fg_color=self.colors["accent_tertiary"],
-            corner_radius=6,
-            text_color="white",
-            width=40, height=20
-        )
-        self.version_badge.grid(row=0, column=2, sticky="ne", padx=(12, 0))
-        
-        # Separator line with gradient effect
-        self.header_separator = ctk.CTkFrame(
-            self, 
-            height=2, 
-            fg_color=self.colors["border_subtle"]
-        )
-        self.header_separator.grid(row=0, column=0, columnspan=2, padx=32, pady=(90, 0), sticky="sew")
-        
-        # Animate header title through vibrant colors
-        self._header_colors = ["#00f0ff", "#00ff9f", "#ff00aa", "#a855f7", "#ffd600", "#ff6b35"]
-        self._header_idx = 0
-        # Defer animations until window is fully rendered
-        self.after(1000, self._animate_header)
-        self.after(1500, self._animate_logo_glow)
+        self.header_label.grid(row=0, column=0, columnspan=2, padx=24, pady=(12, 4), sticky="w")
 
         # --- LEFT COLUMN: CONTROLS (ENHANCED TABVIEW) ---
         self.controls_container = ctk.CTkFrame(
@@ -2602,13 +2541,6 @@ class App(ctk.CTk):
         self.btn_export.pack(side="right", padx=3)
 
         # Hover effects for toolbar buttons
-        for btn in [self.btn_clear, self.btn_copy, self.btn_export]:
-            self.motion.hover(
-                btn, 
-                enter={"fg_color": self.colors["bg_elevated"], "border_color": self.colors["accent_primary"]}, 
-                leave={"fg_color": self.colors["bg_card"], "border_color": self.colors["border_subtle"]}, 
-                duration_ms=120
-            )
         
         # Log textbox with terminal aesthetics
         self.log_textbox = ctk.CTkTextbox(
@@ -2698,17 +2630,17 @@ class App(ctk.CTk):
         
         self.reg_mode_var = ctk.StringVar(value="Sequential")
         self.reg_mode_menu = ctk.CTkOptionMenu(
-            self.reg_mode_frame, 
-            values=["Sequential", "Multithread"], 
-            variable=self.reg_mode_var, 
-            command=self.toggle_reg_inputs, 
-            width=180,
-            height=36,
+            self.reg_mode_frame,
+            values=["Sequential", "Multithread"],
+            variable=self.reg_mode_var,
+            command=self.toggle_reg_inputs,
+            width=160,
+            height=32,
             font=self.font_label,
             dropdown_font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            button_color=self.colors["accent_tertiary"],
-            button_hover_color=self.colors["accent_secondary"],
+            fg_color=self.colors["accent_tertiary"],
+            button_color=self.colors["accent_secondary"],
+            button_hover_color=self.colors["accent_primary"],
             dropdown_fg_color=self.colors["bg_card"],
             dropdown_hover_color=self.colors["bg_card_hover"],
             corner_radius=10
@@ -3117,12 +3049,6 @@ class App(ctk.CTk):
         self.reg_stop_btn.pack(side="right")
 
         # Enhanced Hovers
-        self.motion.hover(
-            self.reg_start_btn, 
-            enter={"fg_color": "#33ffaa"}, 
-            leave={"fg_color": self.colors["accent_green"]}, 
-            duration_ms=150
-        )
 
     def setup_checkout_tab(self):
         """Setup the Checkout Capture tab with account selection table"""
@@ -3181,16 +3107,19 @@ class App(ctk.CTk):
         
         self.checkout_type_var = ctk.StringVar(value="Plus")
         self.checkout_type_menu = ctk.CTkOptionMenu(
-            options_frame, 
-            values=["Plus", "Business", "Both"], 
+            options_frame,
+            values=["Plus", "Business", "Both"],
             variable=self.checkout_type_var,
-            width=100,
+            width=120,
             height=32,
             font=self.font_label,
-            fg_color=self.colors["bg_elevated"],
-            button_color=self.colors["accent_tertiary"],
+            dropdown_font=self.font_label,
+            fg_color=self.colors["accent_tertiary"],
+            button_color=self.colors["accent_secondary"],
             button_hover_color=self.colors["accent_primary"],
-            corner_radius=8
+            dropdown_fg_color=self.colors["bg_card"],
+            dropdown_hover_color=self.colors["bg_card_hover"],
+            corner_radius=10
         )
         self.checkout_type_menu.pack(side="left", padx=(0, 16))
         
@@ -3324,7 +3253,7 @@ class App(ctk.CTk):
         )
         self.checkout_mt_badge.pack(side="right")
         
-        # ═══ ACCOUNTS TABLE ═══
+        # ═══ ACCOUNTS TABLE (ttk.Treeview — 1 widget replaces N*6 CTk widgets) ═══
         table_frame = ctk.CTkFrame(
             tab, 
             fg_color=self.colors["bg_card"],
@@ -3336,39 +3265,67 @@ class App(ctk.CTk):
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
         
-        # Scrollable frame for accounts
-        self.checkout_scroll = ctk.CTkScrollableFrame(
-            table_frame,
-            fg_color="transparent",
-            corner_radius=0
+        # Configure dark theme for ttk widgets
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Checkout.Treeview",
+            background="#111827",
+            foreground="#f8fafc",
+            fieldbackground="#111827",
+            rowheight=30,
+            font=("Segoe UI", 11)
         )
-        self.checkout_scroll.pack(fill="both", expand=True, padx=8, pady=8)
+        style.configure("Checkout.Treeview.Heading",
+            background="#1e293b",
+            foreground="#94a3b8",
+            font=("Segoe UI", 12, "bold")
+        )
+        style.map("Checkout.Treeview",
+            background=[("selected", "#1e3a5f")],
+            foreground=[("selected", "#00f0ff")]
+        )
+
         
-        # Configure fixed column widths
-        self.checkout_scroll.grid_columnconfigure(0, weight=0, minsize=40)   # Checkbox
-        self.checkout_scroll.grid_columnconfigure(1, weight=1, minsize=200)  # Email (flexible)
-        self.checkout_scroll.grid_columnconfigure(2, weight=0, minsize=50)   # Plus
-        self.checkout_scroll.grid_columnconfigure(3, weight=0, minsize=70)   # Business
-        self.checkout_scroll.grid_columnconfigure(4, weight=0, minsize=60)   # Sold
+        # Create Treeview
+        self.checkout_tree = ttk.Treeview(
+            table_frame,
+            columns=("email", "plus", "business", "sold"),
+            show="tree headings",
+            selectmode="extended",
+            style="Checkout.Treeview",
+            height=6
+        )
+        self.checkout_tree.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
         
-        # Header row for table
-        header_row = ctk.CTkFrame(self.checkout_scroll, fg_color=self.colors["bg_elevated"], corner_radius=8, height=30)
-        header_row.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 4))
-        header_row.grid_columnconfigure(0, weight=0, minsize=40)
-        header_row.grid_columnconfigure(1, weight=1, minsize=200)
-        header_row.grid_columnconfigure(2, weight=0, minsize=50)
-        header_row.grid_columnconfigure(3, weight=0, minsize=70)
-        header_row.grid_columnconfigure(4, weight=0, minsize=60)
+        # Column config
+        self.checkout_tree.column("#0", width=40, stretch=False)
+        self.checkout_tree.column("email", width=250, stretch=True)
+        self.checkout_tree.column("plus", width=50, stretch=False, anchor="center")
+        self.checkout_tree.column("business", width=70, stretch=False, anchor="center")
+        self.checkout_tree.column("sold", width=50, stretch=False, anchor="center")
         
-        ctk.CTkLabel(header_row, text="✓", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=0, padx=8, sticky="w")
-        ctk.CTkLabel(header_row, text="Email", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"], anchor="w").grid(row=0, column=1, padx=8, sticky="w")
-        ctk.CTkLabel(header_row, text="Plus", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=2, padx=4, sticky="w")
-        ctk.CTkLabel(header_row, text="Business", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=3, padx=4, sticky="w")
-        ctk.CTkLabel(header_row, text="Sold", font=self._font("Segoe UI", 11, "bold"), text_color=self.colors["text_secondary"]).grid(row=0, column=4, padx=4, sticky="w")
+        self.checkout_tree.heading("#0", text="✓")
+        self.checkout_tree.heading("email", text="Email")
+        self.checkout_tree.heading("plus", text="Plus")
+        self.checkout_tree.heading("business", text="Business")
+        self.checkout_tree.heading("sold", text="Sold")
         
-        # Store for account checkboxes
+        # Scrollbar
+        tree_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.checkout_tree.yview)
+        tree_scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
+        self.checkout_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # Click to toggle selection
+        self.checkout_tree.bind("<ButtonRelease-1>", self._toggle_checkout_row)
+        
+        # Tags for visual styling
+        self.checkout_tree.tag_configure("sold", foreground="#ff6b4a")
+        self.checkout_tree.tag_configure("selected", foreground="#00f0ff")
+        self.checkout_tree.tag_configure("evenrow", background="#0f172a")
+        self.checkout_tree.tag_configure("oddrow", background="#1a2332")
+        
+        # Store for account data (compatible with business logic)
         self.checkout_account_vars = []
-        self.checkout_account_widgets = []
         
         # ═══ ACTION BUTTONS ═══
         btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -3405,43 +3362,14 @@ class App(ctk.CTk):
         self.checkout_stop_btn.pack(side="right")
         
         # Load accounts on init
-        self.after(500, self.load_checkout_accounts)
+        self.after(2000, self.load_checkout_accounts)  # Defer: render UI first
     
     def load_checkout_accounts(self):
-        """Load accounts from Excel and display in table"""
-        # Clear existing widgets safely to avoid TclError with CTkCheckBox
-        # First, clear all variable traces by setting variables to False and unbinding
-        for item in self.checkout_account_vars:
-            try:
-                var = item.get("var")
-                if var:
-                    var.set(False)  # Reset variable value
-            except:
-                pass
-        
-        # Clear variables list first to avoid callbacks during destroy
+        """Load accounts from Excel and display in treeview table"""
+        # Clear existing data
         self.checkout_account_vars.clear()
-        
-        # Now safely destroy widgets
-        for widget in self.checkout_account_widgets:
-            try:
-                # For CTkCheckBox, we need to handle the variable trace issue
-                if isinstance(widget, ctk.CTkCheckBox):
-                    # Try to remove the variable callback before destroy
-                    try:
-                        if hasattr(widget, '_variable') and widget._variable:
-                            if hasattr(widget, '_variable_callback_name') and widget._variable_callback_name:
-                                try:
-                                    widget._variable.trace_remove("write", widget._variable_callback_name)
-                                except:
-                                    pass
-                                widget._variable_callback_name = None
-                    except:
-                        pass
-                widget.destroy()
-            except:
-                pass
-        self.checkout_account_widgets.clear()
+        for item in self.checkout_tree.get_children():
+            self.checkout_tree.delete(item)
         
         # Load accounts
         excel_file = "chatgpt.xlsx"
@@ -3455,122 +3383,45 @@ class App(ctk.CTk):
             self.checkout_count_label.configure(text="No accounts found in Excel")
             return
         
-        # Create row for each account using grid layout
+        # Insert rows into treeview (1 widget vs N*6 CTk widgets)
         for idx, account in enumerate(accounts):
-            try:
-                row_num = idx + 1
-                is_sold = account.get("is_sold", False)
-                
-                # Create row frame - keep normal background, use border to highlight sold accounts
-                if is_sold:
-                    # Use bright orange border to highlight sold rows (keep normal background)
-                    row_border_color = "#ff6b4a"  # Bright orange border
-                    text_color = "#ff8c6b"  # Light orange text for better visibility
-                    border_width = 2  # Thicker border for better visibility
-                else:
-                    row_border_color = None  # Don't set border_color when not needed
-                    text_color = self.colors["text_primary"]
-                    border_width = 0
-                
-                # Create frame - only set border_color if sold, keep normal background (transparent)
-                frame_kwargs = {
-                    "master": self.checkout_scroll,
-                    "fg_color": "transparent",  # Keep same background as scrollable frame
-                    "border_width": border_width,
-                    "corner_radius": 6
-                }
-                if is_sold:
-                    frame_kwargs["border_color"] = row_border_color
-                
-                row_frame = ctk.CTkFrame(**frame_kwargs)
-                row_frame.grid(row=row_num, column=0, columnspan=5, sticky="ew", pady=1, padx=2)
-                row_frame.grid_columnconfigure(0, weight=0, minsize=40)
-                row_frame.grid_columnconfigure(1, weight=1, minsize=200)
-                row_frame.grid_columnconfigure(2, weight=0, minsize=50)
-                row_frame.grid_columnconfigure(3, weight=0, minsize=70)
-                row_frame.grid_columnconfigure(4, weight=0, minsize=60)
-                self.checkout_account_widgets.append(row_frame)
-                
-                # Checkbox
-                var = ctk.BooleanVar(value=False)
-                self.checkout_account_vars.append({
-                    "var": var,
-                    "account": account
-                })
-                
-                cb = ctk.CTkCheckBox(
-                    row_frame, 
-                    text="",
-                    variable=var,
-                    width=30,
-                    checkbox_width=18,
-                    checkbox_height=18,
-                    fg_color=self.colors["accent_primary"],
-                    hover_color=self.colors["accent_secondary"],
-                    command=self.update_checkout_selection_count,
-                    state="disabled" if is_sold else "normal"
-                )
-                cb.grid(row=0, column=0, padx=(8, 4), pady=2, sticky="w")
-                self.checkout_account_widgets.append(cb)
-                
-                # Email (truncate to fit)
-                email_text = account["email"][:30] + "..." if len(account["email"]) > 30 else account["email"]
-                email_label = ctk.CTkLabel(
-                    row_frame, 
-                    text=email_text,
-                    font=self._font("Segoe UI", 11),
-                    text_color=text_color,
-                    anchor="w"
-                )
-                email_label.grid(row=0, column=1, padx=4, pady=2, sticky="w")
-                self.checkout_account_widgets.append(email_label)
-                
-                # Plus status
-                if account["plus_url"] == "no Plus offer":
-                    plus_status = "⛔"
-                    plus_color = self.colors["error"]
-                elif account["plus_url"]:
-                    plus_status = "✅"
-                    plus_color = self.colors["accent_green"]
-                else:
-                    plus_status = "❌"
-                    plus_color = self.colors["text_muted"]
-
-                plus_label = ctk.CTkLabel(
-                    row_frame, 
-                    text=plus_status,
-                    font=self._font("Segoe UI", 12),
-                    text_color=plus_color
-                )
-                plus_label.grid(row=0, column=2, padx=4, pady=2, sticky="w")
-                self.checkout_account_widgets.append(plus_label)
-                
-                # Business status
-                business_status = "✅" if account["business_url"] else "❌"
-                business_color = self.colors["accent_green"] if account["business_url"] else self.colors["text_muted"]
-                business_label = ctk.CTkLabel(
-                    row_frame, 
-                    text=business_status,
-                    font=self._font("Segoe UI", 12),
-                    text_color=business_color
-                )
-                business_label.grid(row=0, column=3, padx=4, pady=2, sticky="w")
-                self.checkout_account_widgets.append(business_label)
-                
-                # Sold status
-                sold_status = "✅" if is_sold else "❌"
-                sold_color = "#ff6b4a" if is_sold else self.colors["text_muted"]  # Bright orange for sold
-                sold_label = ctk.CTkLabel(
-                    row_frame, 
-                    text=sold_status,
-                    font=self._font("Segoe UI", 12),
-                    text_color=sold_color
-                )
-                sold_label.grid(row=0, column=4, padx=4, pady=2, sticky="w")
-                self.checkout_account_widgets.append(sold_label)
-            except Exception as e:
-                print(f"Error creating row for account {account.get('email', 'unknown')}: {e}")
-                continue
+            is_sold = account.get("is_sold", False)
+            
+            # Plus status
+            if account["plus_url"] == "no Plus offer":
+                plus_status = "⛔"
+            elif account["plus_url"]:
+                plus_status = "✅"
+            else:
+                plus_status = "❌"
+            
+            # Business/Sold status
+            business_status = "✅" if account["business_url"] else "❌"
+            sold_status = "✅" if is_sold else "❌"
+            
+            # Checkbox text
+            check_text = "☐" if is_sold else "☐"
+            
+            email_text = account["email"][:35] + "..." if len(account["email"]) > 35 else account["email"]
+            
+            # Build tags: sold + alternating row color
+            row_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            tags = ("sold", row_tag) if is_sold else (row_tag,)
+            
+            item_id = self.checkout_tree.insert(
+                "", "end",
+                text=check_text,
+                values=(email_text, plus_status, business_status, sold_status),
+                tags=tags
+            )
+            
+            # Create BooleanVar for compatibility with business logic
+            var = ctk.BooleanVar(value=False)
+            self.checkout_account_vars.append({
+                "var": var,
+                "account": account,
+                "tree_id": item_id
+            })
         
         self.update_checkout_selection_count()
     
@@ -3621,17 +3472,54 @@ class App(ctk.CTk):
             self.checkout_threads_entry.configure(state="disabled")
             self.checkout_delay_entry.configure(state="disabled")
     
+
+    def _toggle_checkout_row(self, event):
+        """Toggle selection of clicked treeview row"""
+        item = self.checkout_tree.identify_row(event.y)
+        if not item:
+            return
+        
+        # Find the account var for this item
+        for acc in self.checkout_account_vars:
+            if acc.get("tree_id") == item:
+                if acc["account"].get("is_sold", False):
+                    return  # Can't select sold accounts
+                
+                # Toggle
+                new_val = not acc["var"].get()
+                acc["var"].set(new_val)
+                
+                # Update checkbox text
+                self.checkout_tree.item(item, text="✅" if new_val else "☐")
+                
+                # Update tag for visual
+                tags = list(self.checkout_tree.item(item, "tags"))
+                if new_val and "selected" not in tags:
+                    tags.append("selected")
+                elif not new_val and "selected" in tags:
+                    tags.remove("selected")
+                self.checkout_tree.item(item, tags=tuple(tags))
+                break
+        
+        self.update_checkout_selection_count()
+    
     def checkout_select_all(self):
         """Select all non-sold accounts"""
         for item in self.checkout_account_vars:
             if not item["account"].get("is_sold", False):
                 item["var"].set(True)
+                tree_id = item.get("tree_id")
+                if tree_id:
+                    self.checkout_tree.item(tree_id, text="✅")
         self.update_checkout_selection_count()
     
     def checkout_deselect_all(self):
         """Deselect all accounts"""
         for item in self.checkout_account_vars:
             item["var"].set(False)
+            tree_id = item.get("tree_id")
+            if tree_id:
+                self.checkout_tree.item(tree_id, text="🔲")
         self.update_checkout_selection_count()
     
     def start_checkout_capture_thread(self):
@@ -3645,7 +3533,7 @@ class App(ctk.CTk):
                    if item["var"].get() and not item["account"].get("is_sold", False)]
         
         if not selected:
-            _toast(self, "⚠️ No accounts selected!", toast_type="warning")
+            print("⚠️ No accounts selected!")
             return
         
         self.lock_ui(True)
@@ -3816,7 +3704,7 @@ class App(ctk.CTk):
                 # Use neutral color for COMPLETED (like IDLE)
                 self.update_status("COMPLETED", None, f"Success: {final_success} | Failed: {final_fail}")
             
-            _toast(self, f"💳 Captured {final_success} checkout links!", toast_type="success" if final_success > 0 else "warning")
+            print(f"💳 Captured {final_success} checkout links!")
 
             # Stage 2: Schedule heavy table rebuild with delay so GUI stays responsive
             self.after(300, self.load_checkout_accounts)
@@ -3829,7 +3717,6 @@ class App(ctk.CTk):
         try:
             self._header_idx = (self._header_idx + 1) % len(self._header_colors)
             next_color = self._header_colors[self._header_idx]
-            self.motion.color(self.header_label, "text_color", next_color, duration_ms=1200, steps=15)
             self.after(4000, self._animate_header)
         except:
             pass
@@ -3841,7 +3728,6 @@ class App(ctk.CTk):
             if not hasattr(self, '_logo_color_idx'):
                 self._logo_color_idx = 0
             self._logo_color_idx = (self._logo_color_idx + 1) % len(colors)
-            self.motion.color(self.logo_frame, "border_color", colors[self._logo_color_idx], duration_ms=1500, steps=12)
             self.after(3000, self._animate_logo_glow)
         except:
             pass
@@ -3881,7 +3767,7 @@ class App(ctk.CTk):
     def _fade_in_widget(self, widget):
         """Simple fade-in by animating border glow"""
         try:
-            self.motion.color(widget, "border_color", self.colors["glass_border"], duration_ms=400, steps=25)
+            pass  # Animation removed for performance
         except:
             pass
     
@@ -3907,12 +3793,6 @@ class App(ctk.CTk):
                 # Cycle colors every ~2 seconds
                 if int(self._progress_phase) % 2 == 0 and self._progress_phase % 1 < 0.03:
                     self._progress_color_idx = (self._progress_color_idx + 1) % len(progress_colors)
-                    self.motion.color(
-                        self.progress_bar, 
-                        "progress_color", 
-                        progress_colors[self._progress_color_idx], 
-                        duration_ms=500
-                    )
                 
                 self._progress_job = self.after(16, tick)  # ~60fps
             except:
@@ -4030,7 +3910,7 @@ class App(ctk.CTk):
         """Save password to the source code file"""
         new_password = self.reg_password_var.get().strip()
         if not new_password:
-            _toast(self, "❌ Password cannot be empty!", toast_type="error")
+            print("❌ Password cannot be empty!")
             return
         
         try:
@@ -4049,14 +3929,14 @@ class App(ctk.CTk):
             
             # Check if pattern exists
             if not re.search(pattern, content):
-                _toast(self, "❌ Could not find DEFAULT_PASSWORD in code!", toast_type="error")
+                print("❌ Could not find DEFAULT_PASSWORD in code!")
                 return
             
             new_content = re.sub(pattern, replacement, content, count=1)
             
             # Verify the replacement was made
             if new_content == content:
-                _toast(self, "❌ Password replacement failed!", toast_type="error")
+                print("❌ Password replacement failed!")
                 return
             
             # Write back to file
@@ -4067,10 +3947,10 @@ class App(ctk.CTk):
             global DEFAULT_PASSWORD
             DEFAULT_PASSWORD = new_password
             
-            _toast(self, f"✅ Password saved: {new_password}", toast_type="success")
+            print(f"✅ Password saved: {new_password}")
             
         except Exception as e:
-            _toast(self, f"❌ Failed to save: {str(e)}", toast_type="error")
+            print(f"❌ Failed to save: {str(e)}")
     
     def toggle_proxy_inputs(self):
         """Enable/disable proxy inputs based on switch state"""
@@ -4094,18 +3974,18 @@ class App(ctk.CTk):
         enabled = self.reg_proxy_var.get()
         
         if not proxy_string:
-            _toast(self, "❌ Proxy string cannot be empty!", toast_type="error")
+            print("❌ Proxy string cannot be empty!")
             return
         
         # Auto-detect format and validate
         detected = detect_proxy_format(proxy_string)
         if not detected:
-            _toast(self, "❌ Cannot detect proxy format! Use user:pass@host:port or host:port:user:pass", toast_type="error")
+            print("❌ Cannot detect proxy format! Use user:pass@host:port or host:port:user:pass")
             return
         
         proxy_info, urls = parse_proxy(proxy_string, detected)
         if not proxy_info:
-            _toast(self, "❌ Invalid proxy! Check your input.", toast_type="error")
+            print("❌ Invalid proxy! Check your input.")
             return
         
         # Save to config file
@@ -4114,7 +3994,7 @@ class App(ctk.CTk):
             PROXY_STRING = proxy_string
             PROXY_FORMAT = detected
             
-            _toast(self, f"✅ Proxy saved: {proxy_info['host']}:{proxy_info['port']}", toast_type="success")
+            print(f"✅ Proxy saved: {proxy_info['host']}:{proxy_info['port']}")
             self.reg_proxy_info.configure(text="✓", text_color=self.colors["accent_green"])
             
             # Reset info text after 2 seconds
@@ -4123,7 +4003,7 @@ class App(ctk.CTk):
                 text_color=self.colors["accent_green"] if enabled else self.colors["text_muted"]
             ))
         else:
-            _toast(self, "❌ Failed to save proxy config!", toast_type="error")
+            print("❌ Failed to save proxy config!")
             
     def update_status(self, state="IDLE", color=None, details=""):
         # Thread-safety: schedule on main thread if called from background thread
@@ -4171,37 +4051,9 @@ class App(ctk.CTk):
         if _threading.current_thread() is not _threading.main_thread():
             self.after(0, lambda: self.update_stats(success, failed))
             return
-        # Get current values
-        def get_current(lbl):
-            try: 
-                text = lbl.cget("text")
-                return int(text)
-            except: 
-                return 0
-            
-        s0 = get_current(self.success_count_label)
-        f0 = get_current(self.fail_count_label)
-        
-        # Animate success counter
-        self.motion.number(
-            setter=lambda v: self.success_count_label.configure(text=str(int(v))),
-            start=s0, end=success, duration_ms=350, steps=30
-        )
-        
-        # Animate fail counter
-        self.motion.number(
-            setter=lambda v: self.fail_count_label.configure(text=str(int(v))),
-            start=f0, end=failed, duration_ms=350, steps=30
-        )
-        
-        # Flash card borders on change
-        if success > s0:
-            self.motion.color(self.success_card, "border_color", self.colors["success"], duration_ms=150)
-            self.after(300, lambda: self.motion.color(self.success_card, "border_color", "#1a3d32", duration_ms=300))
-        
-        if failed > f0:
-            self.motion.color(self.fail_card, "border_color", self.colors["error"], duration_ms=150)
-            self.after(300, lambda: self.motion.color(self.fail_card, "border_color", "#3d1a1a", duration_ms=300))
+        # Direct counter updates (no animation)
+        self.success_count_label.configure(text=str(success))
+        self.fail_count_label.configure(text=str(failed))
         
         # Update progress percentage
         total = success + failed
@@ -4251,20 +4103,13 @@ class App(ctk.CTk):
         self.reg_stop_btn.configure(state=stop_state)
         self.checkout_stop_btn.configure(state=stop_state)
         
-        # Animate stop button visibility
-        if is_running:
-            self.motion.color(self.reg_stop_btn, "border_color", self.colors["error"], duration_ms=200)
-            self.motion.color(self.checkout_stop_btn, "border_color", self.colors["error"], duration_ms=200)
-        else:
-            self.motion.color(self.reg_stop_btn, "border_color", self.colors["border_subtle"], duration_ms=200)
-            self.motion.color(self.checkout_stop_btn, "border_color", self.colors["border_subtle"], duration_ms=200)
         
         # Progress Bar (custom 60fps animation)
         if is_running:
-            self._start_progress_animation()
+            self.progress_bar.set(0.5)
             self.update_status("RUNNING", self.colors["info"], "Initializing automation...")
         else:
-            self._stop_progress_animation()
+            self.progress_bar.set(0)
             
         # Lock inputs
         self.reg_mode_menu.configure(state=state)
@@ -4308,7 +4153,7 @@ class App(ctk.CTk):
         self.update_status("STOPPING", self.colors["warning"], "Force stopping now...")
         # Run heavy cleanup in background thread to avoid freezing GUI
         threading.Thread(target=self._background_force_stop, daemon=True).start()
-        _toast(self, "⏹ Force stop sent (closing browsers now)", toast_type="warning")
+        print("⏹ Force stop sent (closing browsers now)")
 
     def _background_force_stop(self):
         """Run heavy cleanup off the main thread to keep GUI responsive"""
@@ -4437,14 +4282,14 @@ class App(ctk.CTk):
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("0.0", "end")
         self.log_textbox.configure(state="disabled")
-        _toast(self, "🗑️ Logs cleared!", toast_type="info")
+        print("🗑️ Logs cleared!")
         
     def copy_logs(self):
         try:
             text = self.log_textbox.get("0.0", "end")
             self.clipboard_clear()
             self.clipboard_append(text)
-            _toast(self, "📋 Copied to clipboard!", toast_type="success")
+            print("📋 Copied to clipboard!")
         except:
             pass
             
@@ -4454,9 +4299,9 @@ class App(ctk.CTk):
             if filename:
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(self.log_textbox.get("0.0", "end"))
-                _toast(self, "💾 Exported successfully!", toast_type="success")
+                print("💾 Exported successfully!")
         except Exception as e:
-            _toast(self, f"❌ Export failed!", toast_type="error")
+            print(f"❌ Export failed!")
             messagebox.showerror("Error", f"Could not export logs: {e}")
 
     # --- WORKERS ---
@@ -4709,9 +4554,9 @@ class App(ctk.CTk):
         
         # Show completion toast (schedule on main thread)
         if not self.stop_event.is_set():
-            self.after(0, lambda: _toast(self, f"✅ Completed! {success_count} accounts", toast_type="success"))
+            self.after(0, lambda: print(f"✅ Completed! {success_count} accounts"))
         else:
-            self.after(0, lambda: _toast(self, f"⏹ Stopped. {success_count} completed", toast_type="warning"))
+            self.after(0, lambda: print(f"⏹ Stopped. {success_count} completed"))
         
         self.lock_ui(False)
         # Restore status with neutral color (like IDLE) - schedule on main thread
