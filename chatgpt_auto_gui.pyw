@@ -32,7 +32,8 @@ from patchright.sync_api import sync_playwright
 try:
     import tls_client
 except ImportError:
-    os.system("pip install tls-client")
+    import subprocess as _sp
+    _sp.check_call([sys.executable, "-m", "pip", "install", "tls-client"])
     import tls_client
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
@@ -294,37 +295,6 @@ def get_proxy_for_requests():
     req_url = urls["requests"]
     return {"http": req_url, "https": req_url}
 
-def apply_proxy_to_chrome_options(options):
-    """Apply proxy settings to Chrome options.
-
-    Returns (bridge, label) where bridge is a LocalProxyAuthBridge or None.
-    """
-    if not PROXY_ENABLED or not PROXY_STRING:
-        return None, None
-    proxy_info, urls = parse_proxy(PROXY_STRING)
-    if not proxy_info or not urls:
-        return None, None
-    
-    host = (proxy_info.get("host") or "").strip()
-    port = str(proxy_info.get("port") or "").strip()
-    username = (proxy_info.get("username") or "").strip()
-    password = (proxy_info.get("password") or "").strip()
-
-    # Always ensure Chrome gets only host:port (never embed creds)
-    if not host or not port.isdigit():
-        return None, None
-
-    # Auth proxy: run a local bridge so Chrome never shows auth popup
-    if username and password:
-        bridge = LocalProxyAuthBridge(host, int(port), username, password)
-        bridge.start()
-        options.add_argument(f'--proxy-server=http://127.0.0.1:{bridge.bound_port}')
-        return bridge, f"127.0.0.1:{bridge.bound_port}"
-
-    # No-auth proxy
-    options.add_argument(f'--proxy-server=http://{host}:{port}')
-    return None, f"{host}:{port}"
-
 def load_proxy_config():
     """Load proxy configuration from JSON file."""
     global PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
@@ -532,7 +502,6 @@ class DongVanOAuth2API:
 
 # Global list để quản lý tài khoản OAuth2
 oauth2_accounts = []
-current_account_index = 0
 account_lock = threading.Lock()
 
 
@@ -684,16 +653,15 @@ class ChatGPTAutoRegisterWorker:
         
         if is_stopping:
             # Kill Playwright server PID + all children (browsers)
-            for pid in [self._pw_server_pid]:
-                if pid:
-                    try:
-                        subprocess.Popen(
-                            ['taskkill', '/F', '/PID', str(pid), '/T'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                        )
-                    except Exception:
-                        pass
+            if self._pw_server_pid:
+                try:
+                    subprocess.Popen(
+                        ['taskkill', '/F', '/PID', str(self._pw_server_pid), '/T'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except Exception:
+                    pass
             # Just nullify everything
             self.page = None
             self.context = None
@@ -1045,110 +1013,57 @@ class ChatGPTAutoRegisterWorker:
             "recovery_codes": recovery_codes,
         }
 
-    def get_random_fingerprint(self):
-        """Tạo ngẫu nhiên tổ hợp TLS Fingerprint và User-Agent khớp nhau"""
-        fingerprints = [
-            {"id": "chrome_120", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            {"id": "chrome_119", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"},
-            {"id": "chrome_116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"},
-            {"id": "chrome_117", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"},
-        ]
-        return random.choice(fingerprints)
-
-
     def _call_checkout_api(self, access_token, payload):
         """Gọi POST /backend-api/payments/checkout → trả về checkout URL"""
-        fp = self.get_random_fingerprint()
-        session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
-        lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "User-Agent": fp["ua"],
-            "Accept-Language": lang,
-            "Referer": "https://chatgpt.com/",
-            "Origin": "https://chatgpt.com"
-        }
-        
-        time.sleep(random.uniform(0.5, 1.5))
-        resp = session.post("https://chatgpt.com/backend-api/payments/checkout", headers=headers, json=payload)
-        
-        if resp.status_code != 200:
-            self.log(f"Checkout API error: {resp.status_code} - {resp.text[:80]}", Colors.ERROR, "❌ ")
-            return None
-        
-        try:
-            res_json = resp.json()
-        except Exception:
-            self.log("Checkout API response not JSON", Colors.ERROR, "❌ ")
-            return None
-        
-        final_link = res_json.get("url")
-        if not final_link and res_json.get("checkout_session_id"):
-            sid = res_json.get("checkout_session_id")
-            final_link = f"https://chatgpt.com/checkout/openai_llc/{sid}"
-        
-        return final_link
+        return call_checkout_api(access_token, payload, "Checkout", self.log)
     
-    def get_checkout_link_via_api(self, access_token):
-        """Lấy Plus checkout link qua API"""
+    # Checkout payloads by plan type
+    CHECKOUT_PAYLOADS = {
+        "Plus": {
+            "plan_name": "chatgptplusplan",
+            "billing_details": {"country": "VN", "currency": "VND"},
+            "checkout_ui_mode": "custom",
+            "promo_campaign": {"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": False}
+        },
+        "Business": {
+            "plan_name": "chatgptteamplan",
+            "team_plan_data": {
+                "workspace_name": "SABUBULEX",
+                "price_interval": "month",
+                "seat_quantity": 5
+            },
+            "billing_details": {"country": "VN", "currency": "VND"},
+            "checkout_ui_mode": "custom",
+            "promo_campaign": {
+                "promo_campaign_id": "team-1-month-free",
+                "is_coupon_from_query_param": True
+            }
+        },
+    }
+
+    def get_checkout_link_via_api(self, access_token, plan_type="Plus"):
+        """Lấy checkout link qua API. plan_type: 'Plus' hoặc 'Business'"""
+        emoji = "🔗 " if plan_type == "Plus" else "💼 "
         try:
-            self.log("Lấy Plus checkout link...", Colors.INFO, "🔗 ")
+            self.log(f"Lấy {plan_type} checkout link...", Colors.INFO, emoji)
             if not access_token:
                 return None
-            
-            payload = {
-                "plan_name": "chatgptplusplan",
-                "billing_details": {"country": "VN", "currency": "VND"},
-                "checkout_ui_mode": "custom",
-                "promo_campaign": {"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": False}
-            }
-            
-            url = self._call_checkout_api(access_token, payload)
-            
-            if url:
-                self.log(f"Plus Checkout URL (API): {url}", Colors.SUCCESS, "✅ ")
-            else:
-                self.log("Không lấy được Plus link qua API", Colors.WARNING, "⚠️ ")
-            
-            return url
-        except Exception as e:
-            self.log(f"API checkout error: {e}", Colors.ERROR, "❌ ")
-            return None
-    
-    def get_business_checkout_link_via_api(self, access_token):
-        """Lấy Business/Team checkout link qua API"""
-        try:
-            self.log("Lấy Business checkout link...", Colors.INFO, "💼 ")
-            if not access_token:
+
+            payload = self.CHECKOUT_PAYLOADS.get(plan_type)
+            if not payload:
+                self.log(f"Unknown plan type: {plan_type}", Colors.ERROR, "❌ ")
                 return None
-            
-            payload = {
-                "plan_name": "chatgptteamplan",
-                "team_plan_data": {
-                    "workspace_name": "SABUBULEX",
-                    "price_interval": "month",
-                    "seat_quantity": 5
-                },
-                "billing_details": {"country": "VN", "currency": "VND"},
-                "checkout_ui_mode": "custom",
-                "promo_campaign": {
-                    "promo_campaign_id": "team-1-month-free",
-                    "is_coupon_from_query_param": True
-                }
-            }
-            
+
             url = self._call_checkout_api(access_token, payload)
-            
+
             if url:
-                self.log(f"Business Checkout URL (API): {url}", Colors.SUCCESS, "✅ ")
+                self.log(f"{plan_type} Checkout URL (API): {url}", Colors.SUCCESS, "✅ ")
             else:
-                self.log("Không lấy được Business link qua API", Colors.WARNING, "⚠️ ")
-            
+                self.log(f"Không lấy được {plan_type} link qua API", Colors.WARNING, "⚠️ ")
+
             return url
         except Exception as e:
-            self.log(f"API business checkout error: {e}", Colors.ERROR, "❌ ")
+            self.log(f"API {plan_type} checkout error: {e}", Colors.ERROR, "❌ ")
             return None
 
     def save_account_info(self, session_data, checkout_url=None, business_checkout_url=None, mfa_secret=None):
@@ -1160,9 +1075,7 @@ class ChatGPTAutoRegisterWorker:
             if not session_data:
                 self.log("No session data to save", Colors.WARNING, "⚠️ ")
                 return False
-            
 
-            
             filename = "chatgpt.xlsx"
             account = f"{self.email_info['email']}:{self.password}"
             
@@ -1277,28 +1190,28 @@ class ChatGPTAutoRegisterWorker:
                 # === Step 4: POST signin → auth URL ===
                 self.log("Redirecting to auth.openai.com...", Colors.INFO, "🔄 ")
                 auth_session_id = str(uuid.uuid4())
-                signin_js = f"""
-                    async () => {{
-                        const params = new URLSearchParams({{
+                signin_js = """
+                    async ([deviceId, authSessionId, loginEmail, csrfTok]) => {
+                        const params = new URLSearchParams({
                             'prompt': 'login',
-                            'ext-oai-did': '{device_id}',
-                            'auth_session_logging_id': '{auth_session_id}',
+                            'ext-oai-did': deviceId,
+                            'auth_session_logging_id': authSessionId,
                             'screen_hint': 'login_or_signup',
-                            'login_hint': '{email}'
-                        }});
-                        const r = await fetch('/api/auth/signin/openai?' + params.toString(), {{
+                            'login_hint': loginEmail
+                        });
+                        const r = await fetch('/api/auth/signin/openai?' + params.toString(), {
                             method: 'POST',
-                            headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                            body: new URLSearchParams({{
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: new URLSearchParams({
                                 'callbackUrl': 'https://chatgpt.com/',
-                                'csrfToken': '{csrf_token}',
+                                'csrfToken': csrfTok,
                                 'json': 'true'
-                            }}).toString()
-                        }});
+                            }).toString()
+                        });
                         return await r.json();
-                    }}
+                    }
                 """
-                signin_resp = page.evaluate(signin_js)
+                signin_resp = page.evaluate(signin_js, [device_id, auth_session_id, email, csrf_token])
                 auth_url = signin_resp.get("url", "")
                 if not auth_url:
                     self.log("No auth URL returned", Colors.ERROR, "❌ ")
@@ -1319,17 +1232,17 @@ class ChatGPTAutoRegisterWorker:
                 
                 # === Step 5: Register via API ===
                 self.log("Registering account...", Colors.INFO, "📝 ")
-                register_js = f"""
-                    async () => {{
-                        const r = await fetch('/api/accounts/user/register', {{
+                register_js = """
+                    async ([regEmail, regPass]) => {
+                        const r = await fetch('/api/accounts/user/register', {
                             method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
-                            body: JSON.stringify({{ 'username': '{email}', 'password': '{password}' }})
-                        }});
-                        return {{ status: r.status, body: await r.text() }};
-                    }}
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ 'username': regEmail, 'password': regPass })
+                        });
+                        return { status: r.status, body: await r.text() };
+                    }
                 """
-                register_resp = page.evaluate(register_js)
+                register_resp = page.evaluate(register_js, [email, password])
                 reg_status = register_resp.get('status', 0)
                 reg_body = register_resp.get('body', '')
                 self.log(f"Register: {reg_status}", Colors.SUCCESS if reg_status == 200 else Colors.ERROR)
@@ -1346,13 +1259,13 @@ class ChatGPTAutoRegisterWorker:
                     continue_url = reg_data.get('continue_url', '')
                     if continue_url:
                         self.log("Following continue_url...", Colors.INFO)
-                        otp_trigger_js = f"""
-                            async () => {{
-                                const r = await fetch('{continue_url}', {{ headers: {{ 'Accept': 'application/json' }} }});
-                                return {{ status: r.status, body: await r.text() }};
-                            }}
+                        otp_trigger_js = """
+                            async (url) => {
+                                const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                                return { status: r.status, body: await r.text() };
+                            }
                         """
-                        page.evaluate(otp_trigger_js)
+                        page.evaluate(otp_trigger_js, continue_url)
                 except Exception as e:
                     self.log(f"OTP trigger error: {e}", Colors.WARNING)
                 
@@ -1375,17 +1288,17 @@ class ChatGPTAutoRegisterWorker:
                 self.log(f"OTP: {otp_code}", Colors.SUCCESS, "✅ ")
                 
                 # Validate OTP via API
-                validate_js = f"""
-                    async () => {{
-                        const r = await fetch('/api/accounts/email-otp/validate', {{
+                validate_js = """
+                    async (code) => {
+                        const r = await fetch('/api/accounts/email-otp/validate', {
                             method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
-                            body: JSON.stringify({{ 'code': '{otp_code}' }})
-                        }});
-                        return {{ status: r.status, body: await r.text() }};
-                    }}
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ 'code': code })
+                        });
+                        return { status: r.status, body: await r.text() };
+                    }
                 """
-                validate_resp = page.evaluate(validate_js)
+                validate_resp = page.evaluate(validate_js, otp_code)
                 status = validate_resp.get('status')
                 body = validate_resp.get('body', '')
                 self.log(f"OTP Validate: {status}", Colors.SUCCESS if status == 200 else Colors.ERROR)
@@ -1396,17 +1309,17 @@ class ChatGPTAutoRegisterWorker:
                 
                 # === Step 7: Create account (name + DOB) ===
                 self.log("Creating account...", Colors.INFO, "🏗️ ")
-                create_js = f"""
-                    async () => {{
-                        const r = await fetch('/api/accounts/create_account', {{
+                create_js = """
+                    async ([name, dob]) => {
+                        const r = await fetch('/api/accounts/create_account', {
                             method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
-                            body: JSON.stringify({{ 'name': '{full_name}', 'birthdate': '{birthdate}' }})
-                        }});
-                        return {{ status: r.status, body: await r.text() }};
-                    }}
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify({ 'name': name, 'birthdate': dob })
+                        });
+                        return { status: r.status, body: await r.text() };
+                    }
                 """
-                create_resp = page.evaluate(create_js)
+                create_resp = page.evaluate(create_js, [full_name, birthdate])
                 self.log(f"Account created: {create_resp.get('status')}", Colors.SUCCESS if create_resp.get('status') == 200 else Colors.ERROR)
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
@@ -1480,13 +1393,10 @@ class ChatGPTAutoRegisterWorker:
                 business_checkout_url = None
                 if GET_CHECKOUT_LINK and access_token:
                     checkout_type = GET_CHECKOUT_TYPE
-                    if checkout_type == "Plus":
-                        checkout_url = self.get_checkout_link_via_api(access_token)
-                    elif checkout_type == "Business":
-                        business_checkout_url = self.get_business_checkout_link_via_api(access_token)
-                    elif checkout_type == "Both":
-                        checkout_url = self.get_checkout_link_via_api(access_token)
-                        business_checkout_url = self.get_business_checkout_link_via_api(access_token)
+                    if checkout_type in ("Plus", "Both"):
+                        checkout_url = self.get_checkout_link_via_api(access_token, "Plus")
+                    if checkout_type in ("Business", "Both"):
+                        business_checkout_url = self.get_checkout_link_via_api(access_token, "Business")
                 
                 # === Save to Excel ===
                 saved = self.save_account_info(session_json_str, checkout_url, business_checkout_url, mfa_secret)
@@ -1553,6 +1463,58 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_
 # MODULE 4: CHECKOUT CAPTURE
 # ============================================================================
 
+# Shared TLS fingerprint list for checkout API calls
+_TLS_FINGERPRINTS = []
+for _ver in [110, 112, 114, 116, 118, 119, 120]:
+    for _os_val in ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64",
+                     "Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]:
+        _TLS_FINGERPRINTS.append({"id": f"chrome_{_ver}", "ua": f"Mozilla/5.0 ({_os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_ver}.0.0.0 Safari/537.36"})
+for _ver in [108, 110, 117, 120]:
+    for _os_val in ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64",
+                     "Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]:
+        _TLS_FINGERPRINTS.append({"id": f"firefox_{_ver}", "ua": f"Mozilla/5.0 ({_os_val}; rv:{_ver}.0) Gecko/20100101 Firefox/{_ver}.0"})
+
+
+def call_checkout_api(access_token, payload, label="Checkout", log_func=None):
+    """Shared: POST /backend-api/payments/checkout → checkout URL.
+    log_func(msg, color, emoji) is optional for logging.
+    """
+    fp = random.choice(_TLS_FINGERPRINTS)
+    session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
+    lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": fp["ua"],
+        "Accept-Language": lang,
+        "Referer": "https://chatgpt.com/",
+        "Origin": "https://chatgpt.com"
+    }
+
+    time.sleep(random.uniform(0.5, 1.5))
+    resp = session.post("https://chatgpt.com/backend-api/payments/checkout", headers=headers, json=payload)
+
+    if resp.status_code != 200:
+        if log_func:
+            log_func(f"{label} API error: {resp.status_code} - {resp.text[:80]}", Colors.ERROR, "❌ ")
+        return None
+
+    try:
+        res_json = resp.json()
+    except Exception:
+        if log_func:
+            log_func(f"{label} response not JSON", Colors.ERROR, "❌ ")
+        return None
+
+    final_link = res_json.get("url")
+    if not final_link and res_json.get("checkout_session_id"):
+        sid = res_json.get("checkout_session_id")
+        final_link = f"https://chatgpt.com/checkout/openai_llc/{sid}"
+
+    return final_link
+
+
 class CheckoutCaptureWorker:
     """Worker for capturing checkout links from existing accounts"""
     
@@ -1614,93 +1576,29 @@ class CheckoutCaptureWorker:
             if not access_token:
                 self.log("No access token", Colors.ERROR, "❌ ")
                 return False
-            
+
             self.log(f"Using access token: {access_token[:30]}...", Colors.SUCCESS, "🔑 ")
-            
-            # Fingerprint for TLS
-            os_windows = ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64"]
-            os_mac = ["Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]
-            
-            fp_list = []
-            for ver in [110, 112, 114, 116, 118, 119, 120]:
-                for os_val in os_windows + os_mac:
-                    fp_list.append({"id": f"chrome_{ver}", "ua": f"Mozilla/5.0 ({os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"})
-            for ver in [108, 110, 117, 120]:
-                for os_val in os_windows + os_mac:
-                    fp_list.append({"id": f"firefox_{ver}", "ua": f"Mozilla/5.0 ({os_val}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"})
-            
-            # Step 2: Call checkout API
+
             plus_url = None
             business_url = None
-            
-            def call_checkout(payload, label):
-                fp2 = random.choice(fp_list)
-                s2 = tls_client.Session(client_identifier=fp2["id"], random_tls_extension_order=True)
-                lang2 = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
-                h2 = {
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": fp2["ua"],
-                    "Accept-Language": lang2,
-                    "Referer": "https://chatgpt.com/",
-                    "Origin": "https://chatgpt.com"
-                }
-                time.sleep(random.uniform(0.5, 1.5))
-                r = s2.post("https://chatgpt.com/backend-api/payments/checkout", headers=h2, json=payload)
-                
-                if r.status_code != 200:
-                    self.log(f"{label} API error: {r.status_code} - {r.text[:80]}", Colors.ERROR, "❌ ")
-                    return None
-                
-                try:
-                    rj = r.json()
-                except Exception:
-                    self.log(f"{label} response not JSON", Colors.ERROR, "❌ ")
-                    return None
-                
-                url = rj.get("url")
-                if not url and rj.get("checkout_session_id"):
-                    sid = rj.get("checkout_session_id")
-                    url = f"https://chatgpt.com/checkout/openai_llc/{sid}"
-                return url
-            
+
             if self.checkout_type in ["Plus", "Both"]:
                 self.log("Requesting Plus checkout link...", Colors.INFO, "💳 ")
-                plus_url = call_checkout({
-                    "plan_name": "chatgptplusplan",
-                    "billing_details": {"country": "VN", "currency": "VND"},
-                    "checkout_ui_mode": "custom",
-                    "promo_campaign": {"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": False}
-                }, "Plus")
-                
+                plus_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Plus"], "Plus", self.log)
                 if plus_url:
                     self.log(f"Plus URL: {plus_url[:60]}...", Colors.SUCCESS, "✅ ")
                 else:
                     self.log("Could not get Plus link (no offer or error)", Colors.WARNING, "⚠️ ")
                     self.save_no_plus_offer()
-            
+
             if self.checkout_type in ["Business", "Both"]:
                 self.log("Requesting Business checkout link...", Colors.INFO, "💼 ")
-                business_url = call_checkout({
-                    "plan_name": "chatgptteamplan",
-                    "team_plan_data": {
-                        "workspace_name": "SABUBULEX",
-                        "price_interval": "month",
-                        "seat_quantity": 5
-                    },
-                    "billing_details": {"country": "VN", "currency": "VND"},
-                    "checkout_ui_mode": "custom",
-                    "promo_campaign": {
-                        "promo_campaign_id": "team-1-month-free",
-                        "is_coupon_from_query_param": True
-                    }
-                }, "Business")
-                
+                business_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Business"], "Business", self.log)
                 if business_url:
                     self.log(f"Business URL: {business_url[:60]}...", Colors.SUCCESS, "✅ ")
                 else:
                     self.log("Could not get Business link", Colors.WARNING, "⚠️ ")
-            
+
             # Save results
             if plus_url or business_url:
                 self.save_to_excel(plus_url, business_url)
@@ -1709,7 +1607,7 @@ class CheckoutCaptureWorker:
             else:
                 self.log(f"No checkout URLs captured for {self.email}", Colors.WARNING, "⚠️ ")
                 return False
-                
+
         except Exception as e:
             self.log(f"Error: {e}", Colors.ERROR, "❌ ")
             return False
@@ -1805,12 +1703,12 @@ class GlowButton(ctk.CTkButton):
     def _on_hover_enter(self, e=None):
         try:
             self.configure(border_width=2, border_color=self.glow_color)
-        except: pass
+        except Exception: pass
         
     def _on_hover_leave(self, e=None):
         try:
             self.configure(border_width=self.default_border, border_color="transparent")
-        except: pass
+        except Exception: pass
 
 
 class AnimatedCard(ctk.CTkFrame):
@@ -1852,7 +1750,7 @@ class PulsingDot(ctk.CTkFrame):
             target = self.base_color if bright else self._dim_color(self.base_color)
             self.configure(fg_color=target)
             self._pulse_job = self.after(500, lambda: self._do_pulse(not bright))
-        except: pass
+        except Exception: pass
         
     def _dim_color(self, hex_color):
         """Dim a hex color by 50%"""
@@ -1865,7 +1763,7 @@ class PulsingDot(ctk.CTkFrame):
         if self._pulse_job:
             try:
                 self.after_cancel(self._pulse_job)
-            except: pass
+            except Exception: pass
         self.configure(fg_color=self.base_color)
 
 
@@ -1919,7 +1817,7 @@ class TextRedirector(object):
             
             self.widget.see("end")
             self.widget.configure(state="disabled")
-        except:
+        except Exception:
             pass
 
     def flush(self):
@@ -1928,7 +1826,6 @@ class TextRedirector(object):
 # =========================
 # UI MOTION SYSTEM (CTk)
 # =========================
-import time
 import math
 
 class MotionTokens:
@@ -1982,7 +1879,7 @@ class Motion:
         job = self._jobs.pop(key, None)
         if job is not None:
             try: self.app.after_cancel(job)
-            except: pass
+            except Exception: pass
 
     def color(self, widget, prop: str, to_hex: str, *,
               duration_ms=None, steps=18, easing=None):
@@ -1995,22 +1892,22 @@ class Motion:
             try:
                 widget.configure(**{prop: to_hex})
                 return
-            except:
+            except Exception:
                 return
 
         if not isinstance(cur, str) or not cur.startswith("#") or len(cur) not in (4, 7):
             try:
                 widget.configure(**{prop: to_hex})
-            except:
+            except Exception:
                 pass
             return
 
         try:
             sr, sg, sb = _hex_to_rgb(cur)
             er, eg, eb = _hex_to_rgb(to_hex)
-        except:
+        except Exception:
             try: widget.configure(**{prop: to_hex})
-            except: pass
+            except Exception: pass
             return
 
         key = self._key(widget, prop, "color")
@@ -2029,7 +1926,7 @@ class Motion:
 
             try:
                 widget.configure(**{prop: _rgb_to_hex((r, g, b))})
-            except:
+            except Exception:
                 pass
 
             if t < 1.0:
@@ -2056,7 +1953,7 @@ class Motion:
             val = _lerp(start, end, te)
             try:
                 setter(fmt(val) if fmt else val)
-            except:
+            except Exception:
                 pass
 
             if t < 1.0:
@@ -2077,7 +1974,7 @@ class Motion:
         job = self._pulse_jobs.pop(key, None)
         if job is not None:
             try: self.app.after_cancel(job)
-            except: pass
+            except Exception: pass
 
         def loop(state=0):
             if key not in self._pulse_on:
@@ -2096,7 +1993,7 @@ class Motion:
         job = self._pulse_jobs.pop(key, None)
         if job is not None:
             try: self.app.after_cancel(job)
-            except: pass
+            except Exception: pass
 
     def hover(self, widget, *,
               enter=None, leave=None,
@@ -2116,7 +2013,7 @@ class Motion:
         try:
             widget.bind("<Enter>", on_enter)
             widget.bind("<Leave>", on_leave)
-        except:
+        except Exception:
             pass
 
 def _toast(app, message, duration_ms=2500, toast_type="info"):
@@ -2181,7 +2078,7 @@ def _toast(app, message, duration_ms=2500, toast_type="info"):
         fade_in()
         toast.after(duration_ms, fade_out)
         
-    except: pass
+    except Exception: pass
 
 class App(ctk.CTk):
     def __init__(self):
@@ -2455,10 +2352,6 @@ class App(ctk.CTk):
         self.progress_bar.pack(fill="x", padx=8, pady=7)
         self.progress_bar.set(0)
         
-        # Custom 60fps animation state
-        self._progress_phase = 0.0
-        self._progress_job = None
-
         # Progress percentage
         self.progress_percent = ctk.CTkLabel(
             self.status_frame,
@@ -2554,8 +2447,6 @@ class App(ctk.CTk):
         self.btn_export = ctk.CTkButton(self.log_toolbar, text="💾", command=self.export_logs, **btn_style)
         self.btn_export.pack(side="right", padx=3)
 
-        # Hover effects for toolbar buttons
-        
         # Log textbox with terminal aesthetics
         self.log_textbox = ctk.CTkTextbox(
             self.log_frame, 
@@ -2590,8 +2481,7 @@ class App(ctk.CTk):
         self._active_executors = set()
         self._active_runtime_lock = threading.Lock()
         
-        # ═══ ENTRANCE ANIMATIONS ═══
-        self.after(500, self._play_entrance_animations)
+        pass  # UI ready
 
     # --- FONT CACHE ---
     def _font(self, family="Segoe UI", size=13, weight="normal", slant="roman"):
@@ -3062,8 +2952,6 @@ class App(ctk.CTk):
         )
         self.reg_stop_btn.pack(side="right")
 
-        # Enhanced Hovers
-
     def setup_checkout_tab(self):
         """Setup the Checkout Capture tab with account selection table"""
         tab = self.tabview.tab("💳 Checkout Capture")
@@ -3413,8 +3301,8 @@ class App(ctk.CTk):
             business_status = "✅" if account["business_url"] else "❌"
             sold_status = "✅" if is_sold else "❌"
             
-            # Checkbox text
-            check_text = "☐" if is_sold else "☐"
+            # Checkbox text (sold accounts show dash, others unchecked box)
+            check_text = "—" if is_sold else "☐"
             
             email_text = account["email"][:35] + "..." if len(account["email"]) > 35 else account["email"]
             
@@ -3533,7 +3421,7 @@ class App(ctk.CTk):
             item["var"].set(False)
             tree_id = item.get("tree_id")
             if tree_id:
-                self.checkout_tree.item(tree_id, text="🔲")
+                self.checkout_tree.item(tree_id, text="☐")
         self.update_checkout_selection_count()
     
     def start_checkout_capture_thread(self):
@@ -3566,14 +3454,14 @@ class App(ctk.CTk):
                 threads = int(self.checkout_threads_entry.get())
                 max_allowed = min(5, len(selected))
                 threads = max(1, min(threads, max_allowed))
-            except:
+            except (ValueError, TypeError):
                 threads = 2
-            
+
             # Get delay between browsers
             try:
                 thread_delay = int(self.checkout_delay_entry.get())
                 thread_delay = max(1, min(thread_delay, 10))  # 1-10s
-            except:
+            except (ValueError, TypeError):
                 thread_delay = 3  # Default 3s
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Checkout Capture | Type: {checkout_type} | Accounts: {len(selected)} | Threads: {threads} | Delay: {thread_delay}s")
@@ -3726,26 +3614,6 @@ class App(ctk.CTk):
         self.after(100, finish_capture)
 
     # --- UI ANIMATIONS ---
-    def _animate_header(self):
-        """Cycle header title through vibrant accent colors"""
-        try:
-            self._header_idx = (self._header_idx + 1) % len(self._header_colors)
-            next_color = self._header_colors[self._header_idx]
-            self.after(4000, self._animate_header)
-        except:
-            pass
-    
-    def _animate_logo_glow(self):
-        """Animate logo border with color cycling"""
-        try:
-            colors = [self.colors["accent_primary"], self.colors["accent_secondary"], self.colors["accent_tertiary"]]
-            if not hasattr(self, '_logo_color_idx'):
-                self._logo_color_idx = 0
-            self._logo_color_idx = (self._logo_color_idx + 1) % len(colors)
-            self.after(3000, self._animate_logo_glow)
-        except:
-            pass
-    
     def _blink_cursor(self):
         """Animate terminal cursor blinking"""
         try:
@@ -3759,74 +3627,7 @@ class App(ctk.CTk):
                 self.cursor_indicator.configure(text_color=self.colors["glass_bg"])
             
             self.after(530, self._blink_cursor)
-        except:
-            pass
-    
-    def _play_entrance_animations(self):
-        """Staggered entrance animations for UI elements"""
-        try:
-            # Animate cards with staggered delays
-            elements = [
-                (self.controls_container, 0),
-                (self.status_frame, 100),
-                (self.log_frame, 200),
-            ]
-            
-            for widget, delay in elements:
-                self.after(delay, lambda w=widget: self._fade_in_widget(w))
-                
-        except Exception as e:
-            pass
-    
-    def _fade_in_widget(self, widget):
-        """Simple fade-in by animating border glow"""
-        try:
-            pass  # Animation removed for performance
-        except:
-            pass
-    
-    def _start_progress_animation(self):
-        """Start custom 60fps progress bar animation with color cycling"""
-        import math
-        self._progress_phase = 0.0
-        self._progress_color_idx = 0
-        
-        progress_colors = [
-            self.colors["accent_primary"],
-            self.colors["accent_tertiary"],
-            self.colors["accent_secondary"],
-        ]
-        
-        def tick():
-            try:
-                # Smooth sine wave animation (0 to 1 and back)
-                self._progress_phase += 0.025  # Speed control
-                value = (math.sin(self._progress_phase) + 1) / 2  # Normalize to 0-1
-                self.progress_bar.set(value)
-                
-                # Cycle colors every ~2 seconds
-                if int(self._progress_phase) % 2 == 0 and self._progress_phase % 1 < 0.03:
-                    self._progress_color_idx = (self._progress_color_idx + 1) % len(progress_colors)
-                
-                self._progress_job = self.after(16, tick)  # ~60fps
-            except:
-                pass
-        
-        tick()
-    
-    def _stop_progress_animation(self):
-        """Stop the custom progress animation"""
-        if self._progress_job:
-            try:
-                self.after_cancel(self._progress_job)
-            except:
-                pass
-            self._progress_job = None
-        self.progress_bar.set(0)
-        # Reset to primary color
-        try:
-            self.progress_bar.configure(progress_color=self.colors["accent_primary"])
-        except:
+        except Exception:
             pass
     
     # --- UI LOGIC ---
@@ -3854,40 +3655,22 @@ class App(ctk.CTk):
         global oauth2_accounts
         
         if mode == "OAuth2":
-            # Show refresh button
+            # Show refresh button and load accounts
             self.reg_oauth2_refresh.pack(side="left", padx=(8, 0))
-            
-            # Load oauth2 accounts from oauth2.xlsx
-            excel_file = "oauth2.xlsx"
-            if os.path.exists(excel_file):
-                oauth2_accounts = load_oauth2_accounts_from_excel(excel_file)
-                count = len(oauth2_accounts)
-                if count > 0:
-                    self.reg_oauth2_status.configure(
-                        text=f"✅ Loaded {count} OAuth2 accounts",
-                        text_color=self.colors["accent_green"]
-                    )
-                else:
-                    self.reg_oauth2_status.configure(
-                        text="⚠️ No OAuth2 accounts found in oauth2.xlsx",
-                        text_color=self.colors["warning"]
-                    )
-            else:
-                self.reg_oauth2_status.configure(
-                    text="❌ oauth2.xlsx not found",
-                    text_color=self.colors["error"]
-                )
-                oauth2_accounts = []
+            self._load_oauth2_and_update_status()
         else:
             # TinyHost mode - clear status and hide refresh button
             self.reg_oauth2_status.configure(text="")
             self.reg_oauth2_refresh.pack_forget()
             oauth2_accounts = []
-    
+
     def refresh_oauth2_accounts(self):
         """Refresh OAuth2 accounts from oauth2.xlsx"""
+        self._load_oauth2_and_update_status()
+
+    def _load_oauth2_and_update_status(self):
+        """Load OAuth2 accounts and update status label"""
         global oauth2_accounts
-        
         excel_file = "oauth2.xlsx"
         if os.path.exists(excel_file):
             oauth2_accounts = load_oauth2_accounts_from_excel(excel_file)
@@ -3910,7 +3693,6 @@ class App(ctk.CTk):
             oauth2_accounts = []
     
     def toggle_password_visibility(self):
-
         """Toggle password visibility"""
         self.password_visible = not self.password_visible
         if self.password_visible:
@@ -3935,8 +3717,6 @@ class App(ctk.CTk):
             with open(current_file, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Replace the DEFAULT_PASSWORD line using proper regex
-            import re
             # Match: DEFAULT_PASSWORD = "anything"
             pattern = r'DEFAULT_PASSWORD\s*=\s*"[^"]*"'
             replacement = f'DEFAULT_PASSWORD = "{new_password}"'
@@ -3961,7 +3741,7 @@ class App(ctk.CTk):
             global DEFAULT_PASSWORD
             DEFAULT_PASSWORD = new_password
             
-            print(f"✅ Password saved: {new_password}")
+            print("✅ Password saved successfully")
             
         except Exception as e:
             print(f"❌ Failed to save: {str(e)}")
@@ -4021,8 +3801,7 @@ class App(ctk.CTk):
             
     def update_status(self, state="IDLE", color=None, details=""):
         # Thread-safety: schedule on main thread if called from background thread
-        import threading as _threading
-        if _threading.current_thread() is not _threading.main_thread():
+        if threading.current_thread() is not threading.main_thread():
             self.after(0, lambda: self.update_status(state, color, details))
             return
         # Map state to icon (keep consistent neutral color for all states)
@@ -4061,8 +3840,7 @@ class App(ctk.CTk):
     def update_stats(self, success, failed):
         """Update stats cards with animated counters"""
         # Thread-safety: schedule on main thread if called from background thread
-        import threading as _threading
-        if _threading.current_thread() is not _threading.main_thread():
+        if threading.current_thread() is not threading.main_thread():
             self.after(0, lambda: self.update_stats(success, failed))
             return
         # Direct counter updates (no animation)
@@ -4077,8 +3855,7 @@ class App(ctk.CTk):
 
     def lock_ui(self, is_running):
         # Thread-safety: schedule on main thread if called from background thread
-        import threading as _threading
-        if _threading.current_thread() is not _threading.main_thread():
+        if threading.current_thread() is not threading.main_thread():
             self.after(0, lambda: self.lock_ui(is_running))
             return
         self.running = is_running
@@ -4174,17 +3951,10 @@ class App(ctk.CTk):
         self._force_stop_all_runtime()
         self._kill_chromium_processes()
     
-    def _kill_chromium_processes(self):
+    @staticmethod
+    def _kill_chromium_processes():
         """Kill any orphaned browser processes spawned by patchright"""
-        for proc_name in ['chrome.exe', 'chromium.exe']:
-            try:
-                subprocess.Popen(
-                    ['taskkill', '/F', '/IM', proc_name, '/T'],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-            except Exception:
-                pass
+        _kill_browser_processes()
     
     def on_closing(self):
         """Clean shutdown: kill all browsers, release files, then destroy window"""
@@ -4304,7 +4074,7 @@ class App(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(text)
             print("📋 Copied to clipboard!")
-        except:
+        except Exception:
             pass
             
     def export_logs(self):
@@ -4323,18 +4093,14 @@ class App(ctk.CTk):
         threading.Thread(target=self.run_registration).start()
 
     def run_registration(self):
-        global GET_CHECKOUT_LINK
-        
+        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, ENABLE_2FA, oauth2_accounts, PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+
         # Reset stop state and re-enable logging for new run
         self.stop_event.clear()
         TextRedirector._suppress_output = False
-        
+
         self.lock_ui(True)
-        self.stop_event.clear()
         self.update_stats(0, 0)
-        
-        # settings
-        global GET_CHECKOUT_LINK, GET_CHECKOUT_TYPE, ENABLE_2FA, oauth2_accounts, PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
         GET_CHECKOUT_LINK = self.reg_checkout_var.get()
         GET_CHECKOUT_TYPE = self.reg_checkout_type_var.get()
         ENABLE_2FA = self.reg_2fa_var.get()
@@ -4357,7 +4123,7 @@ class App(ctk.CTk):
         mode = self.reg_mode_var.get()
         try:
             count = int(self.reg_count_entry.get())
-        except:
+        except (ValueError, TypeError):
             count = 1
         
         # OAuth2 mode validation
@@ -4390,15 +4156,15 @@ class App(ctk.CTk):
                 threads = 2
             if threads > count:
                 threads = count  # Can't have more threads than accounts
-        except:
+        except (ValueError, TypeError):
             threads = 2
-            
+
         # Get thread delay (only for multithread mode)
         try:
             thread_delay = float(self.reg_delay_entry.get())
             if thread_delay < 0:
                 thread_delay = 2
-        except:
+        except (ValueError, TypeError):
             thread_delay = 2
             
         if mode == "Multithread":
@@ -4582,8 +4348,8 @@ class App(ctk.CTk):
         ))
 
 
-def _atexit_cleanup():
-    """Safety net: kill browser processes on exit"""
+def _kill_browser_processes():
+    """Kill any orphaned browser processes spawned by patchright"""
     for proc_name in ['chrome.exe', 'chromium.exe']:
         try:
             subprocess.Popen(
@@ -4594,7 +4360,7 @@ def _atexit_cleanup():
         except Exception:
             pass
 
-atexit.register(_atexit_cleanup)
+atexit.register(_kill_browser_processes)
 
 if __name__ == "__main__":
     app = App()
