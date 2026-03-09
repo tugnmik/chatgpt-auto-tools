@@ -1,210 +1,80 @@
 # ⚡ ChatGPT Auto Tools
 
-Công cụ tự động hóa đăng ký và quản lý tài khoản ChatGPT với giao diện đồ họa hiện đại.
-
-![Version](https://img.shields.io/badge/version-2.0-blue)
-![Python](https://img.shields.io/badge/python-3.8+-green)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
+Tool GUI đa luồng để tự động đăng ký tài khoản ChatGPT và lấy checkout link hàng loạt.
 
 ---
 
-## 📋 Tính năng chính
+## 🚀 Cài đặt
 
-### 1. 🚀 Đăng ký tài khoản tự động (Auto Registration)
-- Tự động tạo email tạm thời qua API tinyhost.shop
-- Đăng ký tài khoản ChatGPT hoàn toàn tự động
-- Hỗ trợ **multithreading** - đăng ký nhiều tài khoản đồng thời
-- Tự động nhận và nhập mã OTP từ email
-- Tùy chọn lấy checkout link (Plus/Business)
-- Lưu thông tin tài khoản vào file Excel
+**Yêu cầu:** Python 3.9+
 
-### 2. 🔐 Bật MFA tự động (MFA Enrollment)
-- Tự động bật xác thực 2 yếu tố (TOTP)
-- Trích xuất secret key từ QR code
-- Lưu TOTP secret vào Excel để sử dụng sau
-- Hỗ trợ xử lý xác thực qua email/password
-
-### 3. 💳 Lấy Checkout Link (Checkout Capture)
-- Lấy link thanh toán ChatGPT Plus
-- Lấy link thanh toán ChatGPT Business
-- Hỗ trợ chọn nhiều tài khoản cùng lúc
-- Tự động lưu link vào Excel
-
----
-
-## 🛠️ Yêu cầu hệ thống
-
-### Phần mềm
-- **Python** 3.8 trở lên
-- **Google Chrome** (phiên bản mới nhất)
-
-### Thư viện Python
 ```bash
-pip install requests
-pip install undetected-chromedriver
-pip install selenium
-pip install colorama
-pip install pyotp
-pip install openpyxl
-pip install customtkinter
+pip install patchright customtkinter openpyxl colorama tls-client pyotp requests
+python -m patchright install chromium
 ```
 
-Hoặc cài đặt tất cả cùng lúc:
-```bash
-pip install requests undetected-chromedriver selenium colorama pyotp openpyxl customtkinter
-```
+Chạy tool:
 
----
-
-## 🚀 Cách sử dụng
-
-### Khởi chạy ứng dụng
 ```bash
 python chatgpt_auto_gui.pyw
 ```
 
-Hoặc double-click file `chatgpt_auto_gui.pyw` (Windows)
+---
 
-### Chế độ OAuth2 Email (Tùy chọn)
+## Tab 🚀 Registration – Đăng ký tài khoản tự động
 
-Nếu bạn muốn sử dụng tài khoản Outlook/Hotmail qua OAuth2 thay vì TinyHost:
+Đăng ký hàng loạt tài khoản ChatGPT theo flow API-First (không click UI, nhanh hơn Selenium).
 
-1. **Chuẩn bị file template**:
-   Chạy lệnh sau để tạo file `oauth2.xlsx`:
-   ```bash
-   python create_oauth2_template.py
-   ```
+**Tính năng:**
+- **Multithreading** – Nhiều luồng đăng ký song song (cấu hình số luồng tùy ý)
+- **2 chế độ email:**
+  - `TinyHost` – Tự tạo email tạm thời ngẫu nhiên qua `tinyhost.shop`
+  - `OAuth2` – Dùng Gmail thật từ file `oauth2.xlsx` (DongVan API)
+- **Tùy chọn sau đăng ký:**
+  - `Get Checkout Link` – Tự động lấy link Plus / Business / cả hai ngay sau khi tạo xong
+  - `Enable 2FA` – Tự động bật TOTP, lưu secret key vào Excel
+- **Proxy support** – Hỗ trợ 3 format: `user:pass@host:port`, `host:port:user:pass`, `user:pass:host:port`
+- Tên, ngày sinh ngẫu nhiên cho mỗi tài khoản
+- Retry tự động 2 lần nếu thất bại
 
-2. **Điền thông tin tài khoản**:
-   Mở file `oauth2.xlsx` vừa tạo và điền thông tin vào các cột:
-   - Cột A: Định dạng `email|password|refresh_token|client_id`
-   - Cột B: `Status` (Để trống, tool sẽ tự điền "registered" khi thành công)
-
-3. **Sử dụng trong GUI**:
-   - Tại Tab Registration > Advanced Options
-   - Chọn **Email Mode**: `OAuth2`
-   - Nhấn nút 🔄 để load danh sách tài khoản
-
-### Tab 1: Registration (Đăng ký)
-
-1. **Số lượng tài khoản**: Nhập số tài khoản muốn đăng ký
-2. **Mật khẩu**: Đặt mật khẩu chung cho tất cả tài khoản
-3. **Network Mode**:
-   - `Fast`: Mạng ổn định, tốc độ cao
-   - `VPN/Slow`: Mạng không ổn định, timeout dài hơn
-4. **Get Checkout Link**: Bật để lấy link thanh toán sau khi đăng ký
-5. **Multithread Mode**: Bật để đăng ký nhiều tài khoản đồng thời
-   - Chọn số threads (1-10)
-   - Delay giữa các thread (ms)
-6. Nhấn **▶ Start Registration** để bắt đầu
-
-### Tab 2: MFA Enrollment (Bật MFA)
-
-1. **Chọn file Excel**: File chứa danh sách tài khoản đã đăng ký
-2. **Multithread Mode**: Bật để xử lý nhiều tài khoản đồng thời
-3. Nhấn **▶ Start MFA** để bắt đầu
-
-### Tab 3: Checkout Capture (Lấy link thanh toán)
-
-1. **Load Accounts**: Tải danh sách tài khoản từ file Excel
-2. **Chọn tài khoản**: Tick chọn các tài khoản cần lấy link
-3. **Checkout Type**: Plus, Business, hoặc Both
-4. Nhấn **▶ Start Capture** để bắt đầu
+**Quy trình đăng ký:**
+1. Lấy CSRF token
+2. POST signin → lấy auth URL
+3. Đăng ký qua `/api/accounts/user/register`
+4. Chờ OTP email và validate
+5. Tạo profile (tên + ngày sinh)
+6. Xác nhận qua `/backend-api/accounts/check`
+7. Lấy session token
+8. *(Tùy chọn)* Setup 2FA + lấy checkout link
 
 ---
 
-## 📁 Cấu trúc file
+## Tab 💳 Checkout Capture – Lấy checkout link hàng loạt
 
-```
-auto gpt/
-├── chatgpt_auto_gui.pyw     # File chính
-├── README.md                 # Hướng dẫn sử dụng
-└── chatgpt_accounts_*.xlsx   # File lưu tài khoản (tự động tạo)
-```
+Lấy checkout link từ các tài khoản đã lưu trong `chatgpt.xlsx` mà chưa có link.
 
-### Cấu trúc file Excel đầu ra
-
-| Cột | Mô tả |
-|-----|-------|
-| Email | Địa chỉ email |
-| Password | Mật khẩu |
-| Cookie | Session cookie (JSON) |
-| TOTP Secret | Secret key cho 2FA |
-| Plus Checkout | Link thanh toán Plus |
-| Business Checkout | Link thanh toán Business |
-| Status | Trạng thái tài khoản |
-| Created At | Thời gian tạo |
+**Tính năng:**
+- Đọc Excel, tự phát hiện tài khoản chưa có link
+- Hỗ trợ format mới (Session JSON) và format cũ (plain accessToken)
+- Chọn loại link: **Plus**, **Business**, hoặc **cả hai**
+- Chạy đa luồng, lưu kết quả trực tiếp vào Excel
+- Random TLS fingerprint (Chrome/Firefox) chống bot
 
 ---
 
-## ⚙️ Cấu hình
+## 📁 Cấu trúc file dữ liệu
 
-### Thay đổi phiên bản Chrome
-Nếu Chrome của bạn khác phiên bản mặc định, sửa dòng:
-```python
-CHROME_VERSION_MAIN = 144  # Đổi thành phiên bản Chrome của bạn
-```
+#### `chatgpt.xlsx` – Output tài khoản đã đăng ký
+| Cột | Nội dung |
+|-----|----------|
+| A | `email:password` |
+| B | Session JSON (từ `/api/auth/session`) |
+| C | Plus Checkout URL |
+| D | Business Checkout URL |
+| E | 2FA Secret (TOTP) |
 
-### Thay đổi mật khẩu mặc định
-Có thể thay đổi trong GUI hoặc sửa trực tiếp:
-```python
-DEFAULT_PASSWORD = "Matkhau123!@#"
-```
+#### `oauth2.xlsx` – Input tài khoản Gmail (chế độ OAuth2)
+| Cột A | `email|password|refresh_token|client_id` |
+| Cột B | Status (`registered` = đã dùng, trống = chưa) |
 
----
-
-## 🎨 Giao diện
-
-- **Dark Mode** mặc định
-- Hiệu ứng animation mượt mà
-- Status bar với màu sắc trạng thái
-- Console log với syntax highlighting
-- Thống kê realtime (Success/Failed)
-
----
-
-## ⚠️ Lưu ý quan trọng
-
-1. **Sử dụng VPN** nếu IP của bạn bị giới hạn
-2. **Không lạm dụng** - Có thể bị ban IP
-3. **Kiểm tra Chrome version** trước khi chạy
-4. **Backup file Excel** thường xuyên
-5. Tool chỉ dành cho mục đích **học tập và nghiên cứu**
-
----
-
-## 🐛 Xử lý lỗi thường gặp
-
-| Lỗi | Giải pháp |
-|-----|-----------|
-| ChromeDriver version mismatch | Cập nhật `CHROME_VERSION_MAIN` |
-| Operation timed out | Chuyển sang Network Mode: VPN/Slow |
-| Email not received | Tool sẽ tự động resend OTP |
-| Session expired | Đăng ký lại tài khoản |
-
----
-
-## 📝 Changelog
-
-### v2.0
-- Giao diện GUI hiện đại với CustomTkinter
-- Hỗ trợ multithreading
-- Thêm module Checkout Capture
-- Animation và hiệu ứng UI
-- Cải thiện xử lý lỗi và retry logic
-
----
-
-## 📄 License
-
-Dự án này chỉ dành cho mục đích học tập và nghiên cứu. Tác giả không chịu trách nhiệm cho bất kỳ việc sử dụng sai mục đích nào.
-
----
-
-## 👤 Tác giả
-
-**tungdk** - *Developer*
-
----
-
-⭐ Nếu thấy hữu ích, hãy cho một star nhé!
+#### `proxy_config.json` – Cấu hình proxy (tự tạo khi lưu trong GUI)
