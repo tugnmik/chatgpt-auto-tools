@@ -1474,9 +1474,13 @@ for _ver in [108, 110, 117, 120]:
                      "Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]:
         _TLS_FINGERPRINTS.append({"id": f"firefox_{_ver}", "ua": f"Mozilla/5.0 ({_os_val}; rv:{_ver}.0) Gecko/20100101 Firefox/{_ver}.0"})
 
+# Sentinel returned by call_checkout_api when the token is expired (HTTP 401)
+TOKEN_EXPIRED = "__TOKEN_EXPIRED__"
+
 
 def call_checkout_api(access_token, payload, label="Checkout", log_func=None):
     """Shared: POST /backend-api/payments/checkout → checkout URL.
+    Returns TOKEN_EXPIRED sentinel when access token is expired (401).
     log_func(msg, color, emoji) is optional for logging.
     """
     fp = random.choice(_TLS_FINGERPRINTS)
@@ -1498,6 +1502,9 @@ def call_checkout_api(access_token, payload, label="Checkout", log_func=None):
     if resp.status_code != 200:
         if log_func:
             log_func(f"{label} API error: {resp.status_code} - {resp.text[:80]}", Colors.ERROR, "❌ ")
+        # Distinguish expired token (401) from other errors so caller can re-login
+        if resp.status_code == 401 and "expired" in resp.text.lower():
+            return TOKEN_EXPIRED
         return None
 
     try:
@@ -1518,13 +1525,16 @@ def call_checkout_api(access_token, payload, label="Checkout", log_func=None):
 class CheckoutCaptureWorker:
     """Worker for capturing checkout links from existing accounts"""
     
-    def __init__(self, thread_id, email, access_token, excel_file, row_index, checkout_type="Plus"):
+    def __init__(self, thread_id, email, password, access_token, excel_file, row_index, checkout_type="Plus", mfa_secret=""):
         self.thread_id = thread_id
         self.email = email
+        self.password = password  # Needed for re-login when token is expired
+        self.mfa_secret = mfa_secret  # TOTP secret for 2FA during re-login
         self.access_token = access_token
         self.excel_file = excel_file
         self.row_index = row_index
         self.checkout_type = checkout_type  # "Plus", "Business", or "Both"
+        self.stop_event = None
         
     def log(self, message, color=Colors.INFO, emoji=""):
         safe_print(self.thread_id, message, color, emoji)
@@ -1552,6 +1562,175 @@ class CheckoutCaptureWorker:
             self.log(f"Failed to save to Excel: {e}", Colors.ERROR, "❌ ")
             return False
     
+    def _save_fresh_token(self, session_json_str):
+        """Update access token in Excel column B after re-login."""
+        try:
+            with file_lock:
+                wb = load_workbook(self.excel_file)
+                ws = wb.active
+                ws.cell(row=self.row_index, column=2, value=session_json_str)
+                wb.save(self.excel_file)
+                wb.close()
+            self.log("Token updated in Excel", Colors.SUCCESS, "💾 ")
+        except Exception as e:
+            self.log(f"Failed to update token: {e}", Colors.WARNING, "⚠️ ")
+
+    def _fresh_login(self):
+        """Open a browser, log in with email+password, return fresh access token."""
+        if not self.password:
+            self.log("No password available for re-login", Colors.ERROR, "❌ ")
+            return None
+        self.log(f"Token expired — re-logging in to refresh...", Colors.WARNING, "🔄 ")
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=False,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--lang=en-US",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = context.new_page()
+                try:
+                    # Navigate to chatgpt.com
+                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2000)
+
+                    # Get CSRF token
+                    csrf_resp = page.evaluate("""
+                        async () => {
+                            const r = await fetch('/api/auth/csrf', { headers: { 'Content-Type': 'application/json' } });
+                            return await r.json();
+                        }
+                    """)
+                    csrf_token = csrf_resp.get("csrfToken", "")
+                    if not csrf_token:
+                        self.log("No CSRF token", Colors.ERROR)
+                        return None
+
+                    # POST signin to get auth URL
+                    device_id = str(uuid.uuid4())
+                    auth_session_id = str(uuid.uuid4())
+                    signin_resp = page.evaluate("""
+                        async ([deviceId, authSessionId, loginEmail, csrfTok]) => {
+                            const params = new URLSearchParams({
+                                'prompt': 'login',
+                                'ext-oai-did': deviceId,
+                                'auth_session_logging_id': authSessionId,
+                                'screen_hint': 'login',
+                                'login_hint': loginEmail
+                            });
+                            const r = await fetch('/api/auth/signin/openai?' + params.toString(), {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: new URLSearchParams({
+                                    'callbackUrl': 'https://chatgpt.com/',
+                                    'csrfToken': csrfTok,
+                                    'json': 'true'
+                                }).toString()
+                            });
+                            return await r.json();
+                        }
+                    """, [device_id, auth_session_id, self.email, csrf_token])
+
+                    auth_url = signin_resp.get("url", "")
+                    if not auth_url:
+                        self.log("No auth URL returned", Colors.ERROR)
+                        return None
+
+                    # Navigate to auth.openai.com login form
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2000)
+
+                    # login_hint pre-fills email → page may show Continue button instead of email input
+                    # Try to find a visible email input first; if hidden/absent, click Continue
+                    email_visible = page.locator(
+                        "input#identifier:visible,input[name='identifier']:visible,input[type='email']:visible"
+                    )
+                    if email_visible.count() > 0:
+                        email_visible.first.fill(self.email)
+                        page.wait_for_timeout(500)
+                        page.keyboard.press("Enter")
+                    else:
+                        # Email already pre-filled via login_hint → click Continue / submit button
+                        continue_btn = page.locator(
+                            "button[type='submit'],button:has-text('Continue'),button:has-text('Tiếp tục')"
+                        )
+                        if continue_btn.count() > 0:
+                            continue_btn.first.click()
+                        else:
+                            page.keyboard.press("Enter")
+                    page.wait_for_timeout(2000)
+
+                    # Fill password
+                    pass_input = page.wait_for_selector(
+                        "input#password,input[name='password'],input[type='password']",
+                        timeout=20000
+                    )
+                    pass_input.fill(self.password)
+                    page.wait_for_timeout(500)
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(3000)
+
+                    # Handle MFA challenge if 2FA is enabled on this account
+                    if self.mfa_secret and "mfa" in page.url.lower():
+                        self.log("MFA challenge detected, entering TOTP code...", Colors.INFO, "🔐 ")
+                        try:
+                            totp = pyotp.TOTP(self.mfa_secret)
+                            mfa_code = totp.now()
+                            mfa_input = page.wait_for_selector(
+                                "input[name='code'],input[type='text'],input[inputmode='numeric']",
+                                timeout=10000
+                            )
+                            mfa_input.fill(mfa_code)
+                            page.wait_for_timeout(500)
+                            # Click submit/continue or press Enter
+                            submit_btn = page.locator("button[type='submit'],button:has-text('Continue'),button:has-text('Verify')")
+                            if submit_btn.count() > 0:
+                                submit_btn.first.click()
+                            else:
+                                page.keyboard.press("Enter")
+                            self.log(f"MFA code submitted: {mfa_code}", Colors.SUCCESS, "✅ ")
+                        except Exception as mfa_err:
+                            self.log(f"MFA entry error: {mfa_err}", Colors.ERROR, "❌ ")
+                            return None
+
+                    # Wait for redirect back to chatgpt.com
+                    page.wait_for_url("https://chatgpt.com/**", timeout=30000)
+                    page.wait_for_timeout(2000)
+
+                    # Get fresh session / access token
+                    session_resp = page.evaluate("""
+                        async () => {
+                            const r = await fetch('/api/auth/session');
+                            return await r.json();
+                        }
+                    """)
+                    access_token = session_resp.get("accessToken", "")
+                    if access_token:
+                        self.log(f"Fresh token obtained: {access_token[:30]}...", Colors.SUCCESS, "✅ ")
+                        self._save_fresh_token(json.dumps(session_resp))
+                        return access_token
+                    else:
+                        self.log("No access token in session after login", Colors.ERROR)
+                        return None
+                finally:
+                    try:
+                        page.close()
+                        context.close()
+                        browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log(f"Re-login error: {e}", Colors.ERROR, "❌ ")
+            return None
+
     def save_no_plus_offer(self):
         """Save 'no Plus offer' to Excel column C when account has no free Plus offer"""
         try:
@@ -1585,19 +1764,37 @@ class CheckoutCaptureWorker:
             if self.checkout_type in ["Plus", "Both"]:
                 self.log("Requesting Plus checkout link...", Colors.INFO, "💳 ")
                 plus_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Plus"], "Plus", self.log)
-                if plus_url:
+                if plus_url == TOKEN_EXPIRED:
+                    # Access token expired — re-login to get a fresh one, then retry once
+                    fresh_token = self._fresh_login()
+                    if fresh_token:
+                        access_token = fresh_token
+                        plus_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Plus"], "Plus", self.log)
+                    else:
+                        plus_url = None
+                if plus_url and plus_url != TOKEN_EXPIRED:
                     self.log(f"Plus URL: {plus_url[:60]}...", Colors.SUCCESS, "✅ ")
                 else:
                     self.log("Could not get Plus link (no offer or error)", Colors.WARNING, "⚠️ ")
                     self.save_no_plus_offer()
+                    plus_url = None
 
             if self.checkout_type in ["Business", "Both"]:
                 self.log("Requesting Business checkout link...", Colors.INFO, "💼 ")
                 business_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Business"], "Business", self.log)
-                if business_url:
+                if business_url == TOKEN_EXPIRED:
+                    # If Plus already refreshed the token, retry directly; else re-login now
+                    if plus_url is None:
+                        fresh_token = self._fresh_login()
+                        if fresh_token:
+                            access_token = fresh_token
+                    business_url = call_checkout_api(access_token, ChatGPTAutoRegisterWorker.CHECKOUT_PAYLOADS["Business"], "Business", self.log)
+                if business_url and business_url != TOKEN_EXPIRED:
                     self.log(f"Business URL: {business_url[:60]}...", Colors.SUCCESS, "✅ ")
                 else:
+                    business_url = None
                     self.log("Could not get Business link", Colors.WARNING, "⚠️ ")
+                    business_url = None
 
             # Save results
             if plus_url or business_url:
@@ -1641,16 +1838,20 @@ def load_checkout_accounts(excel_file):
             
             plus_url = row[2] if len(row) > 2 and row[2] else ""
             business_url = row[3] if len(row) > 3 and row[3] else ""
+            mfa_secret = str(row[4]).strip() if len(row) > 4 and row[4] else ""
             sold_status = row[5] if len(row) > 5 and row[5] else ""
             
             if not account or not access_token:
                 continue
             
-            # Parse email from account
-            if ":" in str(account):
-                email = str(account).split(":", 1)[0]
+            # Parse email and password from account (format: email:password or just email)
+            account_str = str(account)
+            if ":" in account_str:
+                email = account_str.split(":", 1)[0]
+                password = account_str.split(":", 1)[1]
             else:
-                email = str(account)
+                email = account_str
+                password = ""
             
             # Check if sold (any value in column F means sold)
             is_sold = bool(sold_status and str(sold_status).strip())
@@ -1658,6 +1859,8 @@ def load_checkout_accounts(excel_file):
             accounts.append({
                 "row_index": row_idx,
                 "email": email,
+                "password": password,
+                "mfa_secret": mfa_secret,
                 "account": account,
                 "access_token": access_token,
                 "plus_url": plus_url,
@@ -3489,10 +3692,12 @@ class App(ctk.CTk):
                 worker = CheckoutCaptureWorker(
                     thread_id=thread_id,
                     email=account["email"],
+                    password=account.get("password", ""),
                     access_token=account["access_token"],
                     excel_file=excel_file,
                     row_index=account["row_index"],
-                    checkout_type=checkout_type
+                    checkout_type=checkout_type,
+                    mfa_secret=account.get("mfa_secret", ""),
                 )
                 worker.stop_event = self.stop_event
 
@@ -3571,10 +3776,12 @@ class App(ctk.CTk):
                 worker = CheckoutCaptureWorker(
                     thread_id=1,
                     email=account["email"],
+                    password=account.get("password", ""),
                     access_token=account["access_token"],
                     excel_file=excel_file,
                     row_index=account["row_index"],
-                    checkout_type=checkout_type
+                    checkout_type=checkout_type,
+                    mfa_secret=account.get("mfa_secret", ""),
                 )
                 worker.stop_event = self.stop_event
 
