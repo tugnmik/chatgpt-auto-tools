@@ -435,8 +435,13 @@ class DongVanOAuth2API:
         except json.JSONDecodeError:
             return None
     
-    def extract_code_from_messages(self, messages_payload):
-        """Trích xuất code 6 số từ thư mới nhất"""
+    def extract_code_from_messages(self, messages_payload, exclude_codes=None):
+        """Trích xuất code 6 số từ thư mới nhất của OpenAI
+        
+        Args:
+            messages_payload: API response from fetch_messages()
+            exclude_codes: set of codes to ignore (e.g. stale codes from before OTP trigger)
+        """
         if not messages_payload:
             return None
         
@@ -445,6 +450,7 @@ class DongVanOAuth2API:
             return None
         
         pattern = re.compile(r"\b(\d{6})\b")
+        exclude_codes = exclude_codes or set()
         
         def parse_msg_datetime(raw):
             if not raw:
@@ -460,34 +466,53 @@ class DongVanOAuth2API:
                     continue
             return datetime.min
         
+        def is_openai_sender(msg):
+            """Check if the email is from OpenAI"""
+            from_field = msg.get("from", "")
+            if isinstance(from_field, list):
+                # Handle list-of-dict format: [{"name": ..., "address": ...}]
+                for f in from_field:
+                    addr = f.get("address", "") if isinstance(f, dict) else str(f)
+                    if "openai" in addr.lower():
+                        return True
+                return False
+            return "openai" in str(from_field).lower()
+        
+        # Lọc chỉ email từ OpenAI
+        openai_messages = [m for m in messages if is_openai_sender(m)]
+        if not openai_messages:
+            return None
+        
         # Sắp xếp thư mới nhất lên đầu
         sorted_messages = sorted(
-            messages,
+            openai_messages,
             key=lambda msg: parse_msg_datetime(msg.get("date")),
             reverse=True,
         )
         
-        if not sorted_messages:
-            return None
-        
-        latest_msg = sorted_messages[0]
-        
-        # Ưu tiên 1: Trường 'code' nếu có
-        code_field = latest_msg.get("code", "")
-        if code_field and pattern.match(str(code_field)):
-            return code_field
-        
-        # Ưu tiên 2: Extract từ subject line
-        subject = latest_msg.get("subject") or ""
-        subject_codes = pattern.findall(subject)
-        if subject_codes:
-            return subject_codes[0]
-        
-        # Ưu tiên 3: Extract từ content/message
-        content = latest_msg.get("content") or latest_msg.get("message") or ""
-        content_codes = pattern.findall(content)
-        if content_codes:
-            return content_codes[0]
+        # Duyệt qua các thư (mới nhất trước) tìm code chưa bị exclude
+        for msg in sorted_messages:
+            # Ưu tiên 1: Trường 'code' nếu có
+            code_field = msg.get("code", "")
+            if code_field and pattern.match(str(code_field)):
+                if str(code_field) not in exclude_codes:
+                    return str(code_field)
+            
+            # Ưu tiên 2: Extract từ subject line
+            subject = msg.get("subject") or ""
+            subject_codes = pattern.findall(subject)
+            for sc in subject_codes:
+                if sc not in exclude_codes:
+                    return sc
+            
+            # Ưu tiên 3: Extract từ content/message (strip HTML trước)
+            content = msg.get("content") or msg.get("message") or ""
+            # Strip HTML tags to avoid matching CSS values like color:#707070
+            content_clean = re.sub(r'<[^>]+>', ' ', content)
+            content_codes = pattern.findall(content_clean)
+            for cc in content_codes:
+                if cc not in exclude_codes:
+                    return cc
         
         return None
     
@@ -885,9 +910,9 @@ class ChatGPTAutoRegisterWorker:
         return None
 
     def _wait_for_otp_oauth2(self, timeout=120):
-        """Wait for OTP from OAuth2 email"""
+        """Wait for OTP from OAuth2 email.
+        Relies on OpenAI sender filter in extract_code_from_messages."""
         start_time = time.time()
-        last_code = None
         
         while time.time() - start_time < timeout:
             if self.stop_event and self.stop_event.is_set():
@@ -896,10 +921,9 @@ class ChatGPTAutoRegisterWorker:
                 messages = self.mail_api.fetch_messages()
                 if messages:
                     code = self.mail_api.extract_code_from_messages(messages)
-                    if code and code != last_code:
+                    if code:
                         self.log(f"OTP from OAuth2: {code}", Colors.SUCCESS, "✅ ")
                         return code
-                    last_code = code
             except Exception as e:
                 self.log(f"OAuth2 poll error: {e}", Colors.WARNING)
             
