@@ -29,6 +29,11 @@ import pyotp
 from datetime import datetime, timedelta
 from openpyxl import Workbook, load_workbook
 from patchright.sync_api import sync_playwright
+import re
+import html
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+
 try:
     import tls_client
 except ImportError:
@@ -337,6 +342,50 @@ class Colors:
     RESET = Style.RESET_ALL
 
 
+INVALID_STATE_PATTERNS = re.compile(
+    r"invalid_state|"
+    r"sign-in session is no longer valid|"
+    r"please start over|"
+    r"oops,\s*an error occurred|"
+    r"operation timed out|"
+    r"try again",
+    re.I
+)
+
+
+def page_has_invalid_state(page) -> bool:
+    try:
+        page.wait_for_timeout(1000)
+
+        page_text = page.evaluate("""
+            () => {
+                return [
+                    document.body?.innerText || "",
+                    document.title || "",
+                    location.href || ""
+                ].join("\\n");
+            }
+        """)
+
+        return bool(INVALID_STATE_PATTERNS.search(page_text or ""))
+    except Exception:
+        return False
+
+
+def clear_cookies_and_reload_login(context, page, login_url, log=print):
+    """
+    Generic recovery helper for stale OAuth state.
+    """
+    log("Detected stale login session. Clearing cookies and retrying login page.")
+
+    try:
+        context.clear_cookies()
+    except Exception as e:
+        log(f"Could not clear cookies: {e}")
+
+    page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(3000)
+
 def safe_print(thread_id, message, color=Colors.INFO, emoji=""):
     """Thread-safe print with thread ID"""
     with print_lock:
@@ -434,86 +483,136 @@ class DongVanOAuth2API:
             return None
         except json.JSONDecodeError:
             return None
-    
-    def extract_code_from_messages(self, messages_payload, exclude_codes=None):
-        """Trích xuất code 6 số từ thư mới nhất của OpenAI
-        
-        Args:
-            messages_payload: API response from fetch_messages()
-            exclude_codes: set of codes to ignore (e.g. stale codes from before OTP trigger)
-        """
-        if not messages_payload:
-            return None
-        
-        messages = messages_payload.get("messages")
-        if not isinstance(messages, list) or not messages:
-            return None
-        
-        pattern = re.compile(r"\b(\d{6})\b")
-        exclude_codes = exclude_codes or set()
-        
-        def parse_msg_datetime(raw):
+
+    def parse_msg_datetime(self, raw):
             if not raw:
                 return datetime.min
-            try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                pass
-            for fmt in ("%H:%M - %d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
+
+            raw = str(raw).strip()
+
+            for fmt in (
+                "%H:%M - %d/%m/%Y",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+            ):
                 try:
                     return datetime.strptime(raw, fmt)
                 except ValueError:
-                    continue
+                    pass
+
             return datetime.min
-        
-        def is_openai_sender(msg):
-            """Check if the email is from OpenAI"""
-            from_field = msg.get("from", "")
-            if isinstance(from_field, list):
-                # Handle list-of-dict format: [{"name": ..., "address": ...}]
-                for f in from_field:
-                    addr = f.get("address", "") if isinstance(f, dict) else str(f)
-                    if "openai" in addr.lower():
-                        return True
-                return False
-            return "openai" in str(from_field).lower()
-        
-        # Lọc chỉ email từ OpenAI
-        openai_messages = [m for m in messages if is_openai_sender(m)]
+
+    def clean_html(self, raw):
+        if not raw:
+            return ""
+
+        text = html.unescape(str(raw))
+        text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def extract_code_from_messages(self, messages_payload, exclude_codes=None):
+        if not messages_payload:
+            return None
+
+        messages = messages_payload.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            return None
+
+        exclude_codes = set(exclude_codes or [])
+
+        openai_messages = [
+            msg for msg in messages
+            if "openai.com" in str(msg.get("from", "")).lower()
+            and "verification code" in str(msg.get("subject", "")).lower()
+        ]
+
         if not openai_messages:
             return None
+
+        openai_messages.sort(
+            key=lambda msg: self.parse_msg_datetime(msg.get("date")),
+            reverse=True
+        )
+
+        for msg in openai_messages:
+            text = self.clean_html(msg.get("message", ""))
+
+            match = re.search(
+                r"Enter this temporary verification code to continue:\s*(\d{6})",
+                text,
+                flags=re.I
+            )
+
+            if match:
+                code = match.group(1)
+                if code not in exclude_codes:
+                    return code
+
+            for code in re.findall(r"\b\d{6}\b", text):
+                if code not in exclude_codes:
+                    return code
+
+        return None
+
+    def clean_text(value):
+        if not value:
+            return ""
+
+        text = str(value)
+        text = html.unescape(text)
+        text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
         
-        # Sắp xếp thư mới nhất lên đầu
+        openai_messages = [m for m in messages if is_openai_msg(m)]
+
+        if not openai_messages:
+            return None
+
+        import json
+        print(json.dumps(openai_messages[0], indent=2, ensure_ascii=False))
+
         sorted_messages = sorted(
             openai_messages,
             key=lambda msg: parse_msg_datetime(msg.get("date")),
             reverse=True,
         )
-        
-        # Duyệt qua các thư (mới nhất trước) tìm code chưa bị exclude
+
         for msg in sorted_messages:
-            # Ưu tiên 1: Trường 'code' nếu có
-            code_field = msg.get("code", "")
-            if code_field and pattern.match(str(code_field)):
-                if str(code_field) not in exclude_codes:
-                    return str(code_field)
-            
-            # Ưu tiên 2: Extract từ subject line
-            subject = msg.get("subject") or ""
-            subject_codes = pattern.findall(subject)
-            for sc in subject_codes:
-                if sc not in exclude_codes:
-                    return sc
-            
-            # Ưu tiên 3: Extract từ content/message (strip HTML trước)
-            content = msg.get("content") or msg.get("message") or ""
-            # Strip HTML tags to avoid matching CSS values like color:#707070
-            content_clean = re.sub(r'<[^>]+>', ' ', content)
-            content_codes = pattern.findall(content_clean)
-            for cc in content_codes:
-                if cc not in exclude_codes:
-                    return cc
-        
+            code_field = str(msg.get("code") or "").strip()
+
+            if re.fullmatch(r"\d{6}", code_field) and code_field not in exclude_codes:
+                return code_field
+
+            text = " ".join([
+                clean_text(msg.get("subject")),
+                clean_text(msg.get("content")),
+                clean_text(msg.get("message")),
+                clean_text(msg.get("body")),
+                clean_text(msg.get("text")),
+                clean_text(msg.get("html")),
+            ])
+
+            # First: context-aware match
+            for pat in code_patterns:
+                for match in pat.findall(text):
+                    if match not in exclude_codes:
+                        return match
+
+            # Fallback only for OpenAI ChatGPT verification emails
+            subject = clean_text(msg.get("subject")).lower()
+            if "chatgpt verification code" in subject:
+                for match in fallback_pattern.findall(text):
+                    if match not in exclude_codes:
+                        return match
+
         return None
     
     def get_email_info(self):
@@ -803,11 +902,28 @@ class ChatGPTAutoRegisterWorker:
                 position_index = (self.thread_id - 1) % self.num_threads if self.num_threads > 1 else 0
                 
                 self.context = self.browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
                     viewport={"width": viewport_w, "height": viewport_h},
                 )
                 self.page = self.context.new_page()
-                
+                self.page.set_default_timeout(45000)
+                self.page.set_default_navigation_timeout(60000)
+
+                # Network request/response logging for debugging
+                self._net_logs = []
+
+                def _on_response(response):
+                    url = response.url
+                    # Only log auth-related API calls
+                    if '/api/accounts/' in url or '/api/auth/' in url or 'sentinel' in url:
+                        status = response.status
+                        entry = f"[{status}] {response.request.method} {url.split('?')[0]}"
+                        self._net_logs.append(entry)
+                        if status >= 400:
+                            self.log(f"NET: {entry}", Colors.WARNING, "🔍 ")
+
+                self.page.on("response", _on_response)
+
                 self.log("Browser initialized!", Colors.SUCCESS, "✅ ")
                 return True
                 
@@ -822,6 +938,14 @@ class ChatGPTAutoRegisterWorker:
                     return False
         return False
 
+    def _dump_net_logs(self, max_entries=15):
+        """Dump recent network logs for debugging."""
+        if hasattr(self, '_net_logs') and self._net_logs:
+            self.log("─── Network Log ───", Colors.WARNING)
+            for entry in self._net_logs[-max_entries:]:
+                self.log(f"  {entry}", Colors.WARNING)
+            self._net_logs.clear()
+
     @staticmethod
     def _random_name():
         first = ["James","Robert","John","Michael","David","William","Richard",
@@ -833,79 +957,128 @@ class ChatGPTAutoRegisterWorker:
 
     @staticmethod
     def _random_birthdate():
-        start = datetime(1990, 1, 1)
-        end = datetime(2005, 12, 31)
+        start = datetime(1991, 1, 1)
+        end = datetime(2004, 5, 1)
         days = random.randint(0, (end - start).days)
         return (start + timedelta(days=days)).strftime("%Y-%m-%d")
 
     def _wait_for_otp_tinyhost(self, email, timeout=120):
-        """Wait for OTP from TinyHost email"""
+        """Wait for OTP from TinyHost email.
+        New flow (May 2026): OpenAI sends 2 OTP emails —
+          #1 when page first loads /email-verification (stale),
+          #2 after password is submitted (valid).
+        Strategy: wait until inbox has ≥ 2 OTP emails, then return code from the NEWEST one.
+        If after timeout/2 seconds only 1 OTP email exists, fall back to returning that one
+        (handles resend attempts and edge cases)."""
         mail_api = self.mail_api
         start_time = time.time()
-        checked_ids = set()
+        # Generic fallback pattern — used only after MSO-specific extraction fails
         pattern = re.compile(r"\b(\d{6})\b")
-        
+        # OpenAI email HTML: OTP sits between MSO conditional comments
+        # <!--[if mso]><span ...><![endif]--> \n  557407 \n <!--[if mso]></span><![endif]-->
+        mso_pattern = re.compile(r"<!\[endif\]-->\s*(\d{6})\s*<!--\[if mso\]>", re.DOTALL)
+
+        def _extract_otp_from_html(html_text):
+            """Extract OTP from OpenAI HTML email — MSO pattern first, generic fallback."""
+            # Primary: MSO conditional comment wrapper (immune to CSS color codes like #202123)
+            m = mso_pattern.search(html_text)
+            if m:
+                return m.group(1), "mso_pattern"
+            # Fallback: strip HTML tags, then look for standalone 6-digit number
+            # (avoids matching CSS hex like #202123 since those are inside tag attributes)
+            stripped = re.sub(r"<[^>]+>", " ", html_text)
+            codes = pattern.findall(stripped)
+            if codes:
+                return codes[0], "stripped_html"
+            return None, None
+
+        def _extract_code(mail_obj, domain, user):
+            """Extract 6-digit OTP from a mail object, fetching detail if needed."""
+            # Subject first (plain text, no CSS noise)
+            subject = mail_obj.get("subject", "") or ""
+            codes = pattern.findall(subject)
+            if codes:
+                return codes[0], "subject"
+            # Plain text body
+            body = mail_obj.get("body", "") or ""
+            if body:
+                codes = pattern.findall(body)
+                if codes:
+                    return codes[0], "body"
+            # HTML body — use smart extractor
+            html_body = mail_obj.get("html_body", "") or ""
+            if html_body:
+                code, src = _extract_otp_from_html(html_body)
+                if code:
+                    return code, src
+            # Fetch full detail as fallback
+            try:
+                detail = mail_api.get_email_detail(domain, user, mail_obj.get("id"))
+                if detail:
+                    subj = detail.get("subject", "") or ""
+                    codes = pattern.findall(subj)
+                    if codes:
+                        return codes[0], "detail.subject"
+                    bd = detail.get("body", "") or ""
+                    if bd:
+                        codes = pattern.findall(bd)
+                        if codes:
+                            return codes[0], "detail.body"
+                    hb = detail.get("html_body", "") or ""
+                    if hb:
+                        code, src = _extract_otp_from_html(hb)
+                        if code:
+                            return code, f"detail.{src}"
+            except Exception:
+                pass
+            return None, None
+
         while time.time() - start_time < timeout:
             if self.stop_event and self.stop_event.is_set():
                 return None
             try:
                 domain = email.split("@")[1]
                 user = email.split("@")[0]
-                data = mail_api.get_emails(domain, user, limit=10)
+                data = mail_api.get_emails(domain, user, limit=20)
                 if data:
                     emails_list = data.get("emails", [])
-                    for mail in emails_list:
-                        mail_id = mail.get("id")
-                        if mail_id in checked_ids:
-                            continue
-                        
-                        sender = mail.get("sender", "")
-                        subject = mail.get("subject", "")
-                        
-                        # Filter for OpenAI emails
-                        if "openai" not in sender.lower() and "openai" not in subject.lower():
-                            checked_ids.add(mail_id)
-                            continue
-                        
-                        self.log(f"Checking email [{mail_id}]: '{subject}' from {sender}", Colors.INFO)
-                        
-                        # Try extract from subject
-                        codes = pattern.findall(subject)
-                        if codes:
-                            self.log(f"OTP from subject: {codes[0]}", Colors.SUCCESS, "✅ ")
-                            return codes[0]
-                        
-                        # Try extract from body
-                        body = mail.get("body", "") or ""
-                        html_body = mail.get("html_body", "") or ""
-                        for text in [body, html_body]:
-                            codes = pattern.findall(text)
-                            if codes:
-                                self.log(f"OTP from body: {codes[0]}", Colors.SUCCESS, "✅ ")
-                                return codes[0]
-                        
-                        # Try full detail
-                        try:
-                            detail = mail_api.get_email_detail(domain, user, mail_id)
-                            if detail:
-                                for field in ["subject", "body", "html_body"]:
-                                    text = detail.get(field, "") or ""
-                                    codes = pattern.findall(text)
-                                    if codes:
-                                        self.log(f"OTP from detail.{field}: {codes[0]}", Colors.SUCCESS, "✅ ")
-                                        return codes[0]
-                        except Exception:
-                            pass
-                        
-                        checked_ids.add(mail_id)
+                    # Collect all OpenAI OTP emails
+                    otp_emails = [
+                        m for m in emails_list
+                        if "openai" in m.get("sender", "").lower()
+                        or "openai" in m.get("subject", "").lower()
+                    ]
+
+                    elapsed = time.time() - start_time
+                    # Wait for ≥ 2 OTP emails (flow sends 2: one on page load, one after password)
+                    # Fallback to 1 email after timeout/2 to handle edge cases / resend retries
+                    need_count = 2 if elapsed < timeout / 2 else 1
+
+                    if len(otp_emails) >= need_count:
+                        # Sort by id descending — largest id = newest email
+                        otp_emails.sort(
+                            key=lambda m: int(str(m.get("id", 0))), reverse=True
+                        )
+                        newest = otp_emails[0]
+                        mail_id = newest.get("id")
+                        self.log(
+                            f"Checking email [{mail_id}]: '{newest.get('subject','')}' "
+                            f"from {newest.get('sender','')} "
+                            f"({len(otp_emails)} OTP mails found)",
+                            Colors.INFO
+                        )
+                        code, source = _extract_code(newest, domain, user)
+                        if code:
+                            self.log(f"OTP from {source}: {code}", Colors.SUCCESS, "✅ ")
+                            return code
             except Exception as e:
                 self.log(f"Email poll error: {e}", Colors.WARNING)
-            
+
             remaining = int(timeout - (time.time() - start_time))
             if remaining > 0 and remaining % 10 == 0:
                 self.log(f"Waiting for OTP... ({remaining}s remaining)", Colors.INFO, "⏳ ")
             time.sleep(1)
-        
+
         self.log(f"OTP timeout after {timeout}s", Colors.ERROR, "❌ ")
         return None
 
@@ -1189,23 +1362,70 @@ class ChatGPTAutoRegisterWorker:
                 
                 # === Step 2: Navigate + CSRF ===
                 self.log("Navigating to chatgpt.com...", Colors.INFO, "🌐 ")
-                page.goto("https://chatgpt.com/", wait_until="networkidle", timeout=60000)
+                try:
+                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    self.log(f"Initial navigation failed: {e}", Colors.WARNING, "⚠️ ")
+
+                    try:
+                        page.goto("https://chatgpt.com/", wait_until="load", timeout=60000)
+                    except Exception as e2:
+                        self.log(f"Initial navigation retry failed: {e2}", Colors.ERROR, "❌ ")
+                        self.cleanup_browser()
+                        self.current_retry += 1
+                        continue
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
                     return (False, None)
                 page.wait_for_timeout(2000)
-                
+
+                # Warm up: fetch providers (mimics real browser init sequence)
+                page.evaluate("""async () => { await fetch('/api/auth/providers'); }""")
+                page.wait_for_timeout(500)
+
                 # === Step 3: Get CSRF token ===
                 self.log("Getting CSRF token...", Colors.INFO, "🔑 ")
-                csrf_resp = page.evaluate("""
+                csrf_resp_raw = page.evaluate("""
                     async () => {
-                        const r = await fetch('/api/auth/csrf', { headers: { 'Content-Type': 'application/json' } });
-                        return await r.json();
+                        const r = await fetch('/api/auth/csrf', {
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+
+                        const contentType = r.headers.get('content-type') || '';
+                        const text = await r.text();
+
+                        let body = null;
+                        if (contentType.includes('application/json')) {
+                            try {
+                                body = JSON.parse(text);
+                            } catch (e) {
+                                body = null;
+                            }
+                        }
+
+                        return {
+                            ok: r.ok,
+                            status: r.status,
+                            contentType: contentType,
+                            isJson: contentType.includes('application/json'),
+                            text: text.slice(0, 1000),
+                            body: body
+                        };
                     }
                 """)
+
+                if not csrf_resp_raw.get("ok") or not csrf_resp_raw.get("isJson"):
+                    print("CSRF request failed")
+                    print("Status:", csrf_resp_raw.get("status"))
+                    print("Content-Type:", csrf_resp_raw.get("contentType"))
+                    print("Body preview:", csrf_resp_raw.get("text"))
+                    # retry / stop / rotate normal network settings here
+
+                csrf_resp = csrf_resp_raw.get("body") or {}
                 csrf_token = csrf_resp.get("csrfToken", "")
                 if not csrf_token:
                     self.log("Failed to get CSRF token", Colors.ERROR, "❌ ")
+                    self._dump_net_logs()
                     self.cleanup_browser()
                     self.current_retry += 1
                     continue
@@ -1220,9 +1440,11 @@ class ChatGPTAutoRegisterWorker:
                             'prompt': 'login',
                             'ext-oai-did': deviceId,
                             'auth_session_logging_id': authSessionId,
+                            'ext-passkey-client-capabilities': '1111',
                             'screen_hint': 'login_or_signup',
                             'login_hint': loginEmail
                         });
+
                         const r = await fetch('/api/auth/signin/openai?' + params.toString(), {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1232,13 +1454,44 @@ class ChatGPTAutoRegisterWorker:
                                 'json': 'true'
                             }).toString()
                         });
-                        return await r.json();
+
+                        const contentType = r.headers.get('content-type') || '';
+                        const text = await r.text();
+
+                        let body = null;
+                        if (contentType.includes('application/json')) {
+                            try {
+                                body = JSON.parse(text);
+                            } catch (e) {
+                                body = null;
+                            }
+                        }
+
+                        return {
+                            ok: r.ok,
+                            status: r.status,
+                            contentType: contentType,
+                            isJson: contentType.includes('application/json'),
+                            text: text.slice(0, 1000),
+                            body: body
+                        };
                     }
                 """
-                signin_resp = page.evaluate(signin_js, [device_id, auth_session_id, email, csrf_token])
+                signin_resp_raw = page.evaluate(signin_js, [device_id, auth_session_id, email, csrf_token])
+
+                if not signin_resp_raw.get("ok") or not signin_resp_raw.get("isJson"):
+                    self.log(f"Signin failed: HTTP {signin_resp_raw.get('status')}", Colors.WARNING, "⚠️ ")
+                    self.log(f"Body preview: {signin_resp_raw.get('text', '')[:300]}", Colors.WARNING)
+                    self._dump_net_logs()
+                    self.cleanup_browser()
+                    self.current_retry += 1
+                    continue
+
+                signin_resp = signin_resp_raw.get("body") or {}
                 auth_url = signin_resp.get("url", "")
                 if not auth_url:
                     self.log("No auth URL returned", Colors.ERROR, "❌ ")
+                    self._dump_net_logs()
                     self.cleanup_browser()
                     self.current_retry += 1
                     continue
@@ -1248,144 +1501,611 @@ class ChatGPTAutoRegisterWorker:
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
                     return (False, None)
-                page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+                page.goto(auth_url, wait_until="load", timeout=60000)
+                if self.stop_event and self.stop_event.is_set():
+                    self.cleanup_browser()
+                    return (False, None)
+                page.wait_for_timeout(2000)
+                self.log("Checking invalid/prelogin state after auth page...", Colors.INFO, "🔎 ")
+
+                if page_has_invalid_state(page):
+                    self.log("Detected invalid/prelogin timeout page — retrying", Colors.WARNING, "⚠️ ")
+
+                    try:
+                        self.context.clear_cookies()
+                    except Exception:
+                        pass
+
+                    self.cleanup_browser()
+                    self.current_retry += 1
+                    continue
+                
+                # === Step 5: Submit password via form (register happens internally with sentinel PoW) ===
+                # New flow (May 2026): auth_url → /email-verification with "Continue with password"
+                # button → click → /create-account/password → fill password → back to /email-verification
+                # Retry detection: if no "Continue with password" button → password already set
+                current_url = page.url
+                skip_password = False
+                skip_otp = "/about-you" in current_url
+
+                if "/about-you" in current_url:
+                    # Account fully registered in a prior attempt, skip both steps
+                    skip_password = True
+                    self.log("Steps skipped (already at /about-you)", Colors.WARNING, "⚠️ ")
+                elif "email-verification" in current_url or "email-otp" in current_url:
+                    # New flow: landed on email-verification — check for "Continue with password"
+                    try:
+                        cont_pw_btn = page.locator(
+                            "button:has-text('Continue with password'), "
+                            "button:has-text('Tiếp tục với mật khẩu'), "
+                            "a:has-text('Continue with password')"
+                        )
+                        if cont_pw_btn.count() > 0 and cont_pw_btn.first.is_visible():
+                            self.log("Clicking 'Continue with password'...", Colors.INFO, "🔑 ")
+                            cont_pw_btn.first.click()
+                            page.wait_for_timeout(2000)
+
+                            self.log("Checking invalid/prelogin state after auth page...", Colors.INFO, "🔎 ")
+                            page.wait_for_timeout(4000)
+                            if page_has_invalid_state(page):
+                                self.log("Detected invalid state after Continue with password — retrying", Colors.WARNING, "⚠️ ")
+                                self.cleanup_browser()
+                                self.current_retry += 1
+                                continue
+                            # Now on /create-account/password — fall through to password fill below
+                        else:
+                            # No button → password already set, OTP still pending (retry case)
+                            skip_password = True
+                            self.log("Password step skipped (OTP already pending)", Colors.WARNING, "⚠️ ")
+                    except Exception:
+                        skip_password = True
+                # else: directly on /create-account/password (fallback) — proceed normally
+
+                if not skip_password:
+                    self.log("Registering account...", Colors.INFO, "📝 ")
+                    try:
+                        # Increased timeout: auth.openai.com needs Cloudflare challenge
+                        # + Sentinel SDK load before the React form renders (~6-10s typical)
+                        pass_input = page.wait_for_selector(
+                            "input[type='password'], input[name='password'], input#password",
+                            timeout=30000
+                        )
+                        if pass_input:
+                            pass_input.fill(password)
+                            page.wait_for_timeout(500)
+
+                            # Click Continue/Submit (exclude social login buttons)
+                            submit_btn = page.locator(
+                                "button[name='intent'][value='password'], "
+                                "button[type='submit']:not(:has-text('Google')):not(:has-text('Apple')):not(:has-text('Microsoft'))"
+                            )
+                            if submit_btn.count() > 0:
+                                submit_btn.first.click()
+                            else:
+                                page.keyboard.press("Enter")
+
+                            self.log("Registered", Colors.SUCCESS, "✅ ")
+                            page.wait_for_timeout(3000)
+                            self.log("Checking invalid/prelogin state after auth page...", Colors.INFO, "🔎 ")
+
+
+                            if page_has_invalid_state(page):
+                                self.log("Detected invalid state after password submit — retrying", Colors.WARNING, "⚠️ ")
+                                self.cleanup_browser()
+                                self.current_retry += 1
+                                continue
+
+                        else:
+                            self.log("No password field found", Colors.ERROR, "❌ ")
+                            self.cleanup_browser()
+                            self.current_retry += 1
+                            continue
+                    except Exception as e:
+                        self.log(f"Register error: {e}", Colors.ERROR, "❌ ")
+                        self.cleanup_browser()
+                        self.current_retry += 1
+                        continue
+                
                 if self.stop_event and self.stop_event.is_set():
                     self.cleanup_browser()
                     return (False, None)
                 page.wait_for_timeout(2000)
                 
-                # === Step 5: Register via API ===
-                self.log("Registering account...", Colors.INFO, "📝 ")
-                register_js = """
-                    async ([regEmail, regPass]) => {
-                        const r = await fetch('/api/accounts/user/register', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            body: JSON.stringify({ 'username': regEmail, 'password': regPass })
-                        });
-                        return { status: r.status, body: await r.text() };
-                    }
-                """
-                register_resp = page.evaluate(register_js, [email, password])
-                reg_status = register_resp.get('status', 0)
-                reg_body = register_resp.get('body', '')
-                self.log(f"Register: {reg_status}", Colors.SUCCESS if reg_status == 200 else Colors.ERROR)
+                # === Step 6: Wait for OTP + Validate via API ===
+                # skip_create_account=True when OTP validate response reveals account already fully created
+                skip_create_account = False
+                if skip_otp:
+                    self.log("OTP step skipped (already at /about-you)", Colors.WARNING, "⚠️ ")
+                else:
+                    self.log("Waiting for OTP...", Colors.INFO, "📬 ")
+                    otp_code = None
+                    max_resends = 3
+                    for otp_attempt in range(max_resends + 1):
+                        # Wait 10s for OTP email
+                        if self.email_mode == "OAuth2":
+                            otp_code = self._wait_for_otp_oauth2(timeout=10)
+                        else:
+                            otp_code = self._wait_for_otp_tinyhost(email, timeout=10)
+                        
+                        if otp_code:
+                            break
+                        
+                        if otp_attempt < max_resends:
+                            # Resend OTP via XHR
+                            self.log(f"No OTP, resending ({otp_attempt + 1}/{max_resends})...", Colors.WARNING, "🔄 ")
+                            try:
+                                page.evaluate("""
+                                    () => {
+                                        const xhr = new XMLHttpRequest();
+                                        xhr.open('POST', '/api/accounts/email-otp/resend', true);
+                                        xhr.send();
+                                    }
+                                """)
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(1000)
+                    
+                    if not otp_code:
+                        self.log("OTP timeout", Colors.ERROR, "❌ ")
+                        self.cleanup_browser()
+                        return (False, None)
+                    
+                    self.log(f"OTP: {otp_code}", Colors.SUCCESS, "✅ ")
+
+                    # New flow: OTP + Name + Age are on the SAME form page
+                    # Fill all fields then submit once
+                    page.wait_for_timeout(1000)
+
+                    # Fill OTP code
+                    try:
+                        otp_input = page.locator(
+                            "input[name='code'], input[name='otp'], "
+                            "input[autocomplete='one-time-code'], "
+                            "input[inputmode='numeric'], "
+                            "input[maxlength='6'], "
+                            "input[placeholder*='code' i], "
+                            "input[placeholder*='verification' i]"
+                        )
+                        if otp_input.count() > 0:
+                            otp_input.first.fill(otp_code)
+                            self.log("OTP filled", Colors.SUCCESS, "✅ ")
+                        else:
+                            self.log("OTP input not found", Colors.WARNING, "⚠️ ")
+                    except Exception as e:
+                        self.log(f"OTP fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    page.wait_for_timeout(500)
+
+                    # Fill Full name
+                    try:
+                        name_input = page.locator(
+                            "input[name='name']:visible, input[name='full_name']:visible, "
+                            "input[placeholder*='name' i]:visible, "
+                            "input[placeholder*='Full name' i]:visible"
+                        )
+                        if name_input.count() > 0:
+                            name_input.first.fill(full_name)
+                            self.log(f"Name filled: {full_name}", Colors.SUCCESS, "✅ ")
+                        else:
+                            self.log("Name input not found on OTP page", Colors.WARNING, "⚠️ ")
+                    except Exception as e:
+                        self.log(f"Name fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    page.wait_for_timeout(500)
+
+                    # Fill Age/Birthday field
+                    # UI shows "Age" but API sends birthdate. Try multiple strategies.
+                    age_filled = False
+                    try:
+                        # Strategy 1: explicit age/birthday/birthdate inputs
+                        age_input = page.locator(
+                            "input[name='age']:visible, "
+                            "input[name='birthday']:visible, "
+                            "input[name='birthdate']:visible, "
+                            "input[placeholder*='Age' i]:visible, "
+                            "input[placeholder*='Birthday' i]:visible, "
+                            "input[type='date']:visible"
+                        )
+                        if age_input.count() > 0:
+                            input_type = age_input.first.get_attribute("type") or ""
+                            input_name = age_input.first.get_attribute("name") or ""
+                            input_placeholder = age_input.first.get_attribute("placeholder") or ""
+                            if input_type == "date" or "birth" in input_name:
+                                age_input.first.fill(birthdate)
+                            else:
+                                birth_year = int(birthdate.split('-')[0])
+                                age = 2026 - birth_year
+                                age_input.first.fill(str(age))
+                            age_filled = True
+                            self.log(f"Age/DOB filled", Colors.SUCCESS, "✅ ")
+                    except Exception as e:
+                        self.log(f"Age fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    if not age_filled:
+                        # Strategy 2: JS — set hidden birthdate field directly
+                        try:
+                            age_filled = page.evaluate("""
+                                (dob) => {
+                                    // Try hidden birthday/birthdate input
+                                    const el = document.querySelector('input[name="birthday"]') ||
+                                               document.querySelector('input[name="birthdate"]') ||
+                                               document.querySelector('input[name="dob"]');
+                                    if (el) {
+                                        const nativeSet = Object.getOwnPropertyDescriptor(
+                                            window.HTMLInputElement.prototype, 'value').set;
+                                        nativeSet.call(el, dob);
+                                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        return true;
+                                    }
+                                    // Try number input near "age" label
+                                    const labels = document.querySelectorAll('label');
+                                    for (const lbl of labels) {
+                                        if (/age/i.test(lbl.textContent)) {
+                                            const inp = lbl.querySelector('input') ||
+                                                        document.getElementById(lbl.getAttribute('for') || '');
+                                            if (inp) {
+                                                const year = parseInt(dob.split('-')[0]);
+                                                const age = 2026 - year;
+                                                const ns = Object.getOwnPropertyDescriptor(
+                                                    window.HTMLInputElement.prototype, 'value').set;
+                                                ns.call(inp, String(age));
+                                                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                }
+                            """, birthdate)
+                            if age_filled:
+                                self.log("Age/DOB filled (JS)", Colors.SUCCESS, "✅ ")
+                            else:
+                                self.log("Age/DOB input not found", Colors.WARNING, "⚠️ ")
+                        except Exception as e:
+                            self.log(f"Age JS fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    page.wait_for_timeout(500)
+
+                    # Submit the combined form (OTP + Name + Age)
+                    try:
+                        submit_btn = page.locator(
+                            "button[type='submit']:visible, "
+                            "button:has-text('Continue'):visible, "
+                            "button:has-text('Tiếp tục'):visible"
+                        )
+                        if submit_btn.count() > 0:
+                            submit_btn.first.click()
+                        else:
+                            page.keyboard.press("Enter")
+                    except Exception:
+                        page.keyboard.press("Enter")
+
+                    self.log("Form submitted, waiting...", Colors.INFO, "⏳ ")
+
+                    # Wait for navigation or API completion
+                    try:
+                        page.wait_for_url("**/chatgpt.com/**", timeout=15000)
+                        self.log("Redirected to chatgpt.com", Colors.SUCCESS, "✅ ")
+                    except Exception:
+                        pass
+
+                    # Check where we ended up
+                    current_url = page.url
+                    self.log(f"After submit: {current_url.split('?')[0]}", Colors.INFO, "📍 ")
+
+                    if 'chatgpt.com' in current_url:
+                        skip_create_account = True
+                        self.log("Registration complete — on chatgpt.com", Colors.SUCCESS, "✅ ")
+                    elif '/about-you' in current_url:
+                        # Separate about-you page (old flow fallback)
+                        pass
+                    else:
+                        # Still on auth page — check for errors
+                        error_el = page.locator("[role='alert'], .error, [class*='error'], [class*='Error']")
+                        if error_el.count() > 0:
+                            error_text = error_el.first.text_content() or ""
+                            self.log(f"Form error: {error_text[:150]}", Colors.ERROR, "❌ ")
+                            self._dump_net_logs()
+                            self.cleanup_browser()
+                            self.current_retry += 1
+                            continue
+                        # No error but still on auth — wait more and retry check
+                        page.wait_for_timeout(5000)
+                        current_url = page.url
+                        if 'chatgpt.com' in current_url:
+                            skip_create_account = True
+                            self.log("Registration complete (delayed redirect)", Colors.SUCCESS, "✅ ")
+                        elif '/about-you' in current_url:
+                            pass
+                        else:
+                            self.log(f"Stuck on: {current_url.split('?')[0]}", Colors.WARNING, "⚠️ ")
+                            self._dump_net_logs()
+
+                    if self.stop_event and self.stop_event.is_set():
+                        self.cleanup_browser()
+                        return (False, None)
                 
-                if reg_status != 200:
-                    self.log(f"Register failed ({reg_status})", Colors.ERROR, "❌ ")
-                    self.cleanup_browser()
-                    self.current_retry += 1
-                    continue
+                # === Step 7: Fill /about-you form (name + DOB) via UI ===
+                if skip_create_account:
+                    self.log("Create account skipped (already registered)", Colors.WARNING, "⚠️ ")
+                else:
+                    self.log("Finalizing account...", Colors.INFO, "👤 ")
+
+                    # Wait for page to settle after OTP (may be /about-you or /email-verification/register)
+                    page.wait_for_timeout(3000)
+                    current_url = page.url
+                    self.log(f"Current page: {current_url.split('?')[0]}", Colors.INFO, "📍 ")
+
+                    # Fill name field (visible input)
+                    name_filled = False
+                    try:
+                        name_input = page.locator(
+                            "input[name='name']:visible, input[name='full_name']:visible, "
+                            "input[placeholder*='name' i]:visible, input[id*='name' i]:visible"
+                        )
+                        if name_input.count() > 0:
+                            name_input.first.fill(full_name)
+                            name_filled = True
+                            page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+
+                    if not name_filled:
+                        # Try JS approach for React-controlled inputs
+                        try:
+                            page.evaluate("""
+                                (name) => {
+                                    const el = document.querySelector('input[name="name"]') || document.querySelector('input[id*="name"]');
+                                    if (el) {
+                                        const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                                        nativeSet.call(el, name);
+                                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    }
+                                }
+                            """, full_name)
+                            name_filled = True
+                        except Exception as e:
+                            self.log(f"Name fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    # Fill age field (visible number input, value 22-35)
+                    age_filled = False
+                    birth_year = int(birthdate.split('-')[0])
+                    age_value = str(2026 - birth_year)
+                    try:
+                        age_filled = page.evaluate("""
+                            (age) => {
+                                // Find any visible input that could be age
+                                const candidates = document.querySelectorAll(
+                                    'input[name="age"], input[name="birthday"], input[name="birthdate"],' +
+                                    'input[type="number"], input[inputmode="numeric"]'
+                                );
+                                for (const el of candidates) {
+                                    if (el.offsetParent !== null || el.type === 'hidden') {
+                                        const nativeSet = Object.getOwnPropertyDescriptor(
+                                            window.HTMLInputElement.prototype, 'value').set;
+                                        nativeSet.call(el, age);
+                                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        return true;
+                                    }
+                                }
+                                // Try finding input near a label containing "age"
+                                const labels = document.querySelectorAll('label');
+                                for (const lbl of labels) {
+                                    if (/age/i.test(lbl.textContent)) {
+                                        const inp = lbl.querySelector('input') ||
+                                                    document.getElementById(lbl.getAttribute('for') || '');
+                                        if (inp) {
+                                            const ns = Object.getOwnPropertyDescriptor(
+                                                window.HTMLInputElement.prototype, 'value').set;
+                                            ns.call(inp, age);
+                                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                        """, age_value)
+                    except Exception as e:
+                        self.log(f"Age fill error: {e}", Colors.WARNING, "⚠️ ")
+
+                    if not age_filled:
+                        # Fallback: try Playwright locator fill
+                        try:
+                            age_loc = page.locator(
+                                "input[name='age']:visible, input[type='number']:visible, "
+                                "input[inputmode='numeric']:visible"
+                            )
+                            if age_loc.count() > 0:
+                                age_loc.first.fill(age_value)
+                                age_filled = True
+                        except Exception:
+                            pass
+
+                    if not age_filled:
+                        self.log(f"Could not fill age ({age_value})", Colors.WARNING, "⚠️ ")
+                    else:
+                        self.log(f"Age filled: {age_value}", Colors.SUCCESS, "✅ ")
+
+                    page.wait_for_timeout(500)
+                    self.log(f"Filled: name={name_filled}, age={age_filled}", Colors.INFO)
+
+                    # Click Continue/Submit button
+                    try:
+                        submit_btn = page.locator(
+                            "button[type='submit']:visible, "
+                            "button:has-text('Continue'):visible, "
+                            "button:has-text('Tiếp tục'):visible, "
+                            "button:has-text('Agree'):visible"
+                        )
+                        if submit_btn.count() > 0:
+                            submit_btn.first.click()
+                        else:
+                            page.keyboard.press("Enter")
+                    except Exception:
+                        page.keyboard.press("Enter")
+
+                    self.log("Form submitted, waiting...", Colors.INFO, "⏳ ")
+
+                    # Poll for either: page navigates to chatgpt.com OR create_account 200 in network log
+                    create_succeeded = False
+                    redirected_to_chatgpt = False
+                    for _poll in range(30):  # 30 * 2s = 60s max
+                        page.wait_for_timeout(2000)
+                        try:
+                            current_url = page.url
+                        except Exception:
+                            current_url = ""
+                        if 'chatgpt.com' in current_url:
+                            redirected_to_chatgpt = True
+                            create_succeeded = True
+                            break
+                        if any("create_account" in log and "[200]" in log for log in self._net_logs):
+                            create_succeeded = True
+                            # Don't break yet — wait up to 10s more for page to auto-redirect
+                            for _redir in range(5):
+                                page.wait_for_timeout(2000)
+                                try:
+                                    current_url = page.url
+                                except Exception:
+                                    current_url = ""
+                                if 'chatgpt.com' in current_url:
+                                    redirected_to_chatgpt = True
+                                    break
+                            break
+                    else:
+                        # Timeout — do one final check
+                        try:
+                            current_url = page.url
+                        except Exception:
+                            current_url = ""
+
+                    # Final state
+                    if not create_succeeded:
+                        create_succeeded = any("create_account" in log and "[200]" in log for log in self._net_logs)
+                    still_on_form = any(x in current_url for x in ["/about-you", "/email-verification/register", "/create-account"])
+
+                    if still_on_form and not create_succeeded:
+                        # Still on form page and no successful create — check for error messages
+                        error_text = ""
+                        try:
+                            error_el = page.locator("[role='alert'], .error, [class*='error'], [data-testid*='error']")
+                            if error_el.count() > 0:
+                                error_text = error_el.first.text_content() or ""
+                        except Exception:
+                            pass
+                        self.log(f"Create failed (still on form): {error_text[:200]}", Colors.ERROR, "❌ ")
+                        self._dump_net_logs()
+                        self.cleanup_browser()
+                        self.current_retry += 1
+                        continue
+                    else:
+                        self.log("Account created", Colors.SUCCESS, "✅ ")
                 
-                # Follow continue_url to trigger OTP email
+                # === Step 8: Complete OAuth callback → login to chatgpt.com ===
+                self.log("Completing login...", Colors.INFO, "🔄 ")
                 try:
-                    reg_data = json.loads(reg_body)
-                    continue_url = reg_data.get('continue_url', '')
-                    if continue_url:
-                        self.log("Following continue_url...", Colors.INFO)
-                        otp_trigger_js = """
-                            async (url) => {
-                                const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-                                return { status: r.status, body: await r.text() };
+                    current_url = page.url
+                except Exception:
+                    current_url = ""
+
+                if 'chatgpt.com' not in current_url:
+                    # After create_account, OpenAI JS should auto-redirect via callback
+                    # Wait up to 15s for the page to navigate on its own
+                    for _wait in range(5):
+                        page.wait_for_timeout(3000)
+                        try:
+                            current_url = page.url
+                        except Exception:
+                            current_url = ""
+                        if 'chatgpt.com' in current_url:
+                            break
+
+                # If still not on chatgpt.com, try navigating via the auth callback
+                try:
+                    current_url = page.url
+                except Exception:
+                    current_url = ""
+
+                if "chatgpt.com" not in current_url:
+                    # Try to get the callback URL from auth session and navigate through it
+                    try:
+                        # First attempt: use the existing auth session to get callback URL
+                        session_dump_js = """
+                            async () => {
+                                const r = await fetch('/api/accounts/client_auth_session_dump');
+                                return await r.json();
                             }
                         """
-                        page.evaluate(otp_trigger_js, continue_url)
-                except Exception as e:
-                    self.log(f"OTP trigger error: {e}", Colors.WARNING)
-                
-                if self.stop_event and self.stop_event.is_set():
-                    self.cleanup_browser()
-                    return (False, None)
-                page.wait_for_timeout(2000)
-                
-                # === Step 6: Wait for OTP ===
-                self.log("Waiting for OTP email...", Colors.INFO, "📬 ")
-                if self.email_mode == "OAuth2":
-                    otp_code = self._wait_for_otp_oauth2(timeout=120)
-                else:
-                    otp_code = self._wait_for_otp_tinyhost(email, timeout=120)
-                
-                if not otp_code:
-                    self.cleanup_browser()
-                    return (False, None)
-                
-                self.log(f"OTP: {otp_code}", Colors.SUCCESS, "✅ ")
-                
-                # Validate OTP via API
-                validate_js = """
-                    async (code) => {
-                        const r = await fetch('/api/accounts/email-otp/validate', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            body: JSON.stringify({ 'code': code })
-                        });
-                        return { status: r.status, body: await r.text() };
-                    }
-                """
-                validate_resp = page.evaluate(validate_js, otp_code)
-                status = validate_resp.get('status')
-                body = validate_resp.get('body', '')
-                self.log(f"OTP Validate: {status}", Colors.SUCCESS if status == 200 else Colors.ERROR)
-                if self.stop_event and self.stop_event.is_set():
-                    self.cleanup_browser()
-                    return (False, None)
-                page.wait_for_timeout(2000)
-                
-                # === Step 7: Create account (name + DOB) ===
-                self.log("Creating account...", Colors.INFO, "🏗️ ")
-                create_js = """
-                    async ([name, dob]) => {
-                        const r = await fetch('/api/accounts/create_account', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            body: JSON.stringify({ 'name': name, 'birthdate': dob })
-                        });
-                        return { status: r.status, body: await r.text() };
-                    }
-                """
-                create_resp = page.evaluate(create_js, [full_name, birthdate])
-                self.log(f"Account created: {create_resp.get('status')}", Colors.SUCCESS if create_resp.get('status') == 200 else Colors.ERROR)
-                if self.stop_event and self.stop_event.is_set():
-                    self.cleanup_browser()
-                    return (False, None)
-                page.wait_for_timeout(2000)
-                
-                # Follow callback URL to complete login
+                        session_dump = page.evaluate(session_dump_js)
+                        callback_url = ""
+                        if isinstance(session_dump, dict):
+                            callback_url = session_dump.get("callback_url", "") or session_dump.get("redirect_url", "")
+
+                        if callback_url and 'chatgpt.com' in callback_url:
+                            page.goto(callback_url, wait_until="domcontentloaded", timeout=60000)
+                            page.wait_for_timeout(5000)
+                        else:
+                            # Fallback: navigate to chatgpt.com and re-trigger signin
+                            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                            page.wait_for_timeout(2000)
+                            csrf2 = page.evaluate("""async () => { const r = await fetch('/api/auth/csrf'); return (await r.json()).csrfToken || ''; }""")
+                            if csrf2:
+                                callback_js = """
+                                    async ([csrfTok, deviceId, authSessionId]) => {
+                                        const params = new URLSearchParams({
+                                            'prompt': 'login',
+                                            'ext-oai-did': deviceId,
+                                            'auth_session_logging_id': authSessionId,
+                                            'ext-passkey-client-capabilities': '1111',
+                                            'screen_hint': 'login'
+                                        });
+                                        const r = await fetch('/api/auth/signin/openai?' + params.toString(), {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                            body: new URLSearchParams({ 'callbackUrl': 'https://chatgpt.com/', 'csrfToken': csrfTok, 'json': 'true' }).toString()
+                                        });
+                                        return await r.json();
+                                    }
+                                """
+                                signin2 = page.evaluate(callback_js, [csrf2, device_id, auth_session_id])
+                                auth_url2 = signin2.get("url", "")
+                                if auth_url2:
+                                    page.goto(auth_url2, wait_until="domcontentloaded", timeout=60000)
+                                    # Wait for the auth flow to complete and redirect back
+                                    for _redir2 in range(10):
+                                        page.wait_for_timeout(2000)
+                                        try:
+                                            current_url = page.url
+                                        except Exception:
+                                            current_url = ""
+                                        if 'chatgpt.com' in current_url:
+                                            break
+                    except Exception as e:
+                        self.log(f"Re-signin error: {e}", Colors.WARNING)
+
+                # Final fallback: navigate to chatgpt.com
                 try:
-                    create_data = json.loads(create_resp.get("body", "{}"))
-                    continue_url = create_data.get("continue_url", "")
-                    if continue_url and "callback" in continue_url:
-                        self.log("Following auth callback...", Colors.INFO)
-                        page.goto(continue_url, wait_until="domcontentloaded", timeout=60000)
+                    if "chatgpt.com" not in page.url:
+                        page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
                         page.wait_for_timeout(3000)
                 except Exception as e:
-                    self.log(f"Callback error: {e}", Colors.WARNING)
+                    self.log(f"Navigation error: {e}", Colors.WARNING)
+                    try:
+                        page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(3000)
+                    except Exception:
+                        self.log("Browser lost — cannot complete login", Colors.ERROR, "❌ ")
+                        self.cleanup_browser()
+                        self.current_retry += 1
+                        continue
                 
-                if self.stop_event and self.stop_event.is_set():
-                    self.cleanup_browser()
-                    return (False, None)
-                
-                # === Verify registration ===
-                self.log("Verifying registration...", Colors.INFO, "🔍 ")
-                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2000)
-                
-                check_resp = page.evaluate("""
-                    async () => {
-                        const r = await fetch('/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-420');
-                        return { status: r.status };
-                    }
-                """)
-                
-                if check_resp.get("status") != 200:
-                    self.log("Registration verification failed", Colors.ERROR, "❌ ")
-                    self.cleanup_browser()
-                    self.current_retry += 1
-                    continue
-                
-                self.log("Registration verified!", Colors.SUCCESS, "✅ ")
-                
-                # === Get access token ===
+                # === Verify login & get access token ===
                 session_resp = page.evaluate("""
                     async () => {
                         const r = await fetch('/api/auth/session');
@@ -1396,7 +2116,13 @@ class ChatGPTAutoRegisterWorker:
                 session_json_str = json.dumps(session_resp) if isinstance(session_resp, dict) else ""
                 
                 if access_token:
-                    self.log(f"Access Token: {access_token[:30]}...", Colors.SUCCESS)
+                    self.log(f"Logged in ✅", Colors.SUCCESS, "🔑 ")
+                else:
+                    self.log("Login failed - no access token", Colors.ERROR, "❌ ")
+                    self._dump_net_logs()
+                    self.cleanup_browser()
+                    self.current_retry += 1
+                    continue
                 
                 if self.stop_event and self.stop_event.is_set():
                     # Save what we have so far before stopping
@@ -1489,11 +2215,11 @@ def run_worker(thread_id, stop_event=None, thread_delay=2, num_threads=1, email_
 
 # Shared TLS fingerprint list for checkout API calls
 _TLS_FINGERPRINTS = []
-for _ver in [110, 112, 114, 116, 118, 119, 120]:
+for _ver in [143, 144, 145, 146, 147]:
     for _os_val in ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64",
                      "Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]:
         _TLS_FINGERPRINTS.append({"id": f"chrome_{_ver}", "ua": f"Mozilla/5.0 ({_os_val}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_ver}.0.0.0 Safari/537.36"})
-for _ver in [108, 110, 117, 120]:
+for _ver in [126, 128, 130, 132]:
     for _os_val in ["Windows NT 10.0; Win64; x64", "Windows NT 11.0; Win64; x64",
                      "Macintosh; Intel Mac OS X 10_15_7", "Macintosh; Intel Mac OS X 13_3"]:
         _TLS_FINGERPRINTS.append({"id": f"firefox_{_ver}", "ua": f"Mozilla/5.0 ({_os_val}; rv:{_ver}.0) Gecko/20100101 Firefox/{_ver}.0"})
@@ -1511,13 +2237,25 @@ def call_checkout_api(access_token, payload, label="Checkout", log_func=None):
     session = tls_client.Session(client_identifier=fp["id"], random_tls_extension_order=True)
     lang = random.choice(["en-US,en;q=0.9", "vi-VN,vi;q=0.9,en-US;q=0.8", "en-GB,en;q=0.9"])
 
+    # Extract Chrome version from UA for sec-ch-ua header
+    _chrome_ver_match = re.search(r'Chrome/(\d+)', fp["ua"])
+    _chrome_ver = _chrome_ver_match.group(1) if _chrome_ver_match else "147"
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "User-Agent": fp["ua"],
         "Accept-Language": lang,
         "Referer": "https://chatgpt.com/",
-        "Origin": "https://chatgpt.com"
+        "Origin": "https://chatgpt.com",
+        "sec-ch-ua": f'"Google Chrome";v="{_chrome_ver}", "Not.A/Brand";v="8", "Chromium";v="{_chrome_ver}"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "oai-device-id": str(uuid.uuid4()),
+        "oai-language": "en-US",
     }
 
     time.sleep(random.uniform(0.5, 1.5))
@@ -1617,7 +2355,7 @@ class CheckoutCaptureWorker:
                     ],
                 )
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
                     viewport={"width": 1280, "height": 800},
                 )
                 page = context.new_page()
@@ -1627,12 +2365,43 @@ class CheckoutCaptureWorker:
                     page.wait_for_timeout(2000)
 
                     # Get CSRF token
-                    csrf_resp = page.evaluate("""
+                    csrf_resp_raw = page.evaluate("""
                         async () => {
-                            const r = await fetch('/api/auth/csrf', { headers: { 'Content-Type': 'application/json' } });
-                            return await r.json();
+                            const r = await fetch('/api/auth/csrf', {
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+
+                            const contentType = r.headers.get('content-type') || '';
+                            const text = await r.text();
+
+                            let body = null;
+                            if (contentType.includes('application/json')) {
+                                try {
+                                    body = JSON.parse(text);
+                                } catch (e) {
+                                    body = null;
+                                }
+                            }
+
+                            return {
+                                ok: r.ok,
+                                status: r.status,
+                                contentType: contentType,
+                                isJson: contentType.includes('application/json'),
+                                text: text.slice(0, 1000),
+                                body: body
+                            };
                         }
                     """)
+
+                    if not csrf_resp_raw.get("ok") or not csrf_resp_raw.get("isJson"):
+                        print("CSRF request failed")
+                        print("Status:", csrf_resp_raw.get("status"))
+                        print("Content-Type:", csrf_resp_raw.get("contentType"))
+                        print("Body preview:", csrf_resp_raw.get("text"))
+                        # retry / stop / rotate normal network settings here
+
+                    csrf_resp = csrf_resp_raw.get("body") or {}
                     csrf_token = csrf_resp.get("csrfToken", "")
                     if not csrf_token:
                         self.log("No CSRF token", Colors.ERROR)
@@ -1647,6 +2416,7 @@ class CheckoutCaptureWorker:
                                 'prompt': 'login',
                                 'ext-oai-did': deviceId,
                                 'auth_session_logging_id': authSessionId,
+                                'ext-passkey-client-capabilities': '1111',
                                 'screen_hint': 'login',
                                 'login_hint': loginEmail
                             });
@@ -1659,7 +2429,14 @@ class CheckoutCaptureWorker:
                                     'json': 'true'
                                 }).toString()
                             });
-                            return await r.json();
+                                    return {
+                                                ok: r.ok,
+                                                status: r.status,
+                                                contentType,
+                                                isJson: contentType.includes('application/json'),
+                                                text: text.slice(0, 1000),
+                                                body
+                                            };
                         }
                     """, [device_id, auth_session_id, self.email, csrf_token])
 
@@ -1898,6 +2675,332 @@ def load_checkout_accounts(excel_file):
         
     except Exception as e:
         print(f"Error loading accounts: {e}")
+        return []
+
+
+class CheckLiveWorker:
+    """Worker to check if a GPT account is LIVE or DIE by attempting login.
+    
+    Detection logic:
+    - DIE: Page shows deactivated/deleted error after password submit (403)
+    - LIVE: Password accepted → redirects to MFA challenge or chatgpt.com
+    """
+    
+    def __init__(self, thread_id, email, password, num_threads=1, headless=True):
+        self.thread_id = thread_id
+        self.email = email
+        self.password = password
+        self.num_threads = num_threads
+        self.headless = headless
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.proxy_bridge = None
+        self.stop_event = None
+        self._pw_server_pid = None
+    
+    def log(self, message, color=Colors.INFO, emoji=""):
+        safe_print(self.thread_id, message, color, emoji)
+    
+    def cleanup_browser(self):
+        """Close patchright browser and cleanup"""
+        is_stopping = self.stop_event and self.stop_event.is_set()
+        
+        if is_stopping:
+            if self._pw_server_pid:
+                try:
+                    subprocess.Popen(
+                        ['taskkill', '/F', '/PID', str(self._pw_server_pid), '/T'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except Exception:
+                    pass
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            self._pw_server_pid = None
+            return
+        
+        if self.page:
+            try: self.page.close()
+            except Exception: pass
+            self.page = None
+        if self.context:
+            try: self.context.close()
+            except Exception: pass
+            self.context = None
+        if self.browser:
+            try: self.browser.close()
+            except Exception: pass
+            self.browser = None
+        if self.playwright:
+            try: self.playwright.stop()
+            except Exception: pass
+            self.playwright = None
+    
+    def run(self):
+        """Run the check live flow. Returns 'LIVE', 'DIE', or 'ERROR'."""
+        try:
+            self.log(f"Checking: {self.email}", Colors.HEADER, "🔍 ")
+            
+            self.playwright = sync_playwright().start()
+            try:
+                self._pw_server_pid = self.playwright._impl_obj._connection._transport._proc.pid
+            except Exception:
+                self._pw_server_pid = None
+            
+            # Build launch args
+            launch_args = [
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--lang=en-US',
+            ]
+            
+            # Apply proxy if enabled
+            proxy_config = None
+            if PROXY_ENABLED and PROXY_STRING:
+                proxy_info, urls = parse_proxy(PROXY_STRING)
+                if proxy_info and urls:
+                    host = (proxy_info.get("host") or "").strip()
+                    port = str(proxy_info.get("port") or "").strip()
+                    username = (proxy_info.get("username") or "").strip()
+                    password_p = (proxy_info.get("password") or "").strip()
+                    if host and port.isdigit():
+                        if username and password_p:
+                            proxy_config = {
+                                "server": f"http://{host}:{port}",
+                                "username": username,
+                                "password": password_p,
+                            }
+                        else:
+                            proxy_config = {"server": f"http://{host}:{port}"}
+            
+            self.browser = self.playwright.chromium.launch(
+                headless=self.headless,
+                args=launch_args,
+                proxy=proxy_config,
+            )
+            
+            self.context = self.browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+            )
+            self.page = self.context.new_page()
+            
+            if self.stop_event and self.stop_event.is_set():
+                return None
+            
+            # Step 1: Navigate to auth.openai.com
+            self.log("Navigating to auth login...", Colors.INFO, "🌐 ")
+            self.page.goto(
+                "https://auth.openai.com/log-in",
+                wait_until="domcontentloaded", timeout=60000
+            )
+            
+            # Wait for either the "Log in" button or the email input to appear
+            try:
+                self.page.wait_for_selector(
+                    "input[name='identifier'], input[name='email'], input[type='email'], input#identifier, a:has-text('Log in'), a:has-text('Đăng nhập'), button:has-text('Log in')",
+                    timeout=20000, state="visible"
+                )
+            except Exception:
+                pass
+                
+            if self.stop_event and self.stop_event.is_set():
+                return None
+                
+            # Click "Log in" button if on the "Your session has ended" page
+            try:
+                # The "Log in" button is actually an <a> tag
+                login_btn = self.page.locator("a:has-text('Log in'), a:has-text('Đăng nhập'), button:has-text('Log in')")
+                if login_btn.count() > 0 and login_btn.first.is_visible():
+                    self.log("Clicking Log in button to start session...", Colors.INFO, "🖱️ ")
+                    login_btn.first.click()
+                    self.page.wait_for_timeout(2000)
+            except Exception as e:
+                self.log(f"Warning: Login button not clicked: {e}", Colors.WARNING, "⚠️ ")
+            
+            if self.stop_event and self.stop_event.is_set():
+                return None
+            
+            # Step 2: Fill email and submit
+            self.log("Entering email...", Colors.INFO, "📧 ")
+            try:
+                email_input = self.page.wait_for_selector(
+                    "input[name='identifier'],input[name='email'],input[type='email'],input#identifier",
+                    timeout=15000
+                )
+                email_input.fill(self.email)
+                self.page.wait_for_timeout(500)
+                
+                # Click Continue button (email step)
+                # Selector priority: name+value attrs (most specific) → data-dd attr → exclude social buttons
+                continue_btn = self.page.locator(
+                    "button[name='intent'][value='email'],"
+                    "button[data-dd-action-name='Continue']:not(:has-text('Google')):not(:has-text('Apple')):not(:has-text('Microsoft')),"
+                    "button[type='submit']:not(:has-text('Google')):not(:has-text('Apple')):not(:has-text('Microsoft'))"
+                )
+                if continue_btn.count() > 0:
+                    continue_btn.first.click()
+                else:
+                    self.page.keyboard.press("Enter")
+            except Exception as e:
+                self.log(f"Email input not found: {e}", Colors.ERROR, "❌ ")
+                return "ERROR"
+            
+            self.page.wait_for_timeout(2000)
+            
+            if self.stop_event and self.stop_event.is_set():
+                return None
+            
+            # Step 3: Fill password and submit
+            self.log("Entering password...", Colors.INFO, "🔐 ")
+            try:
+                pass_input = self.page.wait_for_selector(
+                    "input#password,input[name='password'],input[type='password']",
+                    timeout=15000
+                )
+                pass_input.fill(self.password)
+                self.page.wait_for_timeout(500)
+                
+                continue_btn = self.page.locator(
+                    "button[type='submit'],button:has-text('Continue'),button:has-text('Tiếp tục')"
+                )
+                if continue_btn.count() > 0:
+                    continue_btn.first.click()
+                else:
+                    self.page.keyboard.press("Enter")
+            except Exception as e:
+                self.log(f"Password input not found: {e}", Colors.ERROR, "❌ ")
+                return "ERROR"
+            
+            # Step 4: Wait and detect result
+            self.log("Waiting for response...", Colors.INFO, "⏳ ")
+            self.page.wait_for_timeout(5000)
+            
+            if self.stop_event and self.stop_event.is_set():
+                return None
+            
+            # Check page state to determine LIVE or DIE
+            current_url = self.page.url.lower()
+            current_title = self.page.title().lower()
+            
+            # LIVE: Redirected to MFA challenge
+            if "/mfa-challenge" in current_url or "mfa" in current_url:
+                self.log(f"✅ LIVE — MFA challenge detected", Colors.SUCCESS, "🟢 ")
+                return "LIVE"
+            
+            # LIVE: Successfully logged in (redirected to chatgpt.com)
+            if "chatgpt.com" in current_url and "auth.openai.com" not in current_url:
+                self.log(f"✅ LIVE — Logged in successfully", Colors.SUCCESS, "🟢 ")
+                return "LIVE"
+            
+            # DIE: Error page (deactivated/deleted)
+            if "oops" in current_title or "error" in current_title:
+                self.log(f"❌ DIE — Account deactivated/deleted", Colors.ERROR, "🔴 ")
+                return "DIE"
+            
+            # DIE: Check page content for deactivated/deleted/wrong password
+            try:
+                page_text = self.page.inner_text("body").lower()
+                if "deactivated" in page_text or "deleted" in page_text:
+                    self.log(f"❌ DIE — Account deactivated/deleted", Colors.ERROR, "🔴 ")
+                    return "DIE"
+                if "wrong email or password" in page_text or "incorrect" in page_text:
+                    self.log(f"❌ DIE — Wrong credentials", Colors.ERROR, "🔴 ")
+                    return "DIE"
+            except Exception:
+                pass
+            
+            # Still on password page? Wait more and re-check
+            if "/log-in" in current_url or "/password" in current_url:
+                self.page.wait_for_timeout(3000)
+                current_url = self.page.url.lower()
+                current_title = self.page.title().lower()
+                
+                if "/mfa-challenge" in current_url or "mfa" in current_url:
+                    self.log(f"✅ LIVE — MFA challenge detected", Colors.SUCCESS, "🟢 ")
+                    return "LIVE"
+                if "chatgpt.com" in current_url and "auth.openai.com" not in current_url:
+                    self.log(f"✅ LIVE — Logged in successfully", Colors.SUCCESS, "🟢 ")
+                    return "LIVE"
+                if "oops" in current_title or "error" in current_title:
+                    self.log(f"❌ DIE — Account deactivated/deleted", Colors.ERROR, "🔴 ")
+                    return "DIE"
+                
+                try:
+                    page_text = self.page.inner_text("body").lower()
+                    if "deactivated" in page_text or "deleted" in page_text:
+                        self.log(f"❌ DIE — Account deactivated/deleted", Colors.ERROR, "🔴 ")
+                        return "DIE"
+                except Exception:
+                    pass
+                
+                self.log(f"❌ DIE — Still on login page (likely invalid)", Colors.ERROR, "🔴 ")
+                return "DIE"
+            
+            # Fallback: Unknown state
+            self.log(f"⚠️ Unknown state: URL={current_url[:60]}, Title={current_title[:40]}", Colors.WARNING, "⚠️ ")
+            return "DIE"
+            
+        except Exception as e:
+            self.log(f"Error: {e}", Colors.ERROR, "❌ ")
+            return "ERROR"
+        finally:
+            self.cleanup_browser()
+
+
+def load_checklive_accounts(excel_file):
+    """Load accounts from Excel for check live.
+    Column A: email:password or email|password
+    Returns list of dicts with email, password, row_index.
+    """
+    try:
+        wb = load_workbook(excel_file)
+        ws = wb.active
+        
+        accounts = []
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or not row[0]:
+                continue
+            
+            account_str = str(row[0]).strip()
+            if not account_str:
+                continue
+            
+            # Support both : and | separators
+            if "|" in account_str:
+                parts = account_str.split("|", 1)
+            elif ":" in account_str:
+                parts = account_str.split(":", 1)
+            else:
+                continue
+            
+            if len(parts) != 2:
+                continue
+            
+            email, password = parts[0].strip(), parts[1].strip()
+            if not email or not password:
+                continue
+            
+            # Get existing status from column B
+            existing_status = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            
+            accounts.append({
+                "email": email,
+                "password": password,
+                "row_index": row_idx,
+                "status": existing_status,
+            })
+        
+        wb.close()
+        return accounts
+    except Exception as e:
+        print(f"Error loading check live accounts: {e}")
         return []
 
 
@@ -2423,6 +3526,7 @@ class App(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=16, pady=16)
         self.tabview.add("🚀 Registration")
         self.tabview.add("💳 Checkout Capture")
+        self.tabview.add("🔍 Check Live")
         
         # Enhanced tab font
         self.tabview._segmented_button.configure(
@@ -2432,6 +3536,7 @@ class App(ctk.CTk):
 
         self.setup_registration_tab()
         self.setup_checkout_tab()
+        self.setup_checklive_tab()
         
         # --- RIGHT COLUMN: STATUS PANEL (GLASSMORPHISM STYLE) ---
         self.status_frame = ctk.CTkFrame(
@@ -3493,6 +4598,579 @@ class App(ctk.CTk):
         # Load accounts on init
         self.after(2000, self.load_checkout_accounts)  # Defer: render UI first
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # CHECK LIVE TAB
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    def setup_checklive_tab(self):
+        """Setup the Check Live tab — check if GPT accounts are alive or deactivated"""
+        tab = self.tabview.tab("🔍 Check Live")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        
+        # ═══ CONTROLS CARD ═══
+        controls_card = ctk.CTkFrame(
+            tab, 
+            fg_color=self.colors["bg_card"],
+            corner_radius=16,
+            border_width=1,
+            border_color=self.colors["border_subtle"]
+        )
+        controls_card.grid(row=0, column=0, padx=8, pady=(4, 8), sticky="ew")
+        
+        # Header row
+        header_frame = ctk.CTkFrame(controls_card, fg_color="transparent")
+        header_frame.pack(fill="x", padx=16, pady=(10, 8))
+        
+        ctk.CTkLabel(
+            header_frame, 
+            text="🔍  Check Live — GPT Account Status", 
+            font=self._font("Segoe UI Semibold", 14, "bold"),
+            text_color=self.colors["text_primary"]
+        ).pack(side="left")
+        
+        # File selector row
+        file_frame = ctk.CTkFrame(controls_card, fg_color="transparent")
+        file_frame.pack(fill="x", padx=16, pady=(4, 8))
+        
+        ctk.CTkLabel(
+            file_frame, 
+            text="Excel File:", 
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).pack(side="left", padx=(0, 8))
+        
+        self.checklive_file_var = ctk.StringVar(value="chatgpt.xlsx")
+        self.checklive_file_entry = ctk.CTkEntry(
+            file_frame,
+            textvariable=self.checklive_file_var,
+            width=250,
+            height=32,
+            font=self.font_label,
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"],
+            corner_radius=8,
+        )
+        self.checklive_file_entry.pack(side="left", padx=(0, 8))
+        
+        self.checklive_browse_btn = ctk.CTkButton(
+            file_frame,
+            text="📂 Browse",
+            width=80,
+            height=28,
+            fg_color=self.colors["bg_elevated"],
+            hover_color=self.colors["bg_card_hover"],
+            corner_radius=8,
+            font=self._font("Segoe UI", 11),
+            command=self._browse_checklive_file
+        )
+        self.checklive_browse_btn.pack(side="left", padx=(0, 8))
+        
+        self.checklive_refresh_btn = ctk.CTkButton(
+            file_frame,
+            text="🔄 Refresh",
+            width=80,
+            height=28,
+            fg_color=self.colors["bg_elevated"],
+            hover_color=self.colors["bg_card_hover"],
+            corner_radius=8,
+            font=self._font("Segoe UI", 11),
+            command=self.load_checklive_accounts_ui
+        )
+        self.checklive_refresh_btn.pack(side="left")
+        
+        # Account count label
+        self.checklive_count_label = ctk.CTkLabel(
+            file_frame,
+            text="0 accounts",
+            font=self._font("Segoe UI", 11),
+            text_color=self.colors["text_muted"]
+        )
+        self.checklive_count_label.pack(side="right")
+        
+        ctk.CTkFrame(controls_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
+        
+        # Info label
+        ctk.CTkLabel(
+            controls_card,
+            text="📋 Column A: email:password (or email|password)  →  Results saved to Column B",
+            font=self._font("Segoe UI", 10),
+            text_color=self.colors["text_muted"]
+        ).pack(fill="x", padx=16, pady=(6, 4))
+        
+        ctk.CTkFrame(controls_card, height=1, fg_color=self.colors["border_subtle"]).pack(fill="x", padx=16)
+        
+        # ═══ MULTITHREAD & HEADLESS OPTIONS ═══
+        mt_frame = ctk.CTkFrame(controls_card, fg_color="transparent")
+        mt_frame.pack(fill="x", padx=16, pady=(6, 8))
+        
+        # Threads
+        ctk.CTkLabel(
+            mt_frame,
+            text="⚡ Threads:",
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).pack(side="left", padx=(0, 4))
+        
+        self.checklive_threads_var = ctk.StringVar(value="20")
+        self.checklive_threads_entry = ctk.CTkEntry(
+            mt_frame,
+            textvariable=self.checklive_threads_var,
+            width=50,
+            height=28,
+            font=self.font_label,
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"],
+            corner_radius=8,
+            justify="center"
+        )
+        self.checklive_threads_entry.pack(side="left", padx=(0, 16))
+        
+        # Delay
+        ctk.CTkLabel(
+            mt_frame,
+            text="⏱ Delay(s):",
+            font=self.font_label,
+            text_color=self.colors["text_secondary"]
+        ).pack(side="left", padx=(0, 4))
+        
+        self.checklive_delay_var = ctk.StringVar(value="1")
+        self.checklive_delay_entry = ctk.CTkEntry(
+            mt_frame,
+            textvariable=self.checklive_delay_var,
+            width=50,
+            height=28,
+            font=self.font_label,
+            fg_color=self.colors["bg_elevated"],
+            border_color=self.colors["border_subtle"],
+            corner_radius=8,
+            justify="center"
+        )
+        self.checklive_delay_entry.pack(side="left", padx=(0, 16))
+        
+        # Headless toggle
+        self.checklive_headless_var = ctk.BooleanVar(value=True)
+        self.checklive_headless_switch = ctk.CTkSwitch(
+            mt_frame,
+            text="  Headless (no browser UI)",
+            variable=self.checklive_headless_var,
+            font=self.font_label,
+            text_color=self.colors["text_secondary"],
+            fg_color=self.colors["bg_elevated"],
+            progress_color=self.colors["accent_cyan"],
+            button_color=self.colors["text_primary"],
+            button_hover_color=self.colors["accent_cyan"],
+        )
+        self.checklive_headless_switch.pack(side="left", padx=(0, 8))
+        
+        # Tip
+        ctk.CTkLabel(
+            mt_frame,
+            text="💡 Rec: 20 threads, headless ON",
+            font=self._font("Segoe UI", 10),
+            text_color=self.colors["accent_yellow"]
+        ).pack(side="right")
+
+        
+        # ═══ ACCOUNTS TABLE ═══
+        table_frame = ctk.CTkFrame(
+            tab, 
+            fg_color=self.colors["bg_card"],
+            corner_radius=16,
+            border_width=1,
+            border_color=self.colors["border_subtle"]
+        )
+        table_frame.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+        
+        # Configure dark theme for ttk widgets
+        style = ttk.Style()
+        style.configure("CheckLive.Treeview",
+            background="#111827",
+            foreground="#f8fafc",
+            fieldbackground="#111827",
+            rowheight=30,
+            font=("Segoe UI", 11)
+        )
+        style.configure("CheckLive.Treeview.Heading",
+            background="#1e293b",
+            foreground="#94a3b8",
+            font=("Segoe UI", 12, "bold")
+        )
+        style.map("CheckLive.Treeview",
+            background=[("selected", "#1e3a5f")],
+            foreground=[("selected", "#00f0ff")]
+        )
+        
+        # Create Treeview
+        self.checklive_tree = ttk.Treeview(
+            table_frame,
+            columns=("email", "password", "status"),
+            show="headings",
+            selectmode="browse",
+            style="CheckLive.Treeview",
+            height=8
+        )
+        self.checklive_tree.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
+        
+        # Column config
+        self.checklive_tree.column("email", width=280, stretch=True)
+        self.checklive_tree.column("password", width=150, stretch=False)
+        self.checklive_tree.column("status", width=80, stretch=False, anchor="center")
+        
+        self.checklive_tree.heading("email", text="Email")
+        self.checklive_tree.heading("password", text="Password")
+        self.checklive_tree.heading("status", text="Status")
+        
+        # Scrollbar
+        tree_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.checklive_tree.yview)
+        tree_scrollbar.grid(row=0, column=1, sticky="ns", pady=8)
+        self.checklive_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # Tags for visual styling
+        self.checklive_tree.tag_configure("live", foreground="#4ade80")     # Green
+        self.checklive_tree.tag_configure("die", foreground="#f87171")      # Red
+        self.checklive_tree.tag_configure("error", foreground="#fbbf24")    # Amber
+        self.checklive_tree.tag_configure("pending", foreground="#94a3b8")  # Gray
+        self.checklive_tree.tag_configure("checking", foreground="#38bdf8") # Blue
+        self.checklive_tree.tag_configure("evenrow", background="#0f172a")
+        self.checklive_tree.tag_configure("oddrow", background="#1a2332")
+        
+        # Store for account data
+        self.checklive_accounts_data = []
+        
+        # ═══ ACTION BUTTONS ═══
+        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, padx=8, pady=(0, 4), sticky="ew")
+        
+        self.checklive_start_btn = GlowButton(
+            btn_frame, 
+            text="🔍  START CHECK LIVE", 
+            command=self.start_checklive_thread, 
+            fg_color=self.colors["accent_cyan"], 
+            hover_color="#22d3ee",
+            text_color="#0a0a0a",
+            height=48, 
+            corner_radius=14,
+            font=self._font("Segoe UI", 13, "bold"),
+            glow_color=self.colors["accent_cyan"]
+        )
+        self.checklive_start_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        
+        self.checklive_stop_btn = ctk.CTkButton(
+            btn_frame, 
+            text="⏹", 
+            command=self.stop_process, 
+            fg_color="transparent",
+            hover_color=self.colors["error"],
+            text_color=self.colors["text_secondary"],
+            width=52, height=48,
+            corner_radius=14,
+            font=self._font("Segoe UI", 18),
+            border_width=2,
+            border_color=self.colors["border_subtle"],
+            state="disabled"
+        )
+        self.checklive_stop_btn.pack(side="right")
+        
+        # Load accounts on init
+        self.after(2500, self.load_checklive_accounts_ui)
+    
+    def _browse_checklive_file(self):
+        """Open file dialog to select Excel file for check live"""
+        filename = filedialog.askopenfilename(
+            filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.checklive_file_var.set(filename)
+            self.load_checklive_accounts_ui()
+    
+    def load_checklive_accounts_ui(self):
+        """Load accounts from Excel and display in treeview table"""
+        # Clear existing data
+        self.checklive_accounts_data.clear()
+        for item in self.checklive_tree.get_children():
+            self.checklive_tree.delete(item)
+        
+        excel_file = self.checklive_file_var.get().strip()
+        if not excel_file or not os.path.exists(excel_file):
+            self.checklive_count_label.configure(text="File not found")
+            return
+        
+        accounts = load_checklive_accounts(excel_file)
+        
+        if not accounts:
+            self.checklive_count_label.configure(text="No accounts found")
+            return
+        
+        for idx, account in enumerate(accounts):
+            status = account.get("status", "")
+            
+            # Determine display status
+            if status.upper() == "LIVE":
+                status_text = "🟢 LIVE"
+                tag = "live"
+            elif status.upper() == "DIE":
+                status_text = "🔴 DIE"
+                tag = "die"
+            elif status.upper() == "ERROR":
+                status_text = "⚠️ ERROR"
+                tag = "error"
+            else:
+                status_text = "⏳ Pending"
+                tag = "pending"
+            
+            row_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            
+            # Mask password for display
+            pwd_display = account["password"][:3] + "***" if len(account["password"]) > 3 else "***"
+            
+            item_id = self.checklive_tree.insert(
+                "", "end",
+                values=(account["email"], pwd_display, status_text),
+                tags=(tag, row_tag)
+            )
+            
+            self.checklive_accounts_data.append({
+                "account": account,
+                "tree_id": item_id,
+            })
+        
+        self.checklive_count_label.configure(text=f"{len(accounts)} accounts")
+    
+    def _save_checklive_result(self, row_index, result, excel_file):
+        """Save check live result to Excel column B (thread-safe)"""
+        with file_lock:
+            try:
+                wb = load_workbook(excel_file)
+                ws = wb.active
+                ws.cell(row=row_index, column=2, value=result)
+                wb.save(excel_file)
+                wb.close()
+                return True
+            except Exception as e:
+                print(f"Error saving check live result: {e}")
+                return False
+    
+    def _update_checklive_row(self, tree_id, result):
+        """Update a row in the check live treeview (thread-safe via after)"""
+        def do_update():
+            try:
+                values = list(self.checklive_tree.item(tree_id, "values"))
+                if result == "LIVE":
+                    values[2] = "🟢 LIVE"
+                    self.checklive_tree.item(tree_id, values=values, tags=("live",))
+                elif result == "DIE":
+                    values[2] = "🔴 DIE"
+                    self.checklive_tree.item(tree_id, values=values, tags=("die",))
+                else:
+                    values[2] = "⚠️ ERROR"
+                    self.checklive_tree.item(tree_id, values=values, tags=("error",))
+            except Exception:
+                pass
+        
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, do_update)
+        else:
+            do_update()
+    
+    def start_checklive_thread(self):
+        """Start the check live process in a background thread"""
+        threading.Thread(target=self.run_checklive, daemon=True).start()
+    
+    def run_checklive(self):
+        """Run check live for all accounts with multithread support"""
+        global PROXY_ENABLED, PROXY_STRING, PROXY_FORMAT
+        
+        # Reset stop state and re-enable logging
+        self.stop_event.clear()
+        TextRedirector._suppress_output = False
+        
+        self.lock_ui(True)
+        self.update_stats(0, 0)
+        
+        excel_file = self.checklive_file_var.get().strip()
+        if not excel_file or not os.path.exists(excel_file):
+            print("❌ Excel file not found!")
+            self.lock_ui(False)
+            return
+        
+        # Apply proxy settings from GUI
+        PROXY_ENABLED = self.reg_proxy_var.get()
+        PROXY_STRING = self.reg_proxy_string_var.get().strip()
+        if PROXY_ENABLED and PROXY_STRING:
+            detected_fmt = detect_proxy_format(PROXY_STRING)
+            if detected_fmt:
+                PROXY_FORMAT = detected_fmt
+            proxy_info, _ = parse_proxy(PROXY_STRING)
+            if proxy_info:
+                print(f"🌐 Proxy enabled: {proxy_info['host']}:{proxy_info['port']}")
+            else:
+                PROXY_ENABLED = False
+        
+        # Read settings
+        try:
+            threads = max(1, int(self.checklive_threads_var.get().strip()))
+        except ValueError:
+            threads = 20
+        try:
+            thread_delay = max(0, float(self.checklive_delay_var.get().strip()))
+        except ValueError:
+            thread_delay = 1.0
+        headless = self.checklive_headless_var.get()
+        
+        # Load accounts
+        all_accounts = load_checklive_accounts(excel_file)
+        if not all_accounts:
+            print("❌ No accounts to check!")
+            self.lock_ui(False)
+            return
+        
+        # Skip accounts already marked LIVE
+        accounts = [a for a in all_accounts if a.get("status", "").upper() != "LIVE"]
+        skipped = len(all_accounts) - len(accounts)
+        if skipped > 0:
+            print(f"⏭ Skipped {skipped} accounts already marked LIVE")
+        
+        if not accounts:
+            print("✅ All accounts already checked as LIVE!")
+            self.lock_ui(False)
+            return
+        
+        total = len(accounts)
+        mode_str = "headless" if headless else "visible"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Check Live | Accounts: {total} | Skipped: {skipped} | Threads: {threads} | Mode: {mode_str}")
+        self.update_status("RUNNING", self.colors["accent_cyan"], f"Checking {total} accounts ({threads} threads)...")
+        
+        live_count = 0
+        die_count = 0
+        count_lock = threading.Lock()
+        
+        def run_check_worker(thread_id, account, acc_idx, start_delay):
+            """Worker function for each account check"""
+            nonlocal live_count, die_count
+            
+            if self.stop_event.is_set():
+                return None, account["email"]
+            
+            # Staggered start delay
+            if start_delay > 0:
+                time.sleep(start_delay)
+            
+            if self.stop_event.is_set():
+                return None, account["email"]
+            
+            # Update tree to show "checking" state
+            if acc_idx < len(self.checklive_accounts_data):
+                tree_id = self.checklive_accounts_data[acc_idx]["tree_id"]
+                self.after(0, lambda tid=tree_id: self._set_checking_state(tid))
+            
+            worker = CheckLiveWorker(
+                thread_id=thread_id,
+                email=account["email"],
+                password=account["password"],
+                num_threads=threads,
+                headless=headless,
+            )
+            worker.stop_event = self.stop_event
+            self._register_worker(worker)
+            
+            try:
+                result = worker.run()
+            finally:
+                self._unregister_worker(worker)
+            
+            # Update results (thread-safe) — only if not stopped
+            if self.stop_event.is_set():
+                return None, account["email"]
+            
+            with count_lock:
+                if result == "LIVE":
+                    live_count += 1
+                    print(f"🟢 LIVE: {account['email']}")
+                elif result == "DIE":
+                    die_count += 1
+                    print(f"🔴 DIE: {account['email']}")
+                else:
+                    # Only save ERROR if the worker actually ran (not stopped)
+                    if result == "ERROR":
+                        die_count += 1
+                        print(f"⚠️ ERROR: {account['email']}")
+                    else:
+                        return None, account["email"]
+                
+                # Save to Excel
+                self._save_checklive_result(account["row_index"], result, excel_file)
+                
+                # Update treeview
+                if acc_idx < len(self.checklive_accounts_data):
+                    tree_id = self.checklive_accounts_data[acc_idx]["tree_id"]
+                    self._update_checklive_row(tree_id, result)
+                
+                self.update_stats(live_count, die_count)
+                checked = live_count + die_count
+                self.update_status("RUNNING", self.colors["accent_cyan"], f"Checked {checked}/{total} | LIVE: {live_count} | DIE: {die_count}")
+            
+            return result, account["email"]
+        
+        # Run with ThreadPoolExecutor
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+        self._register_executor(executor)
+        try:
+            futures = []
+            for idx, account in enumerate(accounts):
+                if self.stop_event.is_set():
+                    break
+                
+                # Note: `idx` is used for staggered delays calculation, but the UI maps to the full list `all_accounts`.
+                true_idx = all_accounts.index(account)
+                
+                # Staggered delay: first wave spreads evenly, subsequent waves add base delay
+                slot_idx = idx % threads
+                wave_idx = idx // threads
+                
+                if wave_idx == 0:
+                    start_delay = slot_idx * thread_delay
+                else:
+                    start_delay = 3.0 + (slot_idx * thread_delay)
+                
+                thread_id = (idx % threads) + 1
+                future = executor.submit(run_check_worker, thread_id, account, true_idx, start_delay)
+                futures.append(future)
+            
+            # Wait for all futures
+            for future in concurrent.futures.as_completed(futures):
+                if self.stop_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error in worker: {e}")
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._unregister_executor(executor)
+        
+        # Final status
+        final_msg = "COMPLETED" if not self.stop_event.is_set() else "STOPPED"
+        self.update_status(final_msg, None, f"✨ LIVE: {live_count} | DIE: {die_count}")
+        print(f"\n{'🎉' if not self.stop_event.is_set() else '🛑'} {final_msg}! LIVE: {live_count} | DIE: {die_count}")
+        
+        self.lock_ui(False)
+    
+    def _set_checking_state(self, tree_id):
+        """Set a row to 'Checking...' state in the treeview"""
+        try:
+            values = list(self.checklive_tree.item(tree_id, "values"))
+            values[2] = "🔄 Checking..."
+            self.checklive_tree.item(tree_id, values=values, tags=("checking",))
+        except Exception:
+            pass
+
     def load_checkout_accounts(self):
         """Load accounts from Excel and display in treeview table"""
         # Clear existing data
@@ -4105,6 +5783,11 @@ class App(ctk.CTk):
                 text="⏳  PROCESSING...",
                 fg_color=self.colors["bg_elevated"]
             )
+            self.checklive_start_btn.configure(
+                state=state, 
+                text="⏳  CHECKING...",
+                fg_color=self.colors["bg_elevated"]
+            )
         else:
             # Only re-enable logging if not forcefully stopped
             # (workers may still be dying and would flood output)
@@ -4120,10 +5803,16 @@ class App(ctk.CTk):
                 text="💳  START CAPTURE",
                 fg_color=self.colors["accent_orange"]
             )
+            self.checklive_start_btn.configure(
+                state=state, 
+                text="🔍  START CHECK LIVE",
+                fg_color=self.colors["accent_cyan"]
+            )
         
         # Stop buttons
         self.reg_stop_btn.configure(state=stop_state)
         self.checkout_stop_btn.configure(state=stop_state)
+        self.checklive_stop_btn.configure(state=stop_state)
         
         
         # Progress Bar (custom 60fps animation)
@@ -4167,8 +5856,14 @@ class App(ctk.CTk):
             self.reg_proxy_entry.configure(state=proxy_state)
             self.reg_proxy_save.configure(state=proxy_state)
         
+        # Lock check live inputs
+        self.checklive_file_entry.configure(state=state)
+        self.checklive_browse_btn.configure(state=state)
+        self.checklive_refresh_btn.configure(state=state)
+        self.checklive_threads_entry.configure(state=state)
+        self.checklive_delay_entry.configure(state=state)
+        self.checklive_headless_switch.configure(state=state)
         
-
     def stop_process(self):
         TextRedirector._suppress_output = True  # Suppress ALL log output immediately
         self.stop_event.set()
